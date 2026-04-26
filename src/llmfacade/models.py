@@ -50,7 +50,29 @@ class ToolResultBlock:
     name: str | None = None
 
 
-ContentBlock = Union[TextBlock, ImageBlock, ToolUseBlock, ToolResultBlock]  # noqa: UP007
+@dataclass(frozen=True, slots=True)
+class ThinkingBlock:
+    """A reasoning / chain-of-thought block returned by a model.
+
+    ``text`` is the human-readable reasoning. ``signature`` is an opaque
+    integrity token that some providers require be returned verbatim in
+    subsequent turns when tools are in use (Anthropic ``signature``, Gemini
+    ``thoughtSignature``). ``encrypted=True`` covers Anthropic's
+    ``redacted_thinking`` and OpenAI's ``encrypted_content`` — the visible
+    ``text`` will be empty and the opaque payload lives in ``provider_data``.
+    ``provider_data`` is a passthrough for any other per-provider fields
+    (e.g. OpenAI reasoning item id) so the block can be round-tripped
+    losslessly."""
+
+    text: str
+    signature: str | None = None
+    encrypted: bool = False
+    provider_data: dict[str, Any] | None = None
+
+
+ContentBlock = Union[  # noqa: UP007
+    TextBlock, ImageBlock, ToolUseBlock, ToolResultBlock, ThinkingBlock
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,5 +136,6 @@ class StreamEvent:
     text_delta: str | None = None
     tool_call_delta: ToolCall | None = None
     thinking_delta: str | None = None
+    thinking_block: ThinkingBlock | None = None
     done: bool = False
     usage: Usage | None = None

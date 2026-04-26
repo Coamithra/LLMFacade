@@ -17,6 +17,7 @@ from llmfacade.models import (
     Response,
     StreamEvent,
     TextBlock,
+    ThinkingBlock,
     ToolCall,
     ToolResultBlock,
     ToolUseBlock,
@@ -114,12 +115,16 @@ class GoogleProvider(Provider):
         api_kwargs = self._build_kwargs(req)
         try:
             stream = self._client.models.generate_content_stream(**api_kwargs)
+            state: dict[str, Any] = {"thought_text": [], "thought_sig": None, "in_thought": False}
             last_usage: Usage | None = None
             for chunk in stream:
-                events, usage = self._chunk_to_events(chunk, api_kwargs["model"])
+                events, usage = self._chunk_to_events(chunk, state)
                 yield from events
                 if usage is not None:
                     last_usage = usage
+            flushed = self._flush_thought(state)
+            if flushed is not None:
+                yield flushed
             yield StreamEvent(done=True, usage=last_usage)
         except Exception as e:
             self._reraise(e)
@@ -129,29 +134,59 @@ class GoogleProvider(Provider):
         api_kwargs = self._build_kwargs(req)
         try:
             stream = await self._client.aio.models.generate_content_stream(**api_kwargs)
+            state: dict[str, Any] = {"thought_text": [], "thought_sig": None, "in_thought": False}
             last_usage: Usage | None = None
             async for chunk in stream:
-                events, usage = self._chunk_to_events(chunk, api_kwargs["model"])
+                events, usage = self._chunk_to_events(chunk, state)
                 for ev in events:
                     yield ev
                 if usage is not None:
                     last_usage = usage
+            flushed = self._flush_thought(state)
+            if flushed is not None:
+                yield flushed
             yield StreamEvent(done=True, usage=last_usage)
         except Exception as e:
             self._reraise(e)
             raise
 
-    def _chunk_to_events(self, chunk: Any, _model: str) -> tuple[list[StreamEvent], Usage | None]:
-        del _model
+    def _flush_thought(self, state: dict[str, Any]) -> StreamEvent | None:
+        if not state["in_thought"]:
+            return None
+        ev = StreamEvent(
+            thinking_block=ThinkingBlock(
+                text="".join(state["thought_text"]),
+                signature=state["thought_sig"],
+            )
+        )
+        state["thought_text"] = []
+        state["thought_sig"] = None
+        state["in_thought"] = False
+        return ev
+
+    def _chunk_to_events(
+        self, chunk: Any, state: dict[str, Any]
+    ) -> tuple[list[StreamEvent], Usage | None]:
         events: list[StreamEvent] = []
-        text = getattr(chunk, "text", None)
-        if text:
-            events.append(StreamEvent(text_delta=text))
         for cand in getattr(chunk, "candidates", []) or []:
             content = getattr(cand, "content", None)
             if content is None:
                 continue
             for part in getattr(content, "parts", []) or []:
+                if getattr(part, "thought", False):
+                    state["in_thought"] = True
+                    t = getattr(part, "text", "") or ""
+                    sig = getattr(part, "thought_signature", None)
+                    if t:
+                        state["thought_text"].append(t)
+                        events.append(StreamEvent(thinking_delta=t))
+                    if sig:
+                        state["thought_sig"] = sig
+                    continue
+                # Non-thought part: flush any pending thought first.
+                flushed = self._flush_thought(state)
+                if flushed is not None:
+                    events.append(flushed)
                 fn_call = getattr(part, "function_call", None)
                 if fn_call is not None:
                     events.append(
@@ -163,6 +198,10 @@ class GoogleProvider(Provider):
                             )
                         )
                     )
+                    continue
+                t = getattr(part, "text", None)
+                if t:
+                    events.append(StreamEvent(text_delta=t))
         usage = self._usage_from(chunk)
         return events, usage
 
@@ -208,6 +247,16 @@ class GoogleProvider(Provider):
                         "function_call": {"name": b.name, "args": b.input},
                     }
                 )
+            elif isinstance(b, ThinkingBlock):
+                # Gemini has no equivalent of Anthropic's redacted_thinking;
+                # encrypted blocks from another provider can't be reconstructed,
+                # so drop them. Plain thoughts round-trip with their signature.
+                if b.encrypted:
+                    continue
+                tp: dict[str, Any] = {"text": b.text, "thought": True}
+                if b.signature:
+                    tp["thought_signature"] = b.signature
+                parts.append(tp)
         return [{"role": role, "parts": parts}]
 
     def _tool_to_api(self, t: Any) -> dict[str, Any]:
@@ -218,16 +267,21 @@ class GoogleProvider(Provider):
         }
 
     def _parse_response(self, raw: Any, model: str) -> Response:
-        text = getattr(raw, "text", "") or ""
         blocks: list[ContentBlock] = []
         tool_calls: list[ToolCall] = []
-        if text:
-            blocks.append(TextBlock(text))
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
         for cand in getattr(raw, "candidates", []) or []:
             content = getattr(cand, "content", None)
             if content is None:
                 continue
             for part in getattr(content, "parts", []) or []:
+                if getattr(part, "thought", False):
+                    t = getattr(part, "text", "") or ""
+                    sig = getattr(part, "thought_signature", None)
+                    blocks.append(ThinkingBlock(text=t, signature=sig))
+                    thinking_parts.append(t)
+                    continue
                 fn_call = getattr(part, "function_call", None)
                 if fn_call is not None:
                     name = getattr(fn_call, "name", "")
@@ -235,12 +289,17 @@ class GoogleProvider(Provider):
                     use_id = f"call-{uuid.uuid4().hex}"
                     blocks.append(ToolUseBlock(id=use_id, name=name, input=args))
                     tool_calls.append(ToolCall(id=use_id, name=name, input=args))
+                    continue
+                t = getattr(part, "text", None)
+                if t:
+                    blocks.append(TextBlock(t))
+                    text_parts.append(t)
 
         return Response(
-            text=text,
+            text="".join(text_parts),
             blocks=blocks,
             tool_calls=tool_calls,
-            thinking=None,
+            thinking="".join(thinking_parts) or None,
             usage=self._usage_from(raw),
             finish_reason=None,
             model=model,

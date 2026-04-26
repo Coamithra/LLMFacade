@@ -17,6 +17,7 @@ from llmfacade.models import (
     Response,
     StreamEvent,
     TextBlock,
+    ThinkingBlock,
     ToolCall,
     ToolResultBlock,
     ToolUseBlock,
@@ -53,6 +54,10 @@ def _render_message_oneline(m: Message) -> str:
             parts.append(f"<tool_use {block.name} id={block.id}>")
         elif isinstance(block, ToolResultBlock):
             parts.append(f"<tool_result for={block.tool_use_id}>")
+        elif isinstance(block, ThinkingBlock):
+            tag = "redacted_thinking" if block.encrypted else "thinking"
+            sig = "+sig" if block.signature else ""
+            parts.append(f"<{tag} {len(block.text)}c{sig}>")
         else:
             parts.append(f"<{type(block).__name__}>")
     return f"[{m.role}] " + " ".join(parts)
@@ -64,6 +69,10 @@ def _message_to_text(m: Message) -> str:
     out: list[str] = []
     for block in m.content:
         if isinstance(block, TextBlock):
+            out.append(block.text)
+        elif isinstance(block, ThinkingBlock):
+            # Thinking content is sent back over the wire and counts toward
+            # input tokens, so include it in the cache-boundary estimate.
             out.append(block.text)
         elif isinstance(block, ToolUseBlock):
             out.append(block.name)
@@ -445,21 +454,21 @@ class Conversation:
         self._log_request(req, per_call)
 
         text_buf: list[str] = []
-        thinking_buf: list[str] = []
+        thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
         for ev in self._model.provider._stream_raw(req):
             if ev.text_delta:
                 text_buf.append(ev.text_delta)
-            if ev.thinking_delta:
-                thinking_buf.append(ev.thinking_delta)
+            if ev.thinking_block is not None:
+                thinking_blocks.append(ev.thinking_block)
             if ev.tool_call_delta:
                 tool_calls.append(ev.tool_call_delta)
             if ev.usage is not None:
                 last_usage = ev.usage
             yield ev
 
-        self._finalize_stream(text_buf, thinking_buf, tool_calls, last_usage)
+        self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
 
     async def astream(
         self,
@@ -506,31 +515,33 @@ class Conversation:
         self._log_request(req, per_call)
 
         text_buf: list[str] = []
-        thinking_buf: list[str] = []
+        thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
         async for ev in self._model.provider._astream_raw(req):
             if ev.text_delta:
                 text_buf.append(ev.text_delta)
-            if ev.thinking_delta:
-                thinking_buf.append(ev.thinking_delta)
+            if ev.thinking_block is not None:
+                thinking_blocks.append(ev.thinking_block)
             if ev.tool_call_delta:
                 tool_calls.append(ev.tool_call_delta)
             if ev.usage is not None:
                 last_usage = ev.usage
             yield ev
 
-        self._finalize_stream(text_buf, thinking_buf, tool_calls, last_usage)
+        self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
 
     def _finalize_stream(
         self,
         text_buf: list[str],
-        thinking_buf: list[str],
+        thinking_blocks: list[ThinkingBlock],
         tool_calls: list[ToolCall],
         usage: Any,
     ) -> None:
-        del thinking_buf, usage
-        blocks: list[ContentBlock] = []
+        del usage
+        # Order matters: Anthropic and Gemini both expect thinking blocks
+        # before any text or tool_use in the assistant turn when sent back.
+        blocks: list[ContentBlock] = list(thinking_blocks)
         if text_buf:
             blocks.append(TextBlock("".join(text_buf)))
         for call in tool_calls:

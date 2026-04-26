@@ -21,6 +21,7 @@ from llmfacade.models import (
     Response,
     StreamEvent,
     TextBlock,
+    ThinkingBlock,
     ToolCall,
     ToolResultBlock,
     ToolUseBlock,
@@ -62,6 +63,7 @@ __all__ = [
     "ImageBlock",
     "ToolUseBlock",
     "ToolResultBlock",
+    "ThinkingBlock",
     "ToolCall",
     # Exceptions
     "LLMError",

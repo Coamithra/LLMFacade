@@ -19,6 +19,7 @@ from llmfacade.models import (
     Message,
     Response,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     Usage,
 )
@@ -175,6 +176,13 @@ def _dump_block(b: ContentBlock, *, max_lines: int | None = None) -> dict[str, A
         return {"type": cls, "tool_use_id": b.tool_use_id, "is_error": b.is_error}
     if isinstance(b, ImageBlock):
         return {"type": cls, "media_type": b.media_type, "bytes": len(b.data)}
+    if isinstance(b, ThinkingBlock):
+        return {
+            "type": cls,
+            "text": _abbreviate_text(b.text, max_lines),
+            "encrypted": b.encrypted,
+            "signature": "<present>" if b.signature else None,
+        }
     return {"type": cls}
 
 

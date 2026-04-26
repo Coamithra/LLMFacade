@@ -15,6 +15,7 @@ from llmfacade.models import (
     Response,
     StreamEvent,
     TextBlock,
+    ThinkingBlock,
     ToolCall,
     ToolResultBlock,
     ToolUseBlock,
@@ -210,6 +211,11 @@ class OllamaProvider(Provider):
                         "function": {"name": b.name, "arguments": b.input},
                     }
                 )
+            elif isinstance(b, ThinkingBlock):
+                # Ollama's chat API has no canonical thinking-block format;
+                # local thinking models (deepseek-r1, qwen-thinking) emit
+                # reasoning inline and don't require round-trip. Drop.
+                continue
         out: dict[str, Any] = {"role": m.role, "content": "".join(text_parts)}
         if images:
             out["images"] = images

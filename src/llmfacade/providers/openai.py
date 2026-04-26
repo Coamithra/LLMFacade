@@ -19,6 +19,7 @@ from llmfacade.models import (
     Response,
     StreamEvent,
     TextBlock,
+    ThinkingBlock,
     ToolCall,
     ToolResultBlock,
     ToolUseBlock,
@@ -275,6 +276,11 @@ class OpenAIProvider(Provider):
                         "function": {"name": b.name, "arguments": _json.dumps(b.input)},
                     }
                 )
+            elif isinstance(b, ThinkingBlock):
+                # OpenAI Chat Completions can't round-trip reasoning content;
+                # the Responses API can but isn't wired up here. Drop on the
+                # way out so we don't send invalid payloads.
+                continue
         out: dict[str, Any] = {"role": m.role}
         if parts:
             if m.role == "user":

@@ -13,6 +13,7 @@ from llmfacade.models import (
     Response,
     StreamEvent,
     TextBlock,
+    ThinkingBlock,
     ToolUseBlock,
     Usage,
 )
@@ -49,12 +50,14 @@ class MockProvider(Provider):
         canned_text="ok",
         canned_tool_calls=None,
         canned_thinking=None,
+        canned_thinking_blocks=None,
         canned_usage=None,
         **knobs,
     ):
         self.canned_text = canned_text
         self.canned_tool_calls = canned_tool_calls or []
         self.canned_thinking = canned_thinking
+        self.canned_thinking_blocks: list[ThinkingBlock] = list(canned_thinking_blocks or [])
         self.canned_usage = canned_usage or Usage(
             prompt_tokens=10,
             completion_tokens=5,
@@ -73,16 +76,20 @@ class MockProvider(Provider):
         return "mock-key"
 
     def _make_response(self) -> Response:
-        blocks: list[ContentBlock] = []
+        blocks: list[ContentBlock] = list(self.canned_thinking_blocks)
         if self.canned_text:
             blocks.append(TextBlock(self.canned_text))
         for tc in self.canned_tool_calls:
             blocks.append(ToolUseBlock(id=tc.id, name=tc.name, input=tc.input))
+        derived_thinking = (
+            "".join(b.text for b in self.canned_thinking_blocks if not b.encrypted)
+            or self.canned_thinking
+        )
         return Response(
             text=self.canned_text,
             blocks=blocks,
             tool_calls=list(self.canned_tool_calls),
-            thinking=self.canned_thinking,
+            thinking=derived_thinking,
             usage=self.canned_usage,
             finish_reason="end_turn",
             model="mock-model",
@@ -99,6 +106,10 @@ class MockProvider(Provider):
 
     def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
         self.calls.append(MockCall(req=req))
+        for tb in self.canned_thinking_blocks:
+            if tb.text:
+                yield StreamEvent(thinking_delta=tb.text)
+            yield StreamEvent(thinking_block=tb)
         for chunk in self.canned_text.split():
             yield StreamEvent(text_delta=chunk + " ")
         for tc in self.canned_tool_calls:
@@ -107,6 +118,10 @@ class MockProvider(Provider):
 
     async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
         self.calls.append(MockCall(req=req))
+        for tb in self.canned_thinking_blocks:
+            if tb.text:
+                yield StreamEvent(thinking_delta=tb.text)
+            yield StreamEvent(thinking_block=tb)
         for chunk in self.canned_text.split():
             yield StreamEvent(text_delta=chunk + " ")
         for tc in self.canned_tool_calls:
