@@ -20,70 +20,68 @@ pip install llmfacade[all]                    # everything
 ```python
 from llmfacade import LLM
 
-provider = LLM.default().NewProvider("anthropic")    # reads ANTHROPIC_API_KEY
-model    = provider.NewModel("claude-sonnet-4-6")
-chat     = model.NewConversation()
+provider = LLM.default().new_provider("anthropic")    # reads ANTHROPIC_API_KEY
+model    = provider.new_model("claude-sonnet-4-6")
+chat     = model.new_conversation(system_blocks="You are a terse assistant.")
 
-chat.AddSystemBlock("You are a terse assistant.")
-chat.Start()
-
-resp = chat.Send("What is 2 + 2?")
+resp = chat.send("What is 2 + 2?")
 print(resp.text)
 ```
+
+There is no `Start()` step — conversations are usable immediately after construction.
 
 ## Architecture
 
 The library has a four-level hierarchy. Each level owns its own concerns and spawns the next:
 
 ```
-LLM           manager: shared api_keys
- -> Provider  auth + SDK client + per-provider knobs (BaseURL, BetaHeaders, ...)
-   -> Model   a model_id bound to a Provider + per-model knobs (TopP, Thinking, ...)
-     -> Conversation   stateful session: history, system blocks, tools, per-call settings
+LLM            manager: shared api_keys; LLM.default() is a process-wide singleton
+ -> Provider   identity (api_key, base_url) + SDK client + generation defaults
+   -> Model    a model_id bound to a provider, with optional model-level defaults
+     -> Conversation   stateful session: history, system blocks, tools, convo-level defaults
 ```
 
 ```python
 from llmfacade import LLM
 
 mgr      = LLM(api_keys={"anthropic": "sk-..."})
-provider = mgr.NewProvider("anthropic")
-model    = provider.NewModel("claude-sonnet-4-6")
-chat     = model.NewConversation(name="dnd-session")
+provider = mgr.new_provider("anthropic", temperature=0.7)
+model    = provider.new_model("claude-sonnet-4-6", max_tokens=2048)
+chat     = model.new_conversation()
 ```
 
-Every level exposes `isAvailable(setting)` and `getCapabilities()` so you can branch on what the current provider/model actually supports.
+Every level exposes `is_available(knob)` and `get_capabilities()` so you can branch on what the current provider/model actually supports.
 
-## Settings
+## Settings cascade
 
-Settings are enums grouped by where they live:
-
-| Enum | Lives on | Examples |
-|---|---|---|
-| `ProviderSettings` | Provider | `BaseURL`, `OrgID`, `BetaHeaders`, `KeepAlive` |
-| `Settings`         | Model    | `ContextSize`, `DefaultMaxTokens`, `DefaultTemperature`, `TopP`, `TopK`, `RepeatPenalty`, `Effort`, `Thinking` |
-| `ConvoSettings`    | Conversation | `AutoCacheLastUser`, `UserMetadata`, `OutputFormat` |
-
-Set a value via the `.settings` facade. Unsupported settings raise `UnsupportedFeature`:
+All generation knobs are plain string kwargs (`temperature`, `max_tokens`, `top_p`, `top_k`, `effort`, `thinking`, `output_format`, `auto_cache_last_user`, `cache_ttl`, `user_metadata`, `beta_headers`, `keep_alive`, `context_size`, `repeat_penalty`). Set defaults at any of four scopes:
 
 ```python
-from llmfacade import Settings, ConvoSettings, UnsupportedFeature
+provider = mgr.new_provider("anthropic", temperature=0.7)        # provider-wide default
+model    = provider.new_model("claude-opus-4-7", thinking=2048)  # narrows for this model
+chat     = model.new_conversation(temperature=0.3)               # narrows for this convo
+resp     = chat.send("Hello", max_tokens=128)                    # one-shot override
+```
 
-model.settings.set(Settings.DefaultMaxTokens, 2048)
+Precedence is `provider < model < convo < per_call` (later wins). Unknown kwarg names raise `TypeError`. Knobs not in the relevant layer's effective `SUPPORTS` raise `UnsupportedFeature` at construction:
 
-if chat.isAvailable(ConvoSettings.AutoCacheLastUser):
-    chat.settings.set(ConvoSettings.AutoCacheLastUser, True)
+```python
+from llmfacade import UnsupportedFeature
+
+if chat.is_available("auto_cache_last_user"):
+    chat = model.new_conversation(auto_cache_last_user=True)
 
 try:
-    chat.settings.set(Settings.Thinking, 2048)   # not on every model
+    chat = model.new_conversation(thinking=2048)   # not on every model
 except UnsupportedFeature as e:
     print(e)
 ```
 
-Conversation settings lock when you call `Start()`. After that, only per-call overrides on `Send`/`Stream` are allowed.
+Configuration is constructor-only: identity (api_key, base_url, model_id, system_blocks, tools, log_path) and defaults are supplied at construction and never change after.
 
 ## Tools
 
-Decorate any function with `@tool`. The schema is generated from its signature and docstring.
+Decorate any function with `@tool`. The schema is generated from its signature, type hints, and docstring.
 
 ```python
 from llmfacade import tool
@@ -93,18 +91,17 @@ def forge_item(item: str, material: str = "iron") -> str:
     """Forge an item out of a material. Returns a description string."""
     return f"You receive a {material} {item}."
 
-chat.AddTool(forge_item)
-chat.Start()
+chat = model.new_conversation(tools=[forge_item])
 
 # One round-trip: model may return tool_calls.
-resp = chat.Send("Make me a sword.")
+resp = chat.send("Make me a sword.")
 for call in resp.tool_calls:
-    chat.AddToolResult(call.id, str(forge_item(**call.input)), name=call.name)
-resp = chat.Send()                # continue with the tool results
+    chat.add_tool_result(call.id, str(forge_item(**call.input)), name=call.name)
+resp = chat.send()                # continue with the tool results
 print(resp.text)
 ```
 
-`Send`/`Stream` are exactly one provider round-trip. The library never auto-executes user code. For the common case — run every tool the model calls, send results back, repeat until done — use `llmfacade.helpers.run_to_completion`:
+`send`/`stream` are exactly one provider round-trip. The library never auto-executes user code. For the common case — run every tool the model calls, send results back, repeat until done — use `llmfacade.helpers.run_to_completion`:
 
 ```python
 from llmfacade import helpers
@@ -113,66 +110,67 @@ resp = helpers.run_to_completion(chat, "Make me a sword.")
 print(resp.text)
 ```
 
-`helpers.run_bound_tools(chat, resp)` is the lower-level building block: it dispatches tool calls whose name matches a `@tool` registered on the conversation. Because the helpers only use the public API, you can write your own (e.g. with approval prompts or parallel dispatch) without subclassing anything.
+`helpers.run_bound_tools(chat, resp)` is the lower-level building block: it dispatches tool calls whose name matches a `@tool` registered on the conversation. Because the helpers only use the public API, you can write your own (e.g. with approval prompts or parallel dispatch) without subclassing anything. Async equivalents: `arun_bound_tools`, `arun_to_completion`.
 
 ## Streaming, async, multimodal
 
 ```python
 # Streaming
-for ev in chat.Stream("Tell me a story."):
+for ev in chat.stream("Tell me a story."):
     if ev.text_delta:
         print(ev.text_delta, end="", flush=True)
 
 # Async
 import asyncio
-resp = asyncio.run(chat.aSend("Briefly?"))
+resp = asyncio.run(chat.asend("Briefly?"))
 
 # Multimodal
 from llmfacade import ImageBlock, TextBlock
-chat.AddUserMessage(content=[
+chat.add_user_message(content=[
     TextBlock("What's in this image?"),
     ImageBlock.from_path("photo.png"),
 ])
-resp = chat.Send()
+resp = chat.send()
 ```
+
+`stream` and `send` are both strict single round-trips with the same wire-format guard: if history contains a `tool_use` without a matching `tool_result`, both raise `ConversationStateError`.
 
 ## Snapshot / Rollback / Clone
 
 ```python
-snap = chat.Snapshot()
-chat.Send("[experiment]")
-chat.Rollback(snap)               # back to pre-experiment state
+snap = chat.snapshot()
+chat.send("[experiment]")
+chat.rollback(snap)               # back to pre-experiment state
 
-alt = chat.Clone()                # independent copy with the same history & tools
-alt.Start()
+alt = chat.clone()                # independent copy with the same history & tools
 ```
 
 ## Logging
 
+Pass `log_path=` at conversation construction to write a JSONL log of every request and response. The first record is a `settings` header listing every effective knob, its value, and which scope (`provider`/`model`/`convo`) supplied it. Subsequent records are tight: `request` carries only `overrides` and `new_messages` (delta since last log); `response` carries the assistant content and a `cache_summary` block (cache_read_tokens, cache_creation_tokens, hit_ratio, etc.).
+
 ```python
-chat.SetLogging("./logs/session.jsonl")   # JSONL of every request and response
+chat = model.new_conversation(log_path="./logs/session.jsonl")
 ```
 
 ## Providers
 
 | Provider | Install extra | API key env | Notes |
 |---|---|---|---|
-| Anthropic | `[anthropic]` | `ANTHROPIC_API_KEY` | Extended thinking, prompt caching, system blocks with `cache=True` |
-| OpenAI    | `[openai]`    | `OPENAI_API_KEY`    | JSON `OutputFormat`, `OrgID` |
-| Google Gemini | `[google]` | `GOOGLE_API_KEY`   | Registered as both `"google"` and `"gemini"` |
-| Ollama    | `[ollama]`    | (none)              | `BaseURL` for remote, `ContextSize` -> `num_ctx`, warns on silent context truncation |
+| Anthropic | `[anthropic]` | `ANTHROPIC_API_KEY` | Extended thinking, prompt caching, system blocks with `cache=True`, `cache_ttl`. Exports `AnthropicModel` enum (`OPUS_4_7`, `SONNET_4_6`, `HAIKU_4_5`) — passing a member to `new_model` auto-applies model id and capability metadata. |
+| OpenAI    | `[openai]`    | `OPENAI_API_KEY`    | `output_format` (JSON mode); `org_id` constructor arg. |
+| Google Gemini | `[google]` | `GOOGLE_API_KEY`   | Registered as both `"google"` and `"gemini"`. |
+| Ollama    | `[ollama]`    | (none)              | `base_url` for remote hosts; `context_size` → `num_ctx`; `max_tokens` → `num_predict`; warns on silent context truncation. |
 
 ## Exceptions
 
 All errors derive from `LLMError`:
 
 - `AuthenticationError`, `RateLimitError`, `ProviderError`, `ModelNotFoundError`
-- `ProviderNotInstalledError` - the SDK extra wasn't installed
-- `UnsupportedFeature` - setting not supported by this provider/model
-- `NotStartedError` - operation needs `Conversation.Start()`
-- `SettingsLockedError` - tried to mutate settings after `Start()`
-- `ConversationStateError` - history has unresolved `tool_use` blocks; append `tool_result`s before sending again
-- `ToolIterationLimitError` - `helpers.run_to_completion` exceeded `max_iterations`
+- `ProviderNotInstalledError` — the SDK extra wasn't installed
+- `UnsupportedFeature` — knob not supported by this provider/model
+- `ConversationStateError` — history has unresolved `tool_use` blocks; append `tool_result`s before sending again
+- `ToolIterationLimitError` — `helpers.run_to_completion` exceeded `max_iterations`
 
 ## Development
 
