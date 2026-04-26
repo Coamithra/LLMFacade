@@ -21,13 +21,7 @@ from llmfacade.models import (
     Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider
-from llmfacade.settings import (
-    AnySetting,
-    ConvoSettings,
-    OutputFormat,
-    ProviderSettings,
-    Settings,
-)
+from llmfacade.settings import OutputFormat
 
 
 class OllamaProvider(Provider):
@@ -37,17 +31,16 @@ class OllamaProvider(Provider):
 
     NAME = "ollama"
     API_KEY_ENV = None
-    SUPPORTS: frozenset[AnySetting] = frozenset(
+    SUPPORTS: frozenset[str] = frozenset(
         {
-            ProviderSettings.BaseURL,
-            ProviderSettings.KeepAlive,
-            Settings.ContextSize,
-            Settings.DefaultMaxTokens,
-            Settings.DefaultTemperature,
-            Settings.TopP,
-            Settings.TopK,
-            Settings.RepeatPenalty,
-            ConvoSettings.OutputFormat,
+            "context_size",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "repeat_penalty",
+            "output_format",
+            "keep_alive",
         }
     )
 
@@ -72,28 +65,29 @@ class OllamaProvider(Provider):
             api_msgs.append(
                 {
                     "role": "system",
-                    "content": "\n\n".join(text for text, _cache in req.system_blocks),
+                    "content": "\n\n".join(sb.text for sb in req.system_blocks),
                 }
             )
         for m in req.messages:
             api_msgs.extend(self._message_to_api(m))
 
         options: dict[str, Any] = {
-            "num_predict": req.max_tokens,
+            "num_predict": req.settings.get("max_tokens", 1024),
         }
-        if req.temperature is not None:
-            options["temperature"] = req.temperature
-        ctx = req.model_settings.get(Settings.ContextSize)
+        temperature = req.settings.get("temperature")
+        if temperature is not None:
+            options["temperature"] = temperature
+        ctx = req.settings.get("context_size")
         if ctx is not None:
             options["num_ctx"] = ctx
         if req.stop:
             options["stop"] = req.stop
         for setting, key in (
-            (Settings.TopP, "top_p"),
-            (Settings.TopK, "top_k"),
-            (Settings.RepeatPenalty, "repeat_penalty"),
+            ("top_p", "top_p"),
+            ("top_k", "top_k"),
+            ("repeat_penalty", "repeat_penalty"),
         ):
-            value = req.per_call_overrides.get(setting, req.model_settings.get(setting))
+            value = req.settings.get(setting)
             if value is not None:
                 options[key] = value
 
@@ -102,11 +96,11 @@ class OllamaProvider(Provider):
             "messages": api_msgs,
             "options": options,
         }
-        keep_alive = req.provider_settings.get(ProviderSettings.KeepAlive)
+        keep_alive = req.settings.get("keep_alive")
         if keep_alive is not None:
             chat_kwargs["keep_alive"] = keep_alive
 
-        out_format = req.convo_settings.get(ConvoSettings.OutputFormat)
+        out_format = req.settings.get("output_format")
         if out_format is not None:
             value = out_format.value if isinstance(out_format, OutputFormat) else out_format
             if value == "json":
@@ -188,9 +182,7 @@ class OllamaProvider(Provider):
             for b in blocks:
                 if isinstance(b, ToolResultBlock):
                     text = (
-                        b.content
-                        if isinstance(b.content, str)
-                        else flatten_text_blocks(b.content)
+                        b.content if isinstance(b.content, str) else flatten_text_blocks(b.content)
                     )
                     results.append(
                         {
@@ -278,7 +270,7 @@ class OllamaProvider(Provider):
         if ctx is not None and prompt >= ctx * 0.95:
             warnings.warn(
                 f"Ollama evaluated {prompt} prompt tokens against a num_ctx of {ctx} - "
-                "input was likely truncated from the front. Increase ContextSize or shorten "
+                "input was likely truncated from the front. Increase context_size or shorten "
                 "your prompt.",
                 stacklevel=2,
             )
@@ -287,5 +279,3 @@ class OllamaProvider(Provider):
             completion_tokens=completion,
             total_tokens=prompt + completion,
         )
-
-

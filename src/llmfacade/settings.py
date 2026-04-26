@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import Enum, auto
+from enum import Enum
 
 
 class EffortLevel(Enum):
@@ -21,35 +21,33 @@ class EphemeralCacheTTL(Enum):
     ONE_HOUR = "1h"
 
 
-class ProviderSettings(Enum):
-    """Settings that live on a Provider instance (auth, connection, per-provider knobs)."""
-
-    BaseURL = auto()
-    OrgID = auto()
-    BetaHeaders = auto()
-    KeepAlive = auto()
-
-
-class Settings(Enum):
-    """Settings that live on a Model instance (load-time / per-call generation knobs)."""
-
-    ContextSize = auto()
-    DefaultMaxTokens = auto()
-    DefaultTemperature = auto()
-    TopP = auto()
-    TopK = auto()
-    RepeatPenalty = auto()
-    Effort = auto()
-    Thinking = auto()
-
-
-class ConvoSettings(Enum):
-    """Settings that live on a Conversation instance (per-session knobs)."""
-
-    AutoCacheLastUser = auto()
-    UserMetadata = auto()
-    OutputFormat = auto()
-    CacheTTL = auto()
+# Every knob that a provider may accept as a per-request parameter. Each
+# provider's class-level SUPPORTS frozenset declares which subset it accepts.
+# Defaults can be set at provider, model, or conversation construction;
+# per-call overrides at send/stream. The cascade merges them in that order.
+RUNTIME_KNOBS: frozenset[str] = frozenset(
+    {
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "top_k",
+        "repeat_penalty",
+        "effort",
+        "thinking",
+        "output_format",
+        "user_metadata",
+        "cache_ttl",
+        "auto_cache_last_user",
+        "beta_headers",
+        "keep_alive",
+        "context_size",
+    }
+)
 
 
-AnySetting = ProviderSettings | Settings | ConvoSettings
+__all__ = [
+    "EffortLevel",
+    "OutputFormat",
+    "EphemeralCacheTTL",
+    "RUNTIME_KNOBS",
+]

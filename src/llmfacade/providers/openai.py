@@ -25,18 +25,12 @@ from llmfacade.models import (
     Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider
-from llmfacade.settings import (
-    AnySetting,
-    ConvoSettings,
-    OutputFormat,
-    ProviderSettings,
-    Settings,
-)
+from llmfacade.settings import OutputFormat
 
 
 def _openai_cached_tokens(usage: Any) -> int:
     """Pull cached prompt-token count from OpenAI usage. Lives in
-    `prompt_tokens_details.cached_tokens` on chat-completion responses."""
+    ``prompt_tokens_details.cached_tokens`` on chat-completion responses."""
     details = getattr(usage, "prompt_tokens_details", None)
     if details is None:
         return 0
@@ -46,17 +40,19 @@ def _openai_cached_tokens(usage: Any) -> int:
 class OpenAIProvider(Provider):
     NAME = "openai"
     API_KEY_ENV = "OPENAI_API_KEY"
-    SUPPORTS: frozenset[AnySetting] = frozenset(
+    SUPPORTS: frozenset[str] = frozenset(
         {
-            ProviderSettings.BaseURL,
-            ProviderSettings.OrgID,
-            Settings.ContextSize,
-            Settings.DefaultMaxTokens,
-            Settings.DefaultTemperature,
-            Settings.TopP,
-            ConvoSettings.OutputFormat,
+            "context_size",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "output_format",
         }
     )
+
+    def __init__(self, *, org_id: str | None = None, **kwargs: Any):
+        self._org_id = org_id
+        super().__init__(**kwargs)
 
     def _init_client(self) -> None:
         try:
@@ -70,9 +66,8 @@ class OpenAIProvider(Provider):
         client_kwargs: dict[str, Any] = {"api_key": key}
         if self._base_url:
             client_kwargs["base_url"] = self._base_url
-        org_id = self.settings.get(ProviderSettings.OrgID)
-        if org_id:
-            client_kwargs["organization"] = org_id
+        if self._org_id:
+            client_kwargs["organization"] = self._org_id
         self._client = _openai.OpenAI(**client_kwargs)
         self._aclient = _openai.AsyncOpenAI(**client_kwargs)
         self._module = _openai
@@ -99,7 +94,7 @@ class OpenAIProvider(Provider):
             api_msgs.append(
                 {
                     "role": "system",
-                    "content": "\n\n".join(text for text, _cache in req.system_blocks),
+                    "content": "\n\n".join(sb.text for sb in req.system_blocks),
                 }
             )
         for m in req.messages:
@@ -108,13 +103,14 @@ class OpenAIProvider(Provider):
         api_kwargs: dict[str, Any] = {
             "model": req.model,
             "messages": api_msgs,
-            "max_tokens": req.max_tokens,
+            "max_tokens": req.settings.get("max_tokens", 1024),
         }
-        if req.temperature is not None:
-            api_kwargs["temperature"] = req.temperature
+        temperature = req.settings.get("temperature")
+        if temperature is not None:
+            api_kwargs["temperature"] = temperature
         if req.stop:
             api_kwargs["stop"] = req.stop
-        top_p = req.per_call_overrides.get(Settings.TopP, req.model_settings.get(Settings.TopP))
+        top_p = req.settings.get("top_p")
         if top_p is not None:
             api_kwargs["top_p"] = top_p
 
@@ -122,7 +118,7 @@ class OpenAIProvider(Provider):
             api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
             api_kwargs["tool_choice"] = self._tool_choice_to_api(req.tool_choice)
 
-        out_format = req.convo_settings.get(ConvoSettings.OutputFormat)
+        out_format = req.settings.get("output_format")
         if out_format is not None:
             value = out_format.value if isinstance(out_format, OutputFormat) else out_format
             if value == "json":
@@ -241,9 +237,7 @@ class OpenAIProvider(Provider):
             for b in blocks:
                 if isinstance(b, ToolResultBlock):
                     text = (
-                        b.content
-                        if isinstance(b.content, str)
-                        else flatten_text_blocks(b.content)
+                        b.content if isinstance(b.content, str) else flatten_text_blocks(b.content)
                     )
                     results.append(
                         {
@@ -356,5 +350,3 @@ class OpenAIProvider(Provider):
             model=raw.model,
             raw=raw,
         )
-
-

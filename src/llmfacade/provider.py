@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-import contextlib
 import os
+import warnings
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from llmfacade.exceptions import AuthenticationError, SettingsLockedError, UnsupportedFeature
-from llmfacade.settings import (
-    AnySetting,
-    ConvoSettings,
-    ProviderSettings,
-    Settings,
-)
+from llmfacade.exceptions import AuthenticationError, UnsupportedFeature
+from llmfacade.settings import RUNTIME_KNOBS
 
 if TYPE_CHECKING:
     from llmfacade.facade import LLM
@@ -22,75 +17,101 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
+class SystemBlock:
+    """A piece of system prompt. ``cache=True`` requests an ephemeral cache
+    marker on providers that support prompt caching (currently Anthropic)."""
+
+    text: str
+    cache: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class CompletionRequest:
     """Single round-trip request to a provider's raw hook.
 
-    Bundles every input the four `_*_raw` hooks need. Built once by
-    `Conversation._build_request` per call; consumed positionally by
-    `_complete_raw` / `_acomplete_raw` / `_stream_raw` / `_astream_raw`.
+    ``settings`` is the merged effective set: provider defaults < model
+    defaults < convo defaults < per-call overrides. Providers read knobs
+    directly from this dict (e.g. ``req.settings.get("temperature")``).
+    ``settings_source`` records where each key came from, for logging.
     """
 
     model: str
     messages: list[Message]
-    system_blocks: list[tuple[str, bool]]
+    system_blocks: list[SystemBlock]
     tools: list[Tool]
     tool_choice: str
-    max_tokens: int
-    temperature: float | None
     stop: list[str] | None
-    provider_settings: dict[AnySetting, Any] = field(default_factory=dict)
-    model_settings: dict[AnySetting, Any] = field(default_factory=dict)
-    convo_settings: dict[AnySetting, Any] = field(default_factory=dict)
-    per_call_overrides: dict[AnySetting, Any] = field(default_factory=dict)
+    settings: dict[str, Any] = field(default_factory=dict)
+    settings_source: dict[str, str] = field(default_factory=dict)
 
 
-class _SettingsFacade:
-    """Capability-aware settings store. Used at every layer."""
+# Track (key, source_scope, model_id) tuples we've already warned about so
+# cascade-time mismatches don't spam the same message every send().
+_WARNED_DROPS: set[tuple[str, str, str]] = set()
 
-    def __init__(
-        self,
-        owner: Provider | Model | object,
-        supports: frozenset[AnySetting],
-        provider_name: str,
-        model_id: str | None = None,
-    ):
-        self._owner = owner
-        self._supports = supports
-        self._provider_name = provider_name
-        self._model_id = model_id
-        self._values: dict[AnySetting, Any] = {}
-        self._locked = False
 
-    def isAvailable(self, setting: AnySetting) -> bool:
-        return setting in self._supports
+def _validate_knobs(
+    knobs: dict[str, Any],
+    supports: frozenset[str],
+    provider: str,
+    model: str | None,
+) -> dict[str, Any]:
+    """Return the non-None subset of ``knobs``, validated against ``supports``.
 
-    def getCapabilities(self) -> set[AnySetting]:
-        return set(self._supports)
+    Unknown keys raise ``TypeError``. Known but unsupported keys raise
+    ``UnsupportedFeature``."""
+    out: dict[str, Any] = {}
+    for k, v in knobs.items():
+        if k not in RUNTIME_KNOBS:
+            raise TypeError(f"Unknown setting {k!r}. Valid: {sorted(RUNTIME_KNOBS)}")
+        if v is None:
+            continue
+        if k not in supports:
+            raise UnsupportedFeature(k, provider, model)
+        out[k] = v
+    return out
 
-    def set(self, setting: AnySetting, value: Any) -> None:
-        if self._locked:
-            raise SettingsLockedError(f"Cannot change {setting.name} after Start().")
-        if setting not in self._supports:
-            raise UnsupportedFeature(setting, self._provider_name, self._model_id)
-        self._values[setting] = value
 
-    def get(self, setting: AnySetting, default: Any = None) -> Any:
-        return self._values.get(setting, default)
+def _filter_unsupported(
+    merged: dict[str, Any],
+    sources: dict[str, str],
+    supports: frozenset[str],
+    provider: str,
+    model: str,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Drop keys not in ``supports``. Warn once per (key, source, model)."""
+    out: dict[str, Any] = {}
+    out_src: dict[str, str] = {}
+    for k, v in merged.items():
+        if k not in supports:
+            src = sources.get(k, "?")
+            tag = (k, src, model)
+            if tag not in _WARNED_DROPS:
+                _WARNED_DROPS.add(tag)
+                warnings.warn(
+                    f"Setting {k!r} from {src!r} scope is not supported by "
+                    f"model {model!r} (provider {provider!r}); ignoring.",
+                    stacklevel=4,
+                )
+            continue
+        out[k] = v
+        out_src[k] = sources[k]
+    return out, out_src
 
-    def has(self, setting: AnySetting) -> bool:
-        return setting in self._values
 
-    def _lock(self) -> None:
-        self._locked = True
-
-    def _snapshot(self) -> dict[AnySetting, Any]:
-        return dict(self._values)
+# Argument list shared by Provider.__init__, Provider.new_model,
+# Model.__init__, Model.new_conversation, Conversation.__init__, and the four
+# send/stream variants. Centralised so a new knob only has to be added in two
+# places (RUNTIME_KNOBS and here).
+_KNOB_DEFAULTS: dict[str, Any] = {k: None for k in RUNTIME_KNOBS}
 
 
 class Provider:
-    """Public Provider base class. Owns auth, connection, SDK client; spawns Models."""
+    """Base provider. Identity (api_key, base_url) is constructor-only.
+    Generation defaults are accepted as kwargs and apply to every model and
+    conversation under this provider unless overridden at a lower scope."""
 
-    SUPPORTS: frozenset[AnySetting] = frozenset()
+    SUPPORTS: frozenset[str] = frozenset()
     NAME: str = "provider"
     API_KEY_ENV: str | None = None
 
@@ -100,52 +121,114 @@ class Provider:
         manager: LLM | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
+        # Generation defaults (subset of RUNTIME_KNOBS). Each is gated by SUPPORTS.
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
     ):
         self._manager = manager
         self._api_key_override = api_key
         self._base_url = base_url
-        self.settings = _SettingsFacade(self, self.SUPPORTS, self.NAME)
-        if base_url is not None:
-            with contextlib.suppress(UnsupportedFeature):
-                self.settings.set(ProviderSettings.BaseURL, base_url)
+        self._defaults = _validate_knobs(
+            {
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repeat_penalty": repeat_penalty,
+                "effort": effort,
+                "thinking": thinking,
+                "output_format": output_format,
+                "user_metadata": user_metadata,
+                "cache_ttl": cache_ttl,
+                "auto_cache_last_user": auto_cache_last_user,
+                "beta_headers": beta_headers,
+                "keep_alive": keep_alive,
+                "context_size": context_size,
+            },
+            self.SUPPORTS,
+            self.NAME,
+            None,
+        )
         self._init_client()
 
     @classmethod
-    def create(
-        cls,
-        provider_name: str,
-        *,
-        api_key: str | None = None,
-        base_url: str | None = None,
-    ) -> Provider:
+    def create(cls, provider_name: str, **kwargs: Any) -> Provider:
         """Build a Provider via the default LLM manager (no explicit manager needed)."""
         from llmfacade.facade import LLM
 
-        return LLM.default().NewProvider(provider_name, api_key=api_key, base_url=base_url)
+        return LLM.default().new_provider(provider_name, **kwargs)
 
-    def NewModel(
+    def new_model(
         self,
         model_id: str,
         *,
-        capability_override: frozenset[AnySetting] | None = None,
+        capability_override: frozenset[str] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
     ) -> Model:
         from llmfacade.model import Model
 
+        defaults = {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repeat_penalty": repeat_penalty,
+            "effort": effort,
+            "thinking": thinking,
+            "output_format": output_format,
+            "user_metadata": user_metadata,
+            "cache_ttl": cache_ttl,
+            "auto_cache_last_user": auto_cache_last_user,
+            "beta_headers": beta_headers,
+            "keep_alive": keep_alive,
+            "context_size": context_size,
+        }
         return Model(
             provider=self,
             model_id=model_id,
             capability_override=capability_override,
+            **defaults,
         )
 
-    def isAvailable(self, setting: AnySetting) -> bool:
+    def is_available(self, setting: str) -> bool:
         return setting in self.SUPPORTS
 
-    def getCapabilities(self) -> set[AnySetting]:
+    def get_capabilities(self) -> set[str]:
         return set(self.SUPPORTS)
 
     @property
     def name(self) -> str:
         return self.NAME
+
+    @property
+    def defaults(self) -> dict[str, Any]:
+        """Read-only view of the generation defaults set on this provider."""
+        return dict(self._defaults)
 
     def _resolve_key(self, env_var: str) -> str:
         if self._api_key_override:
@@ -164,13 +247,11 @@ class Provider:
         """Subclasses override to construct their SDK client."""
 
     def _estimate_tokens(self, text: str, model_id: str) -> int:
-        """Approximate token count for `text`. Used by the cache-summary
+        """Approximate token count for ``text``. Used by the cache-summary
         diagnostic to map cache_read_tokens back to message indices.
 
         Default is ``chars / 4``, which is a coarse English-biased fallback.
-        Subclasses should override with a real local tokenizer when available
-        (e.g., tiktoken for OpenAI). Anthropic and Google ship no offline
-        tokenizer, so they stay on the chars/4 fallback."""
+        Subclasses should override with a real local tokenizer when available."""
         del model_id
         return max(1, len(text) // 4)
 
@@ -190,8 +271,5 @@ class Provider:
 __all__ = [
     "CompletionRequest",
     "Provider",
-    "ProviderSettings",
-    "Settings",
-    "ConvoSettings",
-    "_SettingsFacade",
+    "SystemBlock",
 ]

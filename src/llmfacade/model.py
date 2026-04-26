@@ -1,31 +1,67 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from llmfacade.provider import _SettingsFacade
-from llmfacade.settings import AnySetting
+from llmfacade.provider import _validate_knobs
 
 if TYPE_CHECKING:
     from llmfacade.conversation import Conversation
-    from llmfacade.provider import Provider
+    from llmfacade.provider import Provider, SystemBlock
+    from llmfacade.tools import Tool
 
 
 class Model:
-    """A specific model_id bound to a Provider, with model-level settings."""
+    """A specific model_id bound to a Provider, with optional model-level
+    generation defaults. Identity (provider, model_id) is constructor-only.
+
+    ``capability_override`` narrows the set of supported settings below the
+    provider's full SUPPORTS — used for models that don't honor a feature
+    the provider generally implements (e.g. extended thinking)."""
 
     def __init__(
         self,
         *,
         provider: Provider,
         model_id: str,
-        capability_override: frozenset[AnySetting] | None = None,
+        capability_override: frozenset[str] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
     ):
         self._provider = provider
         self._model_id = model_id
-        effective = capability_override if capability_override is not None else provider.SUPPORTS
-        self.settings = _SettingsFacade(
-            self,
-            effective,
+        self._supports: frozenset[str] = (
+            capability_override if capability_override is not None else provider.SUPPORTS
+        )
+        self._defaults = _validate_knobs(
+            {
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repeat_penalty": repeat_penalty,
+                "effort": effort,
+                "thinking": thinking,
+                "output_format": output_format,
+                "user_metadata": user_metadata,
+                "cache_ttl": cache_ttl,
+                "auto_cache_last_user": auto_cache_last_user,
+                "beta_headers": beta_headers,
+                "keep_alive": keep_alive,
+                "context_size": context_size,
+            },
+            self._supports,
             provider.NAME,
             model_id,
         )
@@ -38,16 +74,63 @@ class Model:
     def model_id(self) -> str:
         return self._model_id
 
-    def isAvailable(self, setting: AnySetting) -> bool:
-        return self.settings.isAvailable(setting)
+    @property
+    def defaults(self) -> dict[str, Any]:
+        return dict(self._defaults)
 
-    def getCapabilities(self) -> set[AnySetting]:
-        return self.settings.getCapabilities()
+    def is_available(self, setting: str) -> bool:
+        return setting in self._supports
 
-    def NewConversation(self, name: str | None = None) -> Conversation:
+    def get_capabilities(self) -> set[str]:
+        return set(self._supports)
+
+    def new_conversation(
+        self,
+        *,
+        name: str | None = None,
+        system_blocks: list[SystemBlock | str] | None = None,
+        tools: list[Tool] | None = None,
+        log_path: Any | None = None,
+        log_max_message_lines: int | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
+    ) -> Conversation:
         from llmfacade.conversation import Conversation
 
-        return Conversation(model=self, name=name)
+        return Conversation(
+            model=self,
+            name=name,
+            system_blocks=system_blocks,
+            tools=tools,
+            log_path=log_path,
+            log_max_message_lines=log_max_message_lines,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            effort=effort,
+            thinking=thinking,
+            output_format=output_format,
+            user_metadata=user_metadata,
+            cache_ttl=cache_ttl,
+            auto_cache_last_user=auto_cache_last_user,
+            beta_headers=beta_headers,
+            keep_alive=keep_alive,
+            context_size=context_size,
+        )
 
     def __repr__(self) -> str:
         return f"Model(provider={self._provider.NAME!r}, model_id={self._model_id!r})"

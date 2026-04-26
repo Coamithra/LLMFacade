@@ -6,11 +6,9 @@ from llmfacade.exceptions import (
     ConversationStateError,
     LLMError,
     ModelNotFoundError,
-    NotStartedError,
     ProviderError,
     ProviderNotInstalledError,
     RateLimitError,
-    SettingsLockedError,
     ToolIterationLimitError,
     UnsupportedFeature,
 )
@@ -28,14 +26,12 @@ from llmfacade.models import (
     ToolUseBlock,
     Usage,
 )
-from llmfacade.provider import Provider
+from llmfacade.provider import CompletionRequest, Provider, SystemBlock
 from llmfacade.settings import (
-    AnySetting,
-    ConvoSettings,
+    RUNTIME_KNOBS,
     EffortLevel,
+    EphemeralCacheTTL,
     OutputFormat,
-    ProviderSettings,
-    Settings,
 )
 from llmfacade.tools import Tool, tool
 
@@ -46,13 +42,13 @@ __all__ = [
     "Model",
     "Conversation",
     "Snapshot",
+    "SystemBlock",
+    "CompletionRequest",
     # Settings
-    "ProviderSettings",
-    "Settings",
-    "ConvoSettings",
-    "AnySetting",
+    "RUNTIME_KNOBS",
     "EffortLevel",
     "OutputFormat",
+    "EphemeralCacheTTL",
     # Tools
     "tool",
     "Tool",
@@ -75,8 +71,6 @@ __all__ = [
     "ModelNotFoundError",
     "ProviderNotInstalledError",
     "UnsupportedFeature",
-    "NotStartedError",
-    "SettingsLockedError",
     "ToolIterationLimitError",
     "ConversationStateError",
     # Helpers

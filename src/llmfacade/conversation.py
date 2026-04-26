@@ -8,12 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from llmfacade.exceptions import (
-    ConversationStateError,
-    NotStartedError,
-    SettingsLockedError,
-    UnsupportedFeature,
-)
+from llmfacade.exceptions import ConversationStateError, UnsupportedFeature
 from llmfacade.helpers import _abbreviate_text, _dump_message, _dump_usage, _log_default
 from llmfacade.models import (
     ContentBlock,
@@ -26,36 +21,23 @@ from llmfacade.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from llmfacade.provider import CompletionRequest, _SettingsFacade
-from llmfacade.settings import AnySetting, ConvoSettings, Settings
+from llmfacade.provider import (
+    CompletionRequest,
+    SystemBlock,
+    _filter_unsupported,
+    _validate_knobs,
+)
 from llmfacade.tools import Tool
 
 if TYPE_CHECKING:
     from llmfacade.model import Model
 
 
-_PER_CALL_OVERRIDE_KEYS: dict[str, AnySetting] = {
-    "max_tokens": Settings.DefaultMaxTokens,
-    "temperature": Settings.DefaultTemperature,
-    "top_p": Settings.TopP,
-    "top_k": Settings.TopK,
-    "effort": Settings.Effort,
-    "repeat_penalty": Settings.RepeatPenalty,
-}
-
-
-@dataclass(frozen=True, slots=True)
-class _SystemBlock:
-    text: str
-    cache: bool
-
-
 @dataclass(frozen=True, slots=True)
 class Snapshot:
-    """Opaque snapshot token for Conversation.Rollback()."""
+    """Opaque snapshot token for ``Conversation.rollback()``."""
 
     history: tuple[Message, ...]
-    system_blocks: tuple[_SystemBlock, ...]
 
 
 def _render_message_oneline(m: Message) -> str:
@@ -77,9 +59,6 @@ def _render_message_oneline(m: Message) -> str:
 
 
 def _message_to_text(m: Message) -> str:
-    """Concatenate the textual content of a message for token estimation.
-    Image blocks contribute a fixed estimate per provider (handled at the
-    summary level, not here)."""
     if isinstance(m.content, str):
         return m.content
     out: list[str] = []
@@ -98,7 +77,7 @@ def _message_to_text(m: Message) -> str:
 
 
 def _tokenizer_label(provider: Any, model_id: str) -> str:
-    """Best-effort label of the tokenizer used for cache_summary estimates."""
+    del model_id
     if provider.NAME == "openai":
         try:
             import tiktoken  # noqa: F401
@@ -122,30 +101,99 @@ def _abbreviate_lines(text: str, *, head: int = 3, tail: int = 3) -> str:
     )
 
 
+def _coerce_system_blocks(
+    raw: list[SystemBlock | str] | None,
+    supports_cache: bool,
+    provider: str,
+    model: str,
+) -> list[SystemBlock]:
+    if not raw:
+        return []
+    out: list[SystemBlock] = []
+    for sb in raw:
+        if isinstance(sb, str):
+            out.append(SystemBlock(text=sb, cache=False))
+        else:
+            if sb.cache and not supports_cache:
+                raise UnsupportedFeature("system_block_cache", provider, model)
+            out.append(sb)
+    return out
+
+
 class Conversation:
-    """A stateful chat session against one Model. Holds history, settings, tools."""
+    """A stateful chat session against one Model.
+
+    Identity, system blocks, tools, logging path, and generation defaults are
+    all set at construction. There is no ``Start()`` step — the conversation
+    is usable immediately. Mutating state (history) lives on the conversation;
+    configuration is immutable post-construction. To get a fresh configuration,
+    build a new conversation."""
 
     def __init__(
         self,
         *,
         model: Model,
         name: str | None = None,
+        system_blocks: list[SystemBlock | str] | None = None,
+        tools: list[Tool] | None = None,
+        log_path: str | Path | None = None,
+        log_max_message_lines: int | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
     ):
         self._model = model
         self.name = name or f"convo-{uuid.uuid4().hex[:8]}"
-        self.settings = _SettingsFacade(
-            self,
-            model.settings.getCapabilities(),
+
+        self._system_blocks = _coerce_system_blocks(
+            system_blocks,
+            supports_cache=model.is_available("auto_cache_last_user"),
+            provider=model.provider.NAME,
+            model=model.model_id,
+        )
+        self._tools: dict[str, Tool] = {t.name: t for t in (tools or [])}
+
+        self._defaults = _validate_knobs(
+            {
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repeat_penalty": repeat_penalty,
+                "effort": effort,
+                "thinking": thinking,
+                "output_format": output_format,
+                "user_metadata": user_metadata,
+                "cache_ttl": cache_ttl,
+                "auto_cache_last_user": auto_cache_last_user,
+                "beta_headers": beta_headers,
+                "keep_alive": keep_alive,
+                "context_size": context_size,
+            },
+            model._supports,
             model.provider.NAME,
             model.model_id,
         )
-        self._system_blocks: list[_SystemBlock] = []
+
         self._history: list[Message] = []
-        self._tools: dict[str, Tool] = {}
-        self._started = False
-        self._log_path: Path | None = None
-        self._log_max_message_lines: int | None = None
+        self._log_path: Path | None = Path(log_path) if log_path is not None else None
+        self._log_max_message_lines = log_max_message_lines
         self._logged_msg_count: int = 0
+
+        if self._log_path is not None:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_settings_header()
 
     @property
     def model(self) -> Model:
@@ -156,63 +204,44 @@ class Conversation:
         return list(self._history)
 
     @property
-    def started(self) -> bool:
-        return self._started
+    def defaults(self) -> dict[str, Any]:
+        return dict(self._defaults)
 
-    def isAvailable(self, setting: AnySetting) -> bool:
-        return self.settings.isAvailable(setting)
-
-    def getCapabilities(self) -> set[AnySetting]:
-        return self.settings.getCapabilities()
+    @property
+    def system_blocks(self) -> list[SystemBlock]:
+        return list(self._system_blocks)
 
     @property
     def tools(self) -> list[Tool]:
         return list(self._tools.values())
 
     def tool(self, name: str) -> Tool | None:
-        """Look up a registered tool by name (returns None if not registered)."""
         return self._tools.get(name)
 
-    def AddTool(self, t: Tool) -> None:
-        self._require_not_started("AddTool")
-        self._tools[t.name] = t
+    def is_available(self, setting: str) -> bool:
+        return self._model.is_available(setting)
 
-    def AddSystemBlock(self, text: str, *, cache: bool = False) -> None:
-        self._require_not_started("AddSystemBlock")
-        if cache and not self.settings.isAvailable(ConvoSettings.AutoCacheLastUser):
-            # Caching capability is gated via AutoCacheLastUser setting availability;
-            # if a provider doesn't expose that, it can't honor cache_control either.
-            raise UnsupportedFeature(
-                ConvoSettings.AutoCacheLastUser,
-                self._model.provider.NAME,
-                self._model.model_id,
-            )
-        self._system_blocks.append(_SystemBlock(text=text, cache=cache))
+    def get_capabilities(self) -> set[str]:
+        return self._model.get_capabilities()
 
-    def AddSystemMessage(self, text: str) -> None:
-        self.AddSystemBlock(text, cache=False)
-
-    def AddUserMessage(
+    def add_user_message(
         self,
         content: str | list[ContentBlock] | None = None,
         *,
         text: str | None = None,
     ) -> None:
-        self._require_started("AddUserMessage")
-        body: str | list[ContentBlock]
         if content is None:
             if text is None:
-                raise ValueError("AddUserMessage needs content= or text=.")
-            body = text
+                raise ValueError("add_user_message needs content= or text=.")
+            body: str | list[ContentBlock] = text
         else:
             body = content
         self._history.append(Message(role="user", content=body))
 
-    def AddAssistantMessage(self, content: str | list[ContentBlock]) -> None:
-        self._require_started("AddAssistantMessage")
+    def add_assistant_message(self, content: str | list[ContentBlock]) -> None:
         self._history.append(Message(role="assistant", content=content))
 
-    def AddToolResult(
+    def add_tool_result(
         self,
         tool_use_id: str,
         result: str | list[ContentBlock],
@@ -220,7 +249,6 @@ class Conversation:
         is_error: bool = False,
         name: str | None = None,
     ) -> None:
-        self._require_started("AddToolResult")
         block = ToolResultBlock(
             tool_use_id=tool_use_id,
             content=result if isinstance(result, str) else self._only_text_image(result),
@@ -229,169 +257,192 @@ class Conversation:
         )
         self._history.append(Message(role="tool", content=[block]))
 
-    def SetLogging(
-        self,
-        path: str | Path | None,
-        *,
-        max_message_lines: int | None = None,
-    ) -> None:
-        """Enable JSONL logging to ``path`` (or disable with ``None``).
+    def snapshot(self) -> Snapshot:
+        return Snapshot(history=tuple(self._history))
 
-        ``max_message_lines`` caps how many lines of any single text payload
-        appear in the log. If a message body exceeds the cap, the first half
-        and last half of the lines are kept with a ``[N lines skipped]``
-        marker between them. ``None`` (default) logs full text."""
-        self._require_not_started("SetLogging")
-        self._log_path = Path(path) if path is not None else None
-        self._log_max_message_lines = max_message_lines
-        if self._log_path is not None:
-            self._log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def Start(self) -> None:
-        if self._started:
-            return
-        self._started = True
-        self.settings._lock()
-
-    def Snapshot(self) -> Snapshot:
-        return Snapshot(
-            history=tuple(self._history),
-            system_blocks=tuple(self._system_blocks),
-        )
-
-    def Rollback(self, snap: Snapshot) -> None:
+    def rollback(self, snap: Snapshot) -> None:
         self._history = list(snap.history)
-        self._system_blocks = list(snap.system_blocks)
         if self._logged_msg_count > len(self._history):
             self._logged_msg_count = len(self._history)
 
-    def Clone(self) -> Conversation:
-        clone = Conversation(model=self._model, name=f"{self.name}-clone")
+    def clone(
+        self,
+        *,
+        name: str | None = None,
+        log_path: str | Path | None = None,
+        log_max_message_lines: int | None = None,
+    ) -> Conversation:
+        """Deep-copy history, system blocks, tools, and defaults into a fresh
+        conversation. The clone may have its own log path; if omitted, the
+        clone has no logging (parent's log isn't shared)."""
+        clone = Conversation.__new__(Conversation)
+        clone._model = self._model
+        clone.name = name or f"{self.name}-clone"
         clone._system_blocks = copy.deepcopy(self._system_blocks)
         clone._history = copy.deepcopy(self._history)
         clone._tools = dict(self._tools)
-        clone.settings._values = dict(self.settings._values)
-        clone._log_path = self._log_path
-        clone._log_max_message_lines = self._log_max_message_lines
-        # Inherited history was already sent by the parent; mark it as logged
-        # so the clone's first Send shows it under `prior_history` rather than
-        # dumping all of it into `new_messages`.
+        clone._defaults = dict(self._defaults)
+        clone._log_path = Path(log_path) if log_path is not None else None
+        clone._log_max_message_lines = (
+            log_max_message_lines
+            if log_max_message_lines is not None
+            else self._log_max_message_lines
+        )
+        # Inherited history was already part of the parent; treat it as already
+        # logged so the clone's first send shows it under prior_history rather
+        # than dumping all of it into new_messages.
         clone._logged_msg_count = len(clone._history)
+        if clone._log_path is not None:
+            clone._log_path.parent.mkdir(parents=True, exist_ok=True)
+            clone._write_settings_header()
         return clone
 
-    def Send(
+    def send(
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
-        max_tokens: int | None = None,
+        tool_choice: str = "auto",
+        stop: list[str] | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
         repeat_penalty: float | None = None,
-        stop: list[str] | None = None,
-        tool_choice: str = "auto",
         effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
     ) -> Response:
         """Send one request to the model and return the response.
 
         If the response includes tool calls, the caller is responsible for
-        executing them and appending results via `AddToolResult` before the
-        next `Send`/`Stream` call. The convenience helpers in
-        `llmfacade.helpers` automate that loop for `@tool`-bound functions."""
-        self._require_started("Send")
-        self._check_no_dangling_tool_use()
-        if prompt is not None:
-            self._history.append(Message(role="user", content=prompt))
-
-        overrides = self._collect_overrides(
-            max_tokens=max_tokens,
+        executing them and appending results via ``add_tool_result`` before
+        the next ``send`` / ``stream`` call. The convenience helpers in
+        ``llmfacade.helpers`` automate that loop for ``@tool``-bound funcs."""
+        per_call = self._collect_per_call(
             temperature=temperature,
+            max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
             repeat_penalty=repeat_penalty,
             effort=effort,
+            thinking=thinking,
+            output_format=output_format,
+            user_metadata=user_metadata,
+            cache_ttl=cache_ttl,
+            auto_cache_last_user=auto_cache_last_user,
+            beta_headers=beta_headers,
+            keep_alive=keep_alive,
+            context_size=context_size,
         )
-        req = self._build_request(
-            tool_choice=tool_choice,
-            stop=stop,
-            overrides=overrides,
-        )
-        self._log_request(req)
+        self._check_no_dangling_tool_use()
+        if prompt is not None:
+            self._history.append(Message(role="user", content=prompt))
+
+        req = self._build_request(tool_choice=tool_choice, stop=stop, per_call=per_call)
+        self._log_request(req, per_call)
         resp = self._model.provider._complete_raw(req)
         self._log_response(req, resp)
         self._history.append(Message(role="assistant", content=list(resp.blocks)))
         return resp
 
-    async def aSend(
+    async def asend(
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
-        max_tokens: int | None = None,
+        tool_choice: str = "auto",
+        stop: list[str] | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
         repeat_penalty: float | None = None,
-        stop: list[str] | None = None,
-        tool_choice: str = "auto",
         effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
     ) -> Response:
-        """Async equivalent of `Send`."""
-        self._require_started("aSend")
-        self._check_no_dangling_tool_use()
-        if prompt is not None:
-            self._history.append(Message(role="user", content=prompt))
-
-        overrides = self._collect_overrides(
-            max_tokens=max_tokens,
+        """Async equivalent of ``send``."""
+        per_call = self._collect_per_call(
             temperature=temperature,
+            max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
             repeat_penalty=repeat_penalty,
             effort=effort,
+            thinking=thinking,
+            output_format=output_format,
+            user_metadata=user_metadata,
+            cache_ttl=cache_ttl,
+            auto_cache_last_user=auto_cache_last_user,
+            beta_headers=beta_headers,
+            keep_alive=keep_alive,
+            context_size=context_size,
         )
-        req = self._build_request(
-            tool_choice=tool_choice,
-            stop=stop,
-            overrides=overrides,
-        )
-        self._log_request(req)
+        self._check_no_dangling_tool_use()
+        if prompt is not None:
+            self._history.append(Message(role="user", content=prompt))
+
+        req = self._build_request(tool_choice=tool_choice, stop=stop, per_call=per_call)
+        self._log_request(req, per_call)
         resp = await self._model.provider._acomplete_raw(req)
         self._log_response(req, resp)
         self._history.append(Message(role="assistant", content=list(resp.blocks)))
         return resp
 
-    def Stream(
+    def stream(
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
-        max_tokens: int | None = None,
+        tool_choice: str = "auto",
+        stop: list[str] | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
         repeat_penalty: float | None = None,
-        stop: list[str] | None = None,
-        tool_choice: str = "auto",
         effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
     ) -> Iterator[StreamEvent]:
-        self._require_started("Stream")
-        self._check_no_dangling_tool_use()
-        if prompt is not None:
-            self._history.append(Message(role="user", content=prompt))
-
-        overrides = self._collect_overrides(
-            max_tokens=max_tokens,
+        per_call = self._collect_per_call(
             temperature=temperature,
+            max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
             repeat_penalty=repeat_penalty,
             effort=effort,
+            thinking=thinking,
+            output_format=output_format,
+            user_metadata=user_metadata,
+            cache_ttl=cache_ttl,
+            auto_cache_last_user=auto_cache_last_user,
+            beta_headers=beta_headers,
+            keep_alive=keep_alive,
+            context_size=context_size,
         )
-        req = self._build_request(
-            tool_choice=tool_choice,
-            stop=stop,
-            overrides=overrides,
-        )
-        self._log_request(req)
+        self._check_no_dangling_tool_use()
+        if prompt is not None:
+            self._history.append(Message(role="user", content=prompt))
+
+        req = self._build_request(tool_choice=tool_choice, stop=stop, per_call=per_call)
+        self._log_request(req, per_call)
 
         text_buf: list[str] = []
         thinking_buf: list[str] = []
@@ -410,38 +461,49 @@ class Conversation:
 
         self._finalize_stream(text_buf, thinking_buf, tool_calls, last_usage)
 
-    async def aStream(
+    async def astream(
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
-        max_tokens: int | None = None,
+        tool_choice: str = "auto",
+        stop: list[str] | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
         repeat_penalty: float | None = None,
-        stop: list[str] | None = None,
-        tool_choice: str = "auto",
         effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        self._require_started("aStream")
-        self._check_no_dangling_tool_use()
-        if prompt is not None:
-            self._history.append(Message(role="user", content=prompt))
-
-        overrides = self._collect_overrides(
-            max_tokens=max_tokens,
+        per_call = self._collect_per_call(
             temperature=temperature,
+            max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
             repeat_penalty=repeat_penalty,
             effort=effort,
+            thinking=thinking,
+            output_format=output_format,
+            user_metadata=user_metadata,
+            cache_ttl=cache_ttl,
+            auto_cache_last_user=auto_cache_last_user,
+            beta_headers=beta_headers,
+            keep_alive=keep_alive,
+            context_size=context_size,
         )
-        req = self._build_request(
-            tool_choice=tool_choice,
-            stop=stop,
-            overrides=overrides,
-        )
-        self._log_request(req)
+        self._check_no_dangling_tool_use()
+        if prompt is not None:
+            self._history.append(Message(role="user", content=prompt))
+
+        req = self._build_request(tool_choice=tool_choice, stop=stop, per_call=per_call)
+        self._log_request(req, per_call)
 
         text_buf: list[str] = []
         thinking_buf: list[str] = []
@@ -476,54 +538,59 @@ class Conversation:
         if blocks:
             self._history.append(Message(role="assistant", content=blocks))
 
-    def _collect_overrides(self, **named: Any) -> dict[AnySetting, Any]:
-        out: dict[AnySetting, Any] = {}
-        for kw, value in named.items():
-            if value is None:
-                continue
-            setting = _PER_CALL_OVERRIDE_KEYS[kw]
-            if not self._model.isAvailable(setting):
-                raise UnsupportedFeature(setting, self._model.provider.NAME, self._model.model_id)
-            out[setting] = value
-        return out
+    def _collect_per_call(self, **kwargs: Any) -> dict[str, Any]:
+        return _validate_knobs(
+            kwargs,
+            self._model._supports,
+            self._model.provider.NAME,
+            self._model.model_id,
+        )
 
     def _build_request(
         self,
         *,
         tool_choice: str,
         stop: list[str] | None,
-        overrides: dict[AnySetting, Any],
+        per_call: dict[str, Any],
     ) -> CompletionRequest:
         provider = self._model.provider
-        max_tokens = overrides.get(
-            Settings.DefaultMaxTokens,
-            self._model.settings.get(Settings.DefaultMaxTokens, 1024),
+        merged: dict[str, Any] = {}
+        sources: dict[str, str] = {}
+        for k, v in provider._defaults.items():
+            merged[k] = v
+            sources[k] = "provider"
+        for k, v in self._model._defaults.items():
+            merged[k] = v
+            sources[k] = "model"
+        for k, v in self._defaults.items():
+            merged[k] = v
+            sources[k] = "convo"
+        for k, v in per_call.items():
+            merged[k] = v
+            sources[k] = "per_call"
+
+        merged, sources = _filter_unsupported(
+            merged, sources, self._model._supports, provider.NAME, self._model.model_id
         )
-        temperature = overrides.get(
-            Settings.DefaultTemperature,
-            self._model.settings.get(Settings.DefaultTemperature),
-        )
+
+        # Most provider APIs require ``max_tokens``. Supply a reasonable default
+        # if no scope set one.
+        if "max_tokens" not in merged and "max_tokens" in self._model._supports:
+            merged["max_tokens"] = 1024
+            sources["max_tokens"] = "default"
+
         return CompletionRequest(
             model=self._model.model_id,
             messages=list(self._history),
-            system_blocks=[(b.text, b.cache) for b in self._system_blocks],
+            system_blocks=list(self._system_blocks),
             tools=list(self._tools.values()),
             tool_choice=tool_choice,
-            max_tokens=max_tokens,
-            temperature=temperature,
             stop=stop,
-            provider_settings=provider.settings._snapshot(),
-            model_settings=self._model.settings._snapshot(),
-            convo_settings=self.settings._snapshot(),
-            per_call_overrides=overrides,
+            settings=merged,
+            settings_source=sources,
         )
 
     def _check_no_dangling_tool_use(self) -> None:
-        """Raise if any assistant tool_use in history lacks a matching tool_result.
-
-        Wire format requires each ToolUseBlock to be answered by a ToolResultBlock
-        before the next request. Sending without that produces a 400 from most
-        providers, so we fail loudly here instead."""
         used: set[str] = set()
         resolved: set[str] = set()
         for msg in self._history:
@@ -538,24 +605,52 @@ class Conversation:
         if unresolved:
             raise ConversationStateError(
                 f"Conversation has unresolved tool calls: {sorted(unresolved)}. "
-                f"Append a ToolResult for each via AddToolResult() (or use "
-                f"llmfacade.helpers.run_bound_tools) before the next Send/Stream."
+                f"Append a ToolResult for each via add_tool_result() (or use "
+                f"llmfacade.helpers.run_bound_tools) before the next send/stream."
             )
-
-    def _require_started(self, op: str) -> None:
-        if not self._started:
-            raise NotStartedError(
-                f"Conversation.{op}() requires a Started Conversation. Call Start() first."
-            )
-
-    def _require_not_started(self, op: str) -> None:
-        if self._started:
-            raise SettingsLockedError(f"Conversation.{op}() is not allowed after Start().")
 
     def _only_text_image(self, blocks: list[ContentBlock]) -> list[Any]:
         return [b for b in blocks if isinstance(b, (TextBlock, ImageBlock))]
 
-    def _log_request(self, req: CompletionRequest) -> None:
+    # ---- logging ----------------------------------------------------------
+
+    def _write_settings_header(self) -> None:
+        """Emit a one-shot settings record at the start of the log file.
+
+        Captures provider/model/convo defaults and their source, plus system
+        blocks and tool names. Subsequent request entries only carry per-call
+        overrides and the message delta."""
+        provider = self._model.provider
+        merged: dict[str, Any] = {}
+        sources: dict[str, str] = {}
+        for k, v in provider._defaults.items():
+            merged[k] = v
+            sources[k] = "provider"
+        for k, v in self._model._defaults.items():
+            merged[k] = v
+            sources[k] = "model"
+        for k, v in self._defaults.items():
+            merged[k] = v
+            sources[k] = "convo"
+        merged, sources = _filter_unsupported(
+            merged, sources, self._model._supports, provider.NAME, self._model.model_id
+        )
+
+        settings_block = {
+            k: {"value": _logsafe(v), "source": sources[k]} for k, v in merged.items()
+        }
+        record: dict[str, Any] = {
+            "type": "settings",
+            "convo": self.name,
+            "provider": provider.NAME,
+            "model": self._model.model_id,
+            "system_blocks": [{"text": sb.text, "cache": sb.cache} for sb in self._system_blocks],
+            "tools": [t.name for t in self._tools.values()],
+            "settings": settings_block,
+        }
+        self._append_log(record)
+
+    def _log_request(self, req: CompletionRequest, per_call: dict[str, Any]) -> None:
         if self._log_path is None:
             return
         messages = list(req.messages)
@@ -565,13 +660,10 @@ class Conversation:
         record: dict[str, Any] = {
             "type": "request",
             "convo": self.name,
-            "model": req.model,
-            "system_blocks": req.system_blocks,
-            "tools": [t.name for t in req.tools],
             "tool_choice": req.tool_choice,
-            "new_messages": [
-                _dump_message(m, max_lines=self._log_max_message_lines) for m in new
-            ],
+            "stop": req.stop,
+            "overrides": {k: _logsafe(v) for k, v in per_call.items()},
+            "new_messages": [_dump_message(m, max_lines=self._log_max_message_lines) for m in new],
         }
         if prior:
             rendered = "\n".join(_render_message_oneline(m) for m in prior)
@@ -608,30 +700,19 @@ class Conversation:
         self._logged_msg_count += 1
 
     def _cache_summary(self, req: CompletionRequest, usage: Any) -> dict[str, Any] | None:
-        """Compute a human-readable cache breakdown from response usage.
-
-        Uses provider-specific token estimates (chars/4 fallback) to map the
-        ``cache_read_tokens`` count back to an approximate message-index
-        boundary so users can see which part of the prefix was a cache hit."""
         if usage is None:
             return None
         cache_read = usage.cache_read_tokens or 0
         cache_creation = usage.cache_creation_tokens or 0
         prompt_uncached = usage.prompt_tokens or 0
-        # For Anthropic, prompt_tokens excludes both cache reads and creations
-        # (input_tokens). For OpenAI/Google, prompt_tokens is the total input
-        # (cache read counted within it). We standardise as: total_input is
-        # the maximum reasonable interpretation either way.
         total_input = max(prompt_uncached + cache_creation + cache_read, prompt_uncached)
         if total_input == 0:
             return None
 
         boundary = self._estimate_cached_boundary(req, cache_read)
         provider = self._model.provider
-        explicit = self._model.isAvailable(ConvoSettings.AutoCacheLastUser)
-        auto = bool(
-            explicit and self.settings.get(ConvoSettings.AutoCacheLastUser, False)
-        )
+        explicit = self._model.is_available("auto_cache_last_user")
+        auto = bool(explicit and req.settings.get("auto_cache_last_user", False))
 
         if cache_read > 0:
             note = (
@@ -648,8 +729,8 @@ class Conversation:
         elif explicit and not auto:
             note = (
                 "No cache hit and no cache creation. Explicit cache markers "
-                "are off — set ConvoSettings.AutoCacheLastUser=True (or "
-                "AddSystemBlock(..., cache=True)) to enable caching on this "
+                "are off — set auto_cache_last_user=True (or pass a "
+                "SystemBlock(..., cache=True)) to enable caching on this "
                 "provider."
             )
         elif auto and total_input > 1024:
@@ -674,20 +755,14 @@ class Conversation:
             "_note": note,
         }
 
-    def _estimate_cached_boundary(
-        self, req: CompletionRequest, cache_read_tokens: int
-    ) -> int:
-        """Walk system blocks then messages, counting how many messages are
-        FULLY covered by the cache_read_tokens count (the boundary may fall
-        partway through the next message; we round down). 0 = system-only or
-        none; len(msgs) = entire prefix was a cache hit."""
+    def _estimate_cached_boundary(self, req: CompletionRequest, cache_read_tokens: int) -> int:
         if cache_read_tokens <= 0:
             return 0
         provider = self._model.provider
         model_id = self._model.model_id
         accumulated = 0
-        for text, _cache in req.system_blocks:
-            accumulated += provider._estimate_tokens(text, model_id)
+        for sb in req.system_blocks:
+            accumulated += provider._estimate_tokens(sb.text, model_id)
             if accumulated > cache_read_tokens:
                 return 0
         msgs = list(req.messages)
@@ -705,3 +780,12 @@ class Conversation:
         assert self._log_path is not None
         with self._log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=_log_default) + "\n")
+
+
+def _logsafe(v: Any) -> Any:
+    """Render Enum values as their .value for compact JSON; passthrough others."""
+    from enum import Enum
+
+    if isinstance(v, Enum):
+        return v.value
+    return v

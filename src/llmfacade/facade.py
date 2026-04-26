@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from llmfacade.exceptions import LLMError, ProviderNotInstalledError
 from llmfacade.providers import PROVIDER_REGISTRY
@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 
 class LLM:
-    """Cross-provider manager. Holds shared defaults; spawns Providers."""
+    """Cross-provider manager. Holds shared API keys; spawns Providers."""
 
     _default: LLM | None = None
 
@@ -30,19 +30,15 @@ class LLM:
 
     @classmethod
     def reset_default(cls) -> None:
-        """Drop the process-wide default LLM. The next default() call rebuilds it.
+        """Drop the process-wide default LLM. The next ``default()`` call rebuilds it.
 
-        Useful in test setup to ensure mutations to LLM.default().api_keys don't
-        leak between tests."""
+        Useful in test setup to ensure mutations to ``LLM.default().api_keys``
+        don't leak between tests."""
         cls._default = None
 
-    def NewProvider(
-        self,
-        provider_name: str,
-        *,
-        api_key: str | None = None,
-        base_url: str | None = None,
-    ) -> Provider:
+    def new_provider(self, provider_name: str, **kwargs: Any) -> Provider:
+        """Build a provider by name. Extra kwargs (api_key, base_url, generation
+        defaults) are forwarded to the provider class's constructor."""
         name = provider_name.lower()
         if name not in PROVIDER_REGISTRY:
             available = ", ".join(sorted(set(PROVIDER_REGISTRY.keys())))
@@ -58,4 +54,4 @@ class LLM:
             ) from e
 
         provider_cls = getattr(module, class_name)
-        return provider_cls(manager=self, api_key=api_key, base_url=base_url)
+        return provider_cls(manager=self, **kwargs)

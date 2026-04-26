@@ -3,8 +3,8 @@
 These functions are not part of the core lifecycle. They exist so common
 patterns (running every tool call the model produced, then sending the
 results back until the model stops calling tools) don't have to be hand-
-rolled by every caller — but they are *just* loops over `Send` /
-`AddToolResult`, with no privileged access to internals."""
+rolled by every caller — but they are *just* loops over ``send`` /
+``add_tool_result``, with no privileged access to internals."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from llmfacade.models import (
     Response,
     TextBlock,
     ToolResultBlock,
-    ToolUseBlock,
     Usage,
 )
 
@@ -29,20 +28,17 @@ if TYPE_CHECKING:
 
 
 def flatten_text_blocks(blocks: list[Any]) -> str:
-    """Concatenate the `.text` of every TextBlock in `blocks`. Non-text blocks ignored.
-
-    Useful for collapsing a tool result's mixed content (text + images) down to a
-    plain-text payload that providers without rich tool-result content can accept."""
+    """Concatenate the ``.text`` of every TextBlock in ``blocks``. Non-text blocks ignored."""
     return "".join(b.text for b in blocks if isinstance(b, TextBlock))
 
 
 def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock]:
-    """Run every tool call in `resp` whose name matches a tool registered on `convo`.
+    """Run every tool call in ``resp`` whose name matches a tool registered on ``convo``.
 
     For each match, calls the function with the model's arguments and appends
-    a ToolResultBlock to the conversation via `AddToolResult`. Tool calls whose
-    name is *not* registered are skipped — the caller is then responsible for
-    handling them (or letting the next `Send` raise `ConversationStateError`).
+    a ToolResultBlock to the conversation via ``add_tool_result``. Tool calls
+    whose name is *not* registered are skipped — the caller is then responsible
+    for handling them (or letting the next ``send`` raise ``ConversationStateError``).
 
     Returns the list of ToolResultBlocks that were appended."""
     out: list[ToolResultBlock] = []
@@ -53,11 +49,11 @@ def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock
         try:
             result = tool_def.fn(**call.input)
             content = _stringify(result)
-            convo.AddToolResult(call.id, content, name=call.name)
+            convo.add_tool_result(call.id, content, name=call.name)
             out.append(ToolResultBlock(tool_use_id=call.id, content=content, name=call.name))
         except Exception as e:
             content = f"Tool error: {e}"
-            convo.AddToolResult(call.id, content, is_error=True, name=call.name)
+            convo.add_tool_result(call.id, content, is_error=True, name=call.name)
             out.append(
                 ToolResultBlock(
                     tool_use_id=call.id, content=content, is_error=True, name=call.name
@@ -67,7 +63,7 @@ def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock
 
 
 async def arun_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock]:
-    """Async equivalent of `run_bound_tools`. Awaits coroutine-returning tool fns."""
+    """Async equivalent of ``run_bound_tools``. Awaits coroutine-returning tool fns."""
     out: list[ToolResultBlock] = []
     for call in resp.tool_calls:
         tool_def = convo.tool(call.name)
@@ -78,11 +74,11 @@ async def arun_bound_tools(convo: Conversation, resp: Response) -> list[ToolResu
             if inspect.isawaitable(result):
                 result = await result
             content = _stringify(result)
-            convo.AddToolResult(call.id, content, name=call.name)
+            convo.add_tool_result(call.id, content, name=call.name)
             out.append(ToolResultBlock(tool_use_id=call.id, content=content, name=call.name))
         except Exception as e:
             content = f"Tool error: {e}"
-            convo.AddToolResult(call.id, content, is_error=True, name=call.name)
+            convo.add_tool_result(call.id, content, is_error=True, name=call.name)
             out.append(
                 ToolResultBlock(
                     tool_use_id=call.id, content=content, is_error=True, name=call.name
@@ -98,17 +94,15 @@ def run_to_completion(
     max_iterations: int = 16,
     **send_kwargs: Any,
 ) -> Response:
-    """Send `prompt`, then dispatch any bound tool calls and continue sending until
-    the model returns a response with no tool calls (or `max_iterations` is hit).
-
-    `send_kwargs` are forwarded to `Conversation.Send` on every iteration. Raises
-    `ToolIterationLimitError` if the loop doesn't terminate."""
-    resp = convo.Send(prompt, **send_kwargs)
+    """Send ``prompt``, then dispatch any bound tool calls and continue sending
+    until the model returns a response with no tool calls (or ``max_iterations``
+    is hit). Raises ``ToolIterationLimitError`` if the loop doesn't terminate."""
+    resp = convo.send(prompt, **send_kwargs)
     for _ in range(max_iterations):
         if not resp.tool_calls:
             return resp
         run_bound_tools(convo, resp)
-        resp = convo.Send(**send_kwargs)
+        resp = convo.send(**send_kwargs)
     raise ToolIterationLimitError(
         f"run_to_completion exceeded max_iterations={max_iterations}. "
         f"The model kept calling tools without producing a final answer."
@@ -122,13 +116,13 @@ async def arun_to_completion(
     max_iterations: int = 16,
     **send_kwargs: Any,
 ) -> Response:
-    """Async equivalent of `run_to_completion`."""
-    resp = await convo.aSend(prompt, **send_kwargs)
+    """Async equivalent of ``run_to_completion``."""
+    resp = await convo.asend(prompt, **send_kwargs)
     for _ in range(max_iterations):
         if not resp.tool_calls:
             return resp
         await arun_bound_tools(convo, resp)
-        resp = await convo.aSend(**send_kwargs)
+        resp = await convo.asend(**send_kwargs)
     raise ToolIterationLimitError(
         f"arun_to_completion exceeded max_iterations={max_iterations}. "
         f"The model kept calling tools without producing a final answer."
@@ -145,8 +139,6 @@ def _stringify(result: Any) -> str:
 
 
 def _abbreviate_text(text: str, max_lines: int | None) -> str:
-    """If ``text`` has more than ``max_lines`` lines, keep the first and last
-    halves with an elision marker in the middle. ``None`` disables abbreviation."""
     if max_lines is None or max_lines <= 0:
         return text
     lines = text.splitlines()
@@ -175,6 +167,8 @@ def _dump_block(b: ContentBlock, *, max_lines: int | None = None) -> dict[str, A
     cls = type(b).__name__
     if isinstance(b, TextBlock):
         return {"type": cls, "text": _abbreviate_text(b.text, max_lines)}
+    from llmfacade.models import ToolUseBlock
+
     if isinstance(b, ToolUseBlock):
         return {"type": cls, "name": b.name, "input": b.input}
     if isinstance(b, ToolResultBlock):

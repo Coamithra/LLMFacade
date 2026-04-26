@@ -17,12 +17,6 @@ from llmfacade.models import (
     Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider
-from llmfacade.settings import (
-    AnySetting,
-    ConvoSettings,
-    ProviderSettings,
-    Settings,
-)
 
 
 @dataclass
@@ -34,16 +28,15 @@ class MockProvider(Provider):
     """Test double. Capabilities are configurable per-instance."""
 
     NAME = "mock"
-    SUPPORTS: frozenset[AnySetting] = frozenset(
+    SUPPORTS: frozenset[str] = frozenset(
         {
-            ProviderSettings.BaseURL,
-            Settings.ContextSize,
-            Settings.DefaultMaxTokens,
-            Settings.DefaultTemperature,
-            Settings.TopP,
-            Settings.Thinking,
-            ConvoSettings.AutoCacheLastUser,
-            ConvoSettings.UserMetadata,
+            "context_size",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "thinking",
+            "auto_cache_last_user",
+            "user_metadata",
         }
     )
 
@@ -57,6 +50,7 @@ class MockProvider(Provider):
         canned_tool_calls=None,
         canned_thinking=None,
         canned_usage=None,
+        **knobs,
     ):
         self.canned_text = canned_text
         self.canned_tool_calls = canned_tool_calls or []
@@ -68,13 +62,14 @@ class MockProvider(Provider):
             cache_creation_tokens=0,
             cache_read_tokens=0,
         )
-        self.calls = []
-        super().__init__(manager=manager, api_key=api_key, base_url=base_url)
+        self.calls: list[MockCall] = []
+        super().__init__(manager=manager, api_key=api_key, base_url=base_url, **knobs)
 
     def _init_client(self) -> None:
         self._client = object()
 
     def _resolve_key(self, env_var: str) -> str:
+        del env_var
         return "mock-key"
 
     def _make_response(self) -> Response:
@@ -134,11 +129,9 @@ def mock_provider() -> MockProvider:
 
 @pytest.fixture
 def mock_model(mock_provider: MockProvider):
-    return mock_provider.NewModel("mock-model")
+    return mock_provider.new_model("mock-model")
 
 
 @pytest.fixture
 def started_convo(mock_model):
-    convo = mock_model.NewConversation()
-    convo.Start()
-    return convo
+    return mock_model.new_conversation()

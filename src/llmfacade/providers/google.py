@@ -23,27 +23,20 @@ from llmfacade.models import (
     Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider
-from llmfacade.settings import (
-    AnySetting,
-    ConvoSettings,
-    OutputFormat,
-    ProviderSettings,
-    Settings,
-)
+from llmfacade.settings import OutputFormat
 
 
 class GoogleProvider(Provider):
     NAME = "google"
     API_KEY_ENV = "GOOGLE_API_KEY"
-    SUPPORTS: frozenset[AnySetting] = frozenset(
+    SUPPORTS: frozenset[str] = frozenset(
         {
-            ProviderSettings.BaseURL,
-            Settings.ContextSize,
-            Settings.DefaultMaxTokens,
-            Settings.DefaultTemperature,
-            Settings.TopP,
-            Settings.TopK,
-            ConvoSettings.OutputFormat,
+            "context_size",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "output_format",
         }
     )
 
@@ -71,29 +64,27 @@ class GoogleProvider(Provider):
             contents.extend(self._message_to_api(m, tool_id_to_name))
 
         config: dict[str, Any] = {
-            "max_output_tokens": req.max_tokens,
+            "max_output_tokens": req.settings.get("max_tokens", 1024),
         }
-        if req.temperature is not None:
-            config["temperature"] = req.temperature
+        temperature = req.settings.get("temperature")
+        if temperature is not None:
+            config["temperature"] = temperature
         if req.stop:
             config["stop_sequences"] = req.stop
-        for setting, key in (
-            (Settings.TopP, "top_p"),
-            (Settings.TopK, "top_k"),
-        ):
-            value = req.per_call_overrides.get(setting, req.model_settings.get(setting))
+        for key in ("top_p", "top_k"):
+            value = req.settings.get(key)
             if value is not None:
                 config[key] = value
 
         if req.system_blocks:
-            config["system_instruction"] = "\n\n".join(text for text, _cache in req.system_blocks)
+            config["system_instruction"] = "\n\n".join(sb.text for sb in req.system_blocks)
 
         if req.tools:
             config["tools"] = [
                 {"function_declarations": [self._tool_to_api(t) for t in req.tools]}
             ]
 
-        out_format = req.convo_settings.get(ConvoSettings.OutputFormat)
+        out_format = req.settings.get("output_format")
         if out_format is not None:
             value = out_format.value if isinstance(out_format, OutputFormat) else out_format
             if value == "json":
@@ -151,6 +142,7 @@ class GoogleProvider(Provider):
             raise
 
     def _chunk_to_events(self, chunk: Any, _model: str) -> tuple[list[StreamEvent], Usage | None]:
+        del _model
         events: list[StreamEvent] = []
         text = getattr(chunk, "text", None)
         if text:

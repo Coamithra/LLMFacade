@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from llmfacade.settings import AnySetting
-
 
 class LLMError(Exception):
     """Base for all llmfacade errors."""
@@ -39,35 +34,26 @@ class UnsupportedFeature(LLMError):
 
     def __init__(
         self,
-        setting: AnySetting | str,
+        setting: str,
         provider: str | None = None,
         model: str | None = None,
     ):
         self.setting = setting
         self.provider = provider
         self.model = model
-        name = setting if isinstance(setting, str) else setting.name
         where = []
         if provider:
             where.append(f"provider={provider!r}")
         if model:
             where.append(f"model={model!r}")
         loc = f" on {', '.join(where)}" if where else ""
-        super().__init__(f"Setting {name} is not supported{loc}.")
-
-
-class NotStartedError(LLMError):
-    """Operation requires a Conversation that has been Start()ed."""
-
-
-class SettingsLockedError(LLMError):
-    """Conversation settings cannot be changed after Start()."""
+        super().__init__(f"Setting {setting!r} is not supported{loc}.")
 
 
 class ToolIterationLimitError(LLMError):
     """A tool-dispatch loop exceeded its maximum iteration count.
 
-    Raised by `helpers.run_to_completion` (and its async equivalent) when a
+    Raised by ``helpers.run_to_completion`` (and its async equivalent) when a
     model keeps calling tools without producing a final answer."""
 
 

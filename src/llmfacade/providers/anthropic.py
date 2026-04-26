@@ -21,34 +21,26 @@ from llmfacade.models import (
     ToolUseBlock,
     Usage,
 )
-from llmfacade.provider import CompletionRequest, Provider
-from llmfacade.settings import (
-    AnySetting,
-    ConvoSettings,
-    EffortLevel,
-    EphemeralCacheTTL,
-    ProviderSettings,
-    Settings,
-)
+from llmfacade.provider import CompletionRequest, Provider, SystemBlock
+from llmfacade.settings import EffortLevel, EphemeralCacheTTL
 
 
 class AnthropicProvider(Provider):
     NAME = "anthropic"
     API_KEY_ENV = "ANTHROPIC_API_KEY"
-    SUPPORTS: frozenset[AnySetting] = frozenset(
+    SUPPORTS: frozenset[str] = frozenset(
         {
-            ProviderSettings.BaseURL,
-            ProviderSettings.BetaHeaders,
-            Settings.ContextSize,
-            Settings.DefaultMaxTokens,
-            Settings.DefaultTemperature,
-            Settings.TopP,
-            Settings.TopK,
-            Settings.Effort,
-            Settings.Thinking,
-            ConvoSettings.AutoCacheLastUser,
-            ConvoSettings.UserMetadata,
-            ConvoSettings.CacheTTL,
+            "context_size",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "effort",
+            "thinking",
+            "auto_cache_last_user",
+            "user_metadata",
+            "cache_ttl",
+            "beta_headers",
         }
     )
 
@@ -71,12 +63,12 @@ class AnthropicProvider(Provider):
         self._aclient = _anthropic.AsyncAnthropic(**client_kwargs)
         self._module = _anthropic
 
-    def NewModel(self, model_id: str, **kwargs: Any):
+    def new_model(self, model_id: str, **kwargs: Any):
         from llmfacade.model import Model
 
-        override = None
-        if any(m in model_id for m in self._NO_THINKING_MODELS):
-            override = self.SUPPORTS - {Settings.Thinking}
+        override = kwargs.pop("capability_override", None)
+        if override is None and any(m in model_id for m in self._NO_THINKING_MODELS):
+            override = self.SUPPORTS - {"thinking"}
         return Model(
             provider=self,
             model_id=model_id,
@@ -85,26 +77,28 @@ class AnthropicProvider(Provider):
         )
 
     def _build_kwargs(self, req: CompletionRequest) -> dict[str, Any]:
-        ttl = req.convo_settings.get(ConvoSettings.CacheTTL)
-        if isinstance(ttl, EphemeralCacheTTL):
-            ttl_value = ttl.value
-        elif isinstance(ttl, str):
-            ttl_value = ttl
+        ttl_raw = req.settings.get("cache_ttl")
+        if isinstance(ttl_raw, EphemeralCacheTTL):
+            ttl_value: str | None = ttl_raw.value
+        elif isinstance(ttl_raw, str):
+            ttl_value = ttl_raw
         else:
             ttl_value = None  # SDK default (5m)
 
+        max_tokens = req.settings.get("max_tokens", 1024)
         api_msgs = self._messages_to_api(
             req.messages,
-            auto_cache_last=bool(req.convo_settings.get(ConvoSettings.AutoCacheLastUser)),
+            auto_cache_last=bool(req.settings.get("auto_cache_last_user")),
             ttl=ttl_value,
         )
         api_kwargs: dict[str, Any] = {
             "model": req.model,
-            "max_tokens": req.max_tokens,
+            "max_tokens": max_tokens,
             "messages": api_msgs,
         }
-        if req.temperature is not None:
-            api_kwargs["temperature"] = req.temperature
+        temperature = req.settings.get("temperature")
+        if temperature is not None:
+            api_kwargs["temperature"] = temperature
         if req.stop:
             api_kwargs["stop_sequences"] = req.stop
 
@@ -116,30 +110,25 @@ class AnthropicProvider(Provider):
             api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
             api_kwargs["tool_choice"] = self._tool_choice_to_api(req.tool_choice)
 
-        thinking_val = req.per_call_overrides.get(
-            Settings.Thinking, req.model_settings.get(Settings.Thinking)
-        )
+        thinking_val = req.settings.get("thinking")
         if thinking_val is not None:
             budget = thinking_val if isinstance(thinking_val, int) else int(thinking_val)
             api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
 
-        effort = req.per_call_overrides.get(
-            Settings.Effort, req.model_settings.get(Settings.Effort)
-        )
+        effort = req.settings.get("effort")
         if effort is not None:
             api_kwargs["effort"] = effort.value if isinstance(effort, EffortLevel) else effort
 
-        for key in ("TopP", "TopK"):
-            setting = getattr(Settings, key)
-            value = req.per_call_overrides.get(setting, req.model_settings.get(setting))
+        for key in ("top_p", "top_k"):
+            value = req.settings.get(key)
             if value is not None:
-                api_kwargs["top_p" if key == "TopP" else "top_k"] = value
+                api_kwargs[key] = value
 
-        metadata = req.convo_settings.get(ConvoSettings.UserMetadata)
+        metadata = req.settings.get("user_metadata")
         if metadata:
             api_kwargs["metadata"] = metadata
 
-        beta_headers = req.provider_settings.get(ProviderSettings.BetaHeaders)
+        beta_headers = req.settings.get("beta_headers")
         if beta_headers:
             api_kwargs["extra_headers"] = {"anthropic-beta": ",".join(beta_headers)}
 
@@ -275,12 +264,12 @@ class AnthropicProvider(Provider):
                 yield StreamEvent(done=True, usage=self._usage_from(msg))
 
     def _system_to_api(
-        self, blocks: list[tuple[str, bool]], *, ttl: str | None = None
+        self, blocks: list[SystemBlock], *, ttl: str | None = None
     ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for text, cache in blocks:
-            entry: dict[str, Any] = {"type": "text", "text": text}
-            if cache:
+        for sb in blocks:
+            entry: dict[str, Any] = {"type": "text", "text": sb.text}
+            if sb.cache:
                 cc: dict[str, Any] = {"type": "ephemeral"}
                 if ttl:
                     cc["ttl"] = ttl

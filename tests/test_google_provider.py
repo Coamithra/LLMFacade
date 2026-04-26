@@ -56,9 +56,7 @@ def test_build_kwargs_threads_name_through_history():
         Message(role="user", content="what's the weather?"),
         Message(
             role="assistant",
-            content=[
-                ToolUseBlock(id="call-abc", name="get_weather", input={"city": "Oslo"})
-            ],
+            content=[ToolUseBlock(id="call-abc", name="get_weather", input={"city": "Oslo"})],
         ),
         Message(
             role="tool",
@@ -73,9 +71,8 @@ def test_build_kwargs_threads_name_through_history():
         system_blocks=[],
         tools=[],
         tool_choice="auto",
-        max_tokens=128,
-        temperature=None,
         stop=None,
+        settings={"max_tokens": 128},
     )
     api_kwargs = p._build_kwargs(req)
     tool_part = api_kwargs["contents"][-1]["parts"][0]
