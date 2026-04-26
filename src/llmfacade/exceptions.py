@@ -62,3 +62,10 @@ class NotStartedError(LLMError):
 
 class SettingsLockedError(LLMError):
     """Conversation settings cannot be changed after Start()."""
+
+
+class ToolIterationLimitError(LLMError):
+    """The auto-tool dispatch loop exceeded its maximum iteration count.
+
+    A misbehaving model may keep calling tools instead of producing a final
+    answer; this exception bounds the loop so it cannot run forever."""

@@ -29,7 +29,7 @@ pytest tests/test_conversation.py::test_complete_round_trip   # single test
 Four-level hierarchy. Each level owns its own concerns and spawns the next:
 
 ```
-LLM            manager: shared api_keys, log_dir; LLM.default() is a process-wide singleton
+LLM            manager: shared api_keys; LLM.default() is a process-wide singleton
  -> Provider   auth + SDK client + per-provider knobs
    -> Model    a model_id bound to a provider, with model-level settings
      -> Conversation   stateful session: history, system blocks, tools, per-call settings

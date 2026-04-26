@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from llmfacade.provider import _SettingsFacade
 from llmfacade.settings import AnySetting
@@ -44,10 +44,10 @@ class Model:
     def getCapabilities(self) -> set[AnySetting]:
         return self.settings.getCapabilities()
 
-    def NewConversation(self, name: str | None = None, **kwargs: Any) -> Conversation:
+    def NewConversation(self, name: str | None = None) -> Conversation:
         from llmfacade.conversation import Conversation
 
-        return Conversation(model=self, name=name, **kwargs)
+        return Conversation(model=self, name=name)
 
     def __repr__(self) -> str:
         return f"Model(provider={self._provider.NAME!r}, model_id={self._model_id!r})"

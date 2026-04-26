@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -75,9 +76,15 @@ class GoogleProvider(Provider):
         per_call_overrides: dict[AnySetting, Any],
     ) -> dict[str, Any]:
         del provider_settings, tool_choice
+        tool_id_to_name: dict[str, str] = {}
+        for m in messages:
+            if isinstance(m.content, list):
+                for b in m.content:
+                    if isinstance(b, ToolUseBlock):
+                        tool_id_to_name[b.id] = b.name
         contents: list[dict[str, Any]] = []
         for m in messages:
-            contents.extend(self._message_to_api(m))
+            contents.extend(self._message_to_api(m, tool_id_to_name))
 
         config: dict[str, Any] = {
             "max_output_tokens": max_tokens,
@@ -172,7 +179,7 @@ class GoogleProvider(Provider):
                     events.append(
                         StreamEvent(
                             tool_call_delta=ToolCall(
-                                id=f"call-{id(fn_call)}",
+                                id=f"call-{uuid.uuid4().hex}",
                                 name=getattr(fn_call, "name", ""),
                                 input=dict(getattr(fn_call, "args", {}) or {}),
                             )
@@ -181,7 +188,9 @@ class GoogleProvider(Provider):
         usage = self._usage_from(chunk)
         return events, usage
 
-    def _message_to_api(self, m: Message) -> list[dict[str, Any]]:
+    def _message_to_api(
+        self, m: Message, tool_id_to_name: dict[str, str] | None = None
+    ) -> list[dict[str, Any]]:
         role = "model" if m.role == "assistant" else "user"
         if m.role == "tool":
             parts = []
@@ -189,10 +198,13 @@ class GoogleProvider(Provider):
             for b in blocks:
                 if isinstance(b, ToolResultBlock):
                     text = b.content if isinstance(b.content, str) else ""
+                    fn_name = b.name or (
+                        (tool_id_to_name or {}).get(b.tool_use_id) or b.tool_use_id
+                    )
                     parts.append(
                         {
                             "function_response": {
-                                "name": b.tool_use_id,
+                                "name": fn_name,
                                 "response": {"content": text},
                             }
                         }
@@ -242,7 +254,7 @@ class GoogleProvider(Provider):
                 if fn_call is not None:
                     name = getattr(fn_call, "name", "")
                     args = dict(getattr(fn_call, "args", {}) or {})
-                    use_id = f"call-{id(fn_call)}"
+                    use_id = f"call-{uuid.uuid4().hex}"
                     blocks.append(ToolUseBlock(id=use_id, name=name, input=args))
                     tool_calls.append(ToolCall(id=use_id, name=name, input=args))
 

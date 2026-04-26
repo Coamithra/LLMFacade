@@ -36,7 +36,7 @@ print(resp.text)
 The library has a four-level hierarchy. Each level owns its own concerns and spawns the next:
 
 ```
-LLM           manager: shared api_keys, log_dir
+LLM           manager: shared api_keys
  -> Provider  auth + SDK client + per-provider knobs (BaseURL, BetaHeaders, ...)
    -> Model   a model_id bound to a Provider + per-model knobs (TopP, Thinking, ...)
      -> Conversation   stateful session: history, system blocks, tools, per-call settings
@@ -45,7 +45,7 @@ LLM           manager: shared api_keys, log_dir
 ```python
 from llmfacade import LLM
 
-mgr      = LLM(api_keys={"anthropic": "sk-..."}, log_dir="./logs")
+mgr      = LLM(api_keys={"anthropic": "sk-..."})
 provider = mgr.NewProvider("anthropic")
 model    = provider.NewModel("claude-sonnet-4-6")
 chat     = model.NewConversation(name="dnd-session")
@@ -139,8 +139,6 @@ alt.Start()
 ```python
 chat.SetLogging("./logs/session.jsonl")   # JSONL of every request and response
 ```
-
-The manager's `log_dir` provides a default root if you prefer to set it once.
 
 ## Providers
 

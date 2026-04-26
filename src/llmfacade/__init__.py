@@ -9,6 +9,7 @@ from llmfacade.exceptions import (
     ProviderNotInstalledError,
     RateLimitError,
     SettingsLockedError,
+    ToolIterationLimitError,
     UnsupportedFeature,
 )
 from llmfacade.facade import LLM
@@ -74,6 +75,7 @@ __all__ = [
     "UnsupportedFeature",
     "NotStartedError",
     "SettingsLockedError",
+    "ToolIterationLimitError",
     # Misc
     "__version__",
 ]

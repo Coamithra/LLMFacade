@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json as _json
+import uuid
 import warnings
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -187,7 +188,7 @@ class OllamaProvider(Provider):
                     continue
                 yield StreamEvent(
                     tool_call_delta=ToolCall(
-                        id=f"call-{id(tc)}",
+                        id=f"call-{uuid.uuid4().hex}",
                         name=getattr(fn, "name", ""),
                         input=getattr(fn, "arguments", {}) or {},
                     )
@@ -263,7 +264,7 @@ class OllamaProvider(Provider):
                         args = _json.loads(args)
                     except _json.JSONDecodeError:
                         args = {"_raw": args}
-                use_id = f"call-{id(tc)}"
+                use_id = f"call-{uuid.uuid4().hex}"
                 blocks.append(ToolUseBlock(id=use_id, name=getattr(fn, "name", ""), input=args))
                 tool_calls.append(ToolCall(id=use_id, name=getattr(fn, "name", ""), input=args))
 

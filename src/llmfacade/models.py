@@ -47,6 +47,7 @@ class ToolResultBlock:
     tool_use_id: str
     content: str | list[TextBlock | ImageBlock]
     is_error: bool = False
+    name: str | None = None
 
 
 ContentBlock = Union[TextBlock, ImageBlock, ToolUseBlock, ToolResultBlock]  # noqa: UP007
@@ -72,7 +73,7 @@ class ToolCall:
     id: str
     name: str
     input: dict[str, Any]
-    _fn: Callable[..., Any] | None = field(default=None, repr=False)
+    _fn: Callable[..., Any] | None = field(default=None, repr=False, compare=False)
 
     def invoke(self) -> Any:
         if self._fn is None:
@@ -105,7 +106,7 @@ class Response:
     usage: Usage | None
     finish_reason: str | None
     model: str
-    raw: object = field(default=None, repr=False)
+    raw: object = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

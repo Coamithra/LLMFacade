@@ -8,9 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from llmfacade.exceptions import NotStartedError, UnsupportedFeature
+from llmfacade.exceptions import (
+    NotStartedError,
+    SettingsLockedError,
+    ToolIterationLimitError,
+    UnsupportedFeature,
+)
 from llmfacade.models import (
     ContentBlock,
+    ImageBlock,
     Message,
     Response,
     StreamEvent,
@@ -137,12 +143,14 @@ class Conversation:
         result: str | list[ContentBlock],
         *,
         is_error: bool = False,
+        name: str | None = None,
     ) -> None:
         self._require_started("AddToolResult")
         block = ToolResultBlock(
             tool_use_id=tool_use_id,
             content=result if isinstance(result, str) else self._only_text_image(result),
             is_error=is_error,
+            name=name,
         )
         self._history.append(Message(role="tool", content=[block]))
 
@@ -190,6 +198,7 @@ class Conversation:
         tool_choice: str = "auto",
         effort: Any | None = None,
         auto_tools: bool = True,
+        max_tool_iterations: int = 16,
     ) -> Response:
         self._require_started("Complete")
         if prompt is not None:
@@ -204,7 +213,7 @@ class Conversation:
             effort=effort,
         )
 
-        while True:
+        for _ in range(max_tool_iterations):
             kwargs = self._call_kwargs(
                 tool_choice=tool_choice,
                 stop=stop,
@@ -222,6 +231,11 @@ class Conversation:
             for call in resp.tool_calls:
                 self._dispatch_tool_call(call)
 
+        raise ToolIterationLimitError(
+            f"Auto-tool dispatch exceeded max_tool_iterations={max_tool_iterations}. "
+            f"The model kept calling tools without producing a final answer."
+        )
+
     async def aComplete(
         self,
         prompt: str | list[ContentBlock] | None = None,
@@ -235,6 +249,7 @@ class Conversation:
         tool_choice: str = "auto",
         effort: Any | None = None,
         auto_tools: bool = True,
+        max_tool_iterations: int = 16,
     ) -> Response:
         self._require_started("aComplete")
         if prompt is not None:
@@ -249,7 +264,7 @@ class Conversation:
             effort=effort,
         )
 
-        while True:
+        for _ in range(max_tool_iterations):
             kwargs = self._call_kwargs(
                 tool_choice=tool_choice,
                 stop=stop,
@@ -266,6 +281,11 @@ class Conversation:
 
             for call in resp.tool_calls:
                 await self._adispatch_tool_call(call)
+
+        raise ToolIterationLimitError(
+            f"Auto-tool dispatch exceeded max_tool_iterations={max_tool_iterations}. "
+            f"The model kept calling tools without producing a final answer."
+        )
 
     def Stream(
         self,
@@ -433,16 +453,16 @@ class Conversation:
     def _dispatch_tool_call(self, call: ToolCall) -> None:
         try:
             result = call.invoke()
-            self.AddToolResult(call.id, _stringify_tool_result(result))
+            self.AddToolResult(call.id, _stringify_tool_result(result), name=call.name)
         except Exception as e:
-            self.AddToolResult(call.id, f"Tool error: {e}", is_error=True)
+            self.AddToolResult(call.id, f"Tool error: {e}", is_error=True, name=call.name)
 
     async def _adispatch_tool_call(self, call: ToolCall) -> None:
         try:
             result = await call.ainvoke()
-            self.AddToolResult(call.id, _stringify_tool_result(result))
+            self.AddToolResult(call.id, _stringify_tool_result(result), name=call.name)
         except Exception as e:
-            self.AddToolResult(call.id, f"Tool error: {e}", is_error=True)
+            self.AddToolResult(call.id, f"Tool error: {e}", is_error=True, name=call.name)
 
     def _require_started(self, op: str) -> None:
         if not self._started:
@@ -452,15 +472,10 @@ class Conversation:
 
     def _require_not_started(self, op: str) -> None:
         if self._started:
-            from llmfacade.exceptions import SettingsLockedError
-
             raise SettingsLockedError(f"Conversation.{op}() is not allowed after Start().")
 
     def _only_text_image(self, blocks: list[ContentBlock]) -> list[Any]:
-        from llmfacade.models import ImageBlock as _Img
-        from llmfacade.models import TextBlock as _Txt
-
-        return [b for b in blocks if isinstance(b, (_Txt, _Img))]
+        return [b for b in blocks if isinstance(b, (TextBlock, ImageBlock))]
 
     def _log_request(self, kwargs: dict[str, Any]) -> None:
         if self._log_path is None:
@@ -518,8 +533,6 @@ def _dump_message(m: Message) -> dict[str, Any]:
 
 
 def _dump_block(b: ContentBlock) -> dict[str, Any]:
-    from llmfacade.models import ImageBlock as _Img
-
     cls = type(b).__name__
     if isinstance(b, TextBlock):
         return {"type": cls, "text": b.text}
@@ -527,7 +540,7 @@ def _dump_block(b: ContentBlock) -> dict[str, Any]:
         return {"type": cls, "name": b.name, "input": b.input}
     if isinstance(b, ToolResultBlock):
         return {"type": cls, "tool_use_id": b.tool_use_id, "is_error": b.is_error}
-    if isinstance(b, _Img):
+    if isinstance(b, ImageBlock):
         return {"type": cls, "media_type": b.media_type, "bytes": len(b.data)}
     return {"type": cls}
 

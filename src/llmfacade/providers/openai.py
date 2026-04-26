@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json as _json
+import warnings
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -247,10 +248,12 @@ class OpenAIProvider(Provider):
 
         parts: list[dict[str, Any]] = []
         tool_calls: list[dict[str, Any]] = []
+        has_image = False
         for b in m.content:
             if isinstance(b, TextBlock):
                 parts.append({"type": "text", "text": b.text})
             elif isinstance(b, ImageBlock):
+                has_image = True
                 parts.append(
                     {
                         "type": "image_url",
@@ -272,6 +275,13 @@ class OpenAIProvider(Provider):
             if m.role == "user":
                 out["content"] = parts
             else:
+                if has_image:
+                    warnings.warn(
+                        f"OpenAI: dropping image block(s) on {m.role!r} message; "
+                        f"the OpenAI Chat Completions API only accepts images on "
+                        f"user messages.",
+                        stacklevel=3,
+                    )
                 out["content"] = "".join(
                     p.get("text", "") for p in parts if p.get("type") == "text"
                 )

@@ -27,7 +27,7 @@ def build_dm_agent():
     api_keys = {}
     if "ANTHROPIC_API_KEY" in os.environ:
         api_keys["anthropic"] = os.environ["ANTHROPIC_API_KEY"]
-    mgr = LLM(api_keys=api_keys, log_dir="./logs")
+    mgr = LLM(api_keys=api_keys)
     anth = mgr.NewProvider("anthropic")
     sonnet = anth.NewModel("claude-sonnet-4-6")
 

@@ -81,3 +81,13 @@ def test_per_call_unsupported_override_raises(mock_model):
     convo.Start()
     with pytest.raises(UnsupportedFeature):
         convo.Complete("hi", repeat_penalty=1.1)
+
+
+def test_falsy_override_still_validates(mock_model):
+    # MockProvider does not declare Settings.TopK; passing top_k=0 must not be
+    # treated the same as top_k=None (skipped) — it should hit the capability
+    # check and raise.
+    convo = mock_model.NewConversation()
+    convo.Start()
+    with pytest.raises(UnsupportedFeature):
+        convo.Complete("hi", top_k=0)

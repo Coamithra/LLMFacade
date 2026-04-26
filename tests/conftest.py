@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
+from llmfacade.facade import LLM
 from llmfacade.models import (
     ContentBlock,
     Response,
     StreamEvent,
     TextBlock,
-    ToolCall,
     ToolUseBlock,
     Usage,
 )
@@ -31,7 +31,6 @@ class MockCall:
     kwargs: dict[str, Any]
 
 
-@dataclass
 class MockProvider(Provider):
     """Test double. Capabilities are configurable per-instance."""
 
@@ -48,12 +47,6 @@ class MockProvider(Provider):
             ConvoSettings.UserMetadata,
         }
     )
-
-    canned_text: str = "ok"
-    canned_tool_calls: list[ToolCall] = field(default_factory=list)
-    canned_thinking: str | None = None
-    canned_usage: Usage | None = None
-    calls: list[MockCall] = field(default_factory=list)
 
     def __init__(
         self,
@@ -125,6 +118,14 @@ class MockProvider(Provider):
         for tc in self.canned_tool_calls:
             yield StreamEvent(tool_call_delta=tc)
         yield StreamEvent(done=True, usage=self.canned_usage)
+
+
+@pytest.fixture(autouse=True)
+def _reset_llm_default():
+    """Drop LLM.default() between tests so api_keys mutations don't leak."""
+    LLM.reset_default()
+    yield
+    LLM.reset_default()
 
 
 @pytest.fixture

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from llmfacade import ToolIterationLimitError, tool
 from llmfacade.models import ToolCall
 
 from .conftest import MockProvider
@@ -93,3 +94,20 @@ def test_complete_records_tool_calls_in_history():
     last = convo.history[-1]
     assert last.role == "assistant"
     assert isinstance(last.content, list)
+
+
+def test_max_tool_iterations_raises():
+    @tool
+    def echo(x: int) -> int:
+        """Echo x."""
+        return x
+
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="echo", input={"x": 1})],
+    )
+    convo = p.NewModel("mock-model").NewConversation()
+    convo.AddTool(echo)
+    convo.Start()
+    with pytest.raises(ToolIterationLimitError):
+        convo.Complete("go", max_tool_iterations=3)

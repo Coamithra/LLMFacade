@@ -5,7 +5,7 @@ import os
 from collections.abc import AsyncIterator, Iterator
 from typing import TYPE_CHECKING, Any
 
-from llmfacade.exceptions import AuthenticationError, UnsupportedFeature
+from llmfacade.exceptions import AuthenticationError, SettingsLockedError, UnsupportedFeature
 from llmfacade.settings import (
     AnySetting,
     ConvoSettings,
@@ -45,8 +45,6 @@ class _SettingsFacade:
 
     def set(self, setting: AnySetting, value: Any) -> None:
         if self._locked:
-            from llmfacade.exceptions import SettingsLockedError
-
             raise SettingsLockedError(f"Cannot change {setting.name} after Start().")
         if setting not in self._supports:
             raise UnsupportedFeature(setting, self._provider_name, self._model_id)
@@ -101,10 +99,19 @@ class Provider:
 
         return LLM.default().NewProvider(provider_name, api_key=api_key, base_url=base_url)
 
-    def NewModel(self, model_id: str, **kwargs: Any) -> Model:
+    def NewModel(
+        self,
+        model_id: str,
+        *,
+        capability_override: frozenset[AnySetting] | None = None,
+    ) -> Model:
         from llmfacade.model import Model
 
-        return Model(provider=self, model_id=model_id, **kwargs)
+        return Model(
+            provider=self,
+            model_id=model_id,
+            capability_override=capability_override,
+        )
 
     def isAvailable(self, setting: AnySetting) -> bool:
         return setting in self.SUPPORTS

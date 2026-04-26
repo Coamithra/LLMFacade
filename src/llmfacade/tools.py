@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import typing
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Union, get_args, get_origin
@@ -88,6 +89,15 @@ def _build_schema(fn: Callable[..., Any]) -> tuple[str, dict[str, Any]]:
         annotation = hints.get(param_name, param.annotation)
         prop_schema = _annotation_to_schema(annotation)
         if not prop_schema:
+            if annotation not in (inspect.Parameter.empty, Any):
+                warnings.warn(
+                    f"@tool {fn.__name__!r}: cannot translate annotation "
+                    f"{annotation!r} for parameter {param_name!r}; falling back "
+                    f"to {{'type': 'string'}}. The model will receive a string "
+                    f"and your function will likely TypeError. Use a primitive, "
+                    f"Literal[...], list[T], dict, or Optional/Union of those.",
+                    stacklevel=3,
+                )
             prop_schema = {"type": "string"}
         properties[param_name] = prop_schema
         if param.default is inspect.Parameter.empty:

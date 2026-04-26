@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from llmfacade.exceptions import LLMError, ProviderNotInstalledError
@@ -20,16 +19,22 @@ class LLM:
         self,
         *,
         api_keys: dict[str, str] | None = None,
-        log_dir: str | Path | None = None,
     ):
         self.api_keys: dict[str, str] = dict(api_keys or {})
-        self.log_dir: Path | None = Path(log_dir) if log_dir is not None else None
 
     @classmethod
     def default(cls) -> LLM:
         if cls._default is None:
             cls._default = cls()
         return cls._default
+
+    @classmethod
+    def reset_default(cls) -> None:
+        """Drop the process-wide default LLM. The next default() call rebuilds it.
+
+        Useful in test setup to ensure mutations to LLM.default().api_keys don't
+        leak between tests."""
+        cls._default = None
 
     def NewProvider(
         self,
