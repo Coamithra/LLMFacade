@@ -34,6 +34,15 @@ from llmfacade.settings import (
 )
 
 
+def _openai_cached_tokens(usage: Any) -> int:
+    """Pull cached prompt-token count from OpenAI usage. Lives in
+    `prompt_tokens_details.cached_tokens` on chat-completion responses."""
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None:
+        return 0
+    return getattr(details, "cached_tokens", 0) or 0
+
+
 class OpenAIProvider(Provider):
     NAME = "openai"
     API_KEY_ENV = "OPENAI_API_KEY"
@@ -67,6 +76,22 @@ class OpenAIProvider(Provider):
         self._client = _openai.OpenAI(**client_kwargs)
         self._aclient = _openai.AsyncOpenAI(**client_kwargs)
         self._module = _openai
+
+    _tiktoken_cache: dict[str, Any] = {}
+
+    def _estimate_tokens(self, text: str, model_id: str) -> int:
+        try:
+            import tiktoken
+        except ImportError:
+            return super()._estimate_tokens(text, model_id)
+        enc = self._tiktoken_cache.get(model_id)
+        if enc is None:
+            try:
+                enc = tiktoken.encoding_for_model(model_id)
+            except KeyError:
+                enc = tiktoken.get_encoding("o200k_base")
+            self._tiktoken_cache[model_id] = enc
+        return len(enc.encode(text))
 
     def _build_kwargs(
         self,
@@ -221,6 +246,7 @@ class OpenAIProvider(Provider):
                     prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                     completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
                     total_tokens=getattr(usage, "total_tokens", 0) or 0,
+                    cache_read_tokens=_openai_cached_tokens(usage),
                 ),
             )
 
@@ -333,6 +359,7 @@ class OpenAIProvider(Provider):
                 prompt_tokens=raw.usage.prompt_tokens,
                 completion_tokens=raw.usage.completion_tokens,
                 total_tokens=raw.usage.total_tokens,
+                cache_read_tokens=_openai_cached_tokens(raw.usage),
             )
 
         return Response(

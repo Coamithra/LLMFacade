@@ -139,6 +139,17 @@ class Provider:
     def _init_client(self) -> None:
         """Subclasses override to construct their SDK client."""
 
+    def _estimate_tokens(self, text: str, model_id: str) -> int:
+        """Approximate token count for `text`. Used by the cache-summary
+        diagnostic to map cache_read_tokens back to message indices.
+
+        Default is ``chars / 4``, which is a coarse English-biased fallback.
+        Subclasses should override with a real local tokenizer when available
+        (e.g., tiktoken for OpenAI). Anthropic and Google ship no offline
+        tokenizer, so they stay on the chars/4 fallback."""
+        del model_id
+        return max(1, len(text) // 4)
+
     def _complete_raw(
         self,
         *,

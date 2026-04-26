@@ -275,10 +275,12 @@ class GoogleProvider(Provider):
             return None
         prompt = getattr(um, "prompt_token_count", 0) or 0
         completion = getattr(um, "candidates_token_count", 0) or 0
+        cached = getattr(um, "cached_content_token_count", 0) or 0
         return Usage(
             prompt_tokens=prompt,
             completion_tokens=completion,
             total_tokens=prompt + completion,
+            cache_read_tokens=cached,
         )
 
     def _reraise(self, e: Exception) -> None:

@@ -144,19 +144,37 @@ def _stringify(result: Any) -> str:
         return str(result)
 
 
-def _dump_message(m: Message) -> dict[str, Any]:
+def _abbreviate_text(text: str, max_lines: int | None) -> str:
+    """If ``text`` has more than ``max_lines`` lines, keep the first and last
+    halves with an elision marker in the middle. ``None`` disables abbreviation."""
+    if max_lines is None or max_lines <= 0:
+        return text
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    head = max_lines // 2
+    tail = max_lines - head
+    elided = len(lines) - head - tail
+    return (
+        "\n".join(lines[:head])
+        + f"\n... [{elided} lines skipped] ...\n"
+        + "\n".join(lines[-tail:])
+    )
+
+
+def _dump_message(m: Message, *, max_lines: int | None = None) -> dict[str, Any]:
     if isinstance(m.content, str):
-        return {"role": m.role, "content": m.content}
+        return {"role": m.role, "content": _abbreviate_text(m.content, max_lines)}
     return {
         "role": m.role,
-        "content": [_dump_block(b) for b in m.content],
+        "content": [_dump_block(b, max_lines=max_lines) for b in m.content],
     }
 
 
-def _dump_block(b: ContentBlock) -> dict[str, Any]:
+def _dump_block(b: ContentBlock, *, max_lines: int | None = None) -> dict[str, Any]:
     cls = type(b).__name__
     if isinstance(b, TextBlock):
-        return {"type": cls, "text": b.text}
+        return {"type": cls, "text": _abbreviate_text(b.text, max_lines)}
     if isinstance(b, ToolUseBlock):
         return {"type": cls, "name": b.name, "input": b.input}
     if isinstance(b, ToolResultBlock):

@@ -26,6 +26,7 @@ from llmfacade.settings import (
     AnySetting,
     ConvoSettings,
     EffortLevel,
+    EphemeralCacheTTL,
     ProviderSettings,
     Settings,
 )
@@ -47,6 +48,7 @@ class AnthropicProvider(Provider):
             Settings.Thinking,
             ConvoSettings.AutoCacheLastUser,
             ConvoSettings.UserMetadata,
+            ConvoSettings.CacheTTL,
         }
     )
 
@@ -98,9 +100,18 @@ class AnthropicProvider(Provider):
         convo_settings: dict[AnySetting, Any],
         per_call_overrides: dict[AnySetting, Any],
     ) -> dict[str, Any]:
+        ttl = convo_settings.get(ConvoSettings.CacheTTL)
+        if isinstance(ttl, EphemeralCacheTTL):
+            ttl_value = ttl.value
+        elif isinstance(ttl, str):
+            ttl_value = ttl
+        else:
+            ttl_value = None  # SDK default (5m)
+
         api_msgs = self._messages_to_api(
             messages,
             auto_cache_last=bool(convo_settings.get(ConvoSettings.AutoCacheLastUser)),
+            ttl=ttl_value,
         )
         api_kwargs: dict[str, Any] = {
             "model": model,
@@ -112,7 +123,7 @@ class AnthropicProvider(Provider):
         if stop:
             api_kwargs["stop_sequences"] = stop
 
-        sys_blocks = self._system_to_api(system_blocks)
+        sys_blocks = self._system_to_api(system_blocks, ttl=ttl_value)
         if sys_blocks:
             api_kwargs["system"] = sys_blocks
 
@@ -276,17 +287,26 @@ class AnthropicProvider(Provider):
                 msg = await stream.get_final_message()
                 yield StreamEvent(done=True, usage=self._usage_from(msg))
 
-    def _system_to_api(self, blocks: list[tuple[str, bool]]) -> list[dict[str, Any]]:
+    def _system_to_api(
+        self, blocks: list[tuple[str, bool]], *, ttl: str | None = None
+    ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for text, cache in blocks:
             entry: dict[str, Any] = {"type": "text", "text": text}
             if cache:
-                entry["cache_control"] = {"type": "ephemeral"}
+                cc: dict[str, Any] = {"type": "ephemeral"}
+                if ttl:
+                    cc["ttl"] = ttl
+                entry["cache_control"] = cc
             out.append(entry)
         return out
 
     def _messages_to_api(
-        self, messages: list[Message], *, auto_cache_last: bool
+        self,
+        messages: list[Message],
+        *,
+        auto_cache_last: bool,
+        ttl: str | None = None,
     ) -> list[dict[str, Any]]:
         merged: list[dict[str, Any]] = []
         for m in messages:
@@ -307,7 +327,10 @@ class AnthropicProvider(Provider):
             if last["role"] == "user" and isinstance(last["content"], list) and last["content"]:
                 last_block = last["content"][-1]
                 if isinstance(last_block, dict):
-                    last_block["cache_control"] = {"type": "ephemeral"}
+                    cc: dict[str, Any] = {"type": "ephemeral"}
+                    if ttl:
+                        cc["ttl"] = ttl
+                    last_block["cache_control"] = cc
 
         return merged
 

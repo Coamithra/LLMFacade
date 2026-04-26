@@ -13,6 +13,14 @@ class OutputFormat(Enum):
     JSON = "json"
 
 
+class EphemeralCacheTTL(Enum):
+    """TTL for Anthropic ephemeral cache_control. 5m is the API default; 1h
+    requires the extended-cache beta on older API versions."""
+
+    FIVE_MINUTES = "5m"
+    ONE_HOUR = "1h"
+
+
 class ProviderSettings(Enum):
     """Settings that live on a Provider instance (auth, connection, per-provider knobs)."""
 
@@ -41,6 +49,7 @@ class ConvoSettings(Enum):
     AutoCacheLastUser = auto()
     UserMetadata = auto()
     OutputFormat = auto()
+    CacheTTL = auto()
 
 
 AnySetting = ProviderSettings | Settings | ConvoSettings
