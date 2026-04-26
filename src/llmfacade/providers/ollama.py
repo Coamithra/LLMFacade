@@ -20,7 +20,7 @@ from llmfacade.models import (
     ToolUseBlock,
     Usage,
 )
-from llmfacade.provider import Provider
+from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.settings import (
     AnySetting,
     ConvoSettings,
@@ -66,91 +66,75 @@ class OllamaProvider(Provider):
         self._aclient = _ollama.AsyncClient(**client_kwargs)
         self._module = _ollama
 
-    def _build_chat_kwargs(
-        self,
-        *,
-        model: str,
-        messages: list[Message],
-        system_blocks: list[tuple[str, bool]],
-        tools: list,
-        tool_choice: str,
-        max_tokens: int,
-        temperature: float | None,
-        stop: list[str] | None,
-        provider_settings: dict[AnySetting, Any],
-        model_settings: dict[AnySetting, Any],
-        convo_settings: dict[AnySetting, Any],
-        per_call_overrides: dict[AnySetting, Any],
-    ) -> tuple[dict[str, Any], int | None]:
-        del tool_choice  # Ollama does not support forced tool_choice; tools are always optional
+    def _build_chat_kwargs(self, req: CompletionRequest) -> tuple[dict[str, Any], int | None]:
         api_msgs: list[dict[str, Any]] = []
-        if system_blocks:
+        if req.system_blocks:
             api_msgs.append(
                 {
                     "role": "system",
-                    "content": "\n\n".join(text for text, _cache in system_blocks),
+                    "content": "\n\n".join(text for text, _cache in req.system_blocks),
                 }
             )
-        for m in messages:
+        for m in req.messages:
             api_msgs.extend(self._message_to_api(m))
 
         options: dict[str, Any] = {
-            "num_predict": max_tokens,
+            "num_predict": req.max_tokens,
         }
-        if temperature is not None:
-            options["temperature"] = temperature
-        ctx = model_settings.get(Settings.ContextSize)
+        if req.temperature is not None:
+            options["temperature"] = req.temperature
+        ctx = req.model_settings.get(Settings.ContextSize)
         if ctx is not None:
             options["num_ctx"] = ctx
-        if stop:
-            options["stop"] = stop
+        if req.stop:
+            options["stop"] = req.stop
         for setting, key in (
             (Settings.TopP, "top_p"),
             (Settings.TopK, "top_k"),
             (Settings.RepeatPenalty, "repeat_penalty"),
         ):
-            value = per_call_overrides.get(setting, model_settings.get(setting))
+            value = req.per_call_overrides.get(setting, req.model_settings.get(setting))
             if value is not None:
                 options[key] = value
 
         chat_kwargs: dict[str, Any] = {
-            "model": model,
+            "model": req.model,
             "messages": api_msgs,
             "options": options,
         }
-        keep_alive = provider_settings.get(ProviderSettings.KeepAlive)
+        keep_alive = req.provider_settings.get(ProviderSettings.KeepAlive)
         if keep_alive is not None:
             chat_kwargs["keep_alive"] = keep_alive
 
-        out_format = convo_settings.get(ConvoSettings.OutputFormat)
+        out_format = req.convo_settings.get(ConvoSettings.OutputFormat)
         if out_format is not None:
             value = out_format.value if isinstance(out_format, OutputFormat) else out_format
             if value == "json":
                 chat_kwargs["format"] = "json"
 
-        if tools:
-            chat_kwargs["tools"] = [self._tool_to_api(t) for t in tools]
+        if req.tools:
+            chat_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
 
         return chat_kwargs, ctx
 
-    def _complete_raw(self, **kwargs: Any) -> Response:
-        chat_kwargs, ctx = self._build_chat_kwargs(**kwargs)
+    def _complete_raw(self, req: CompletionRequest) -> Response:
+        chat_kwargs, ctx = self._build_chat_kwargs(req)
         try:
             raw = self._client.chat(**chat_kwargs)
         except Exception as e:
             raise ProviderError(str(e), original=e) from e
         return self._parse_response(raw, ctx)
 
-    async def _acomplete_raw(self, **kwargs: Any) -> Response:
-        chat_kwargs, ctx = self._build_chat_kwargs(**kwargs)
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
+        chat_kwargs, ctx = self._build_chat_kwargs(req)
         try:
             raw = await self._aclient.chat(**chat_kwargs)
         except Exception as e:
             raise ProviderError(str(e), original=e) from e
         return self._parse_response(raw, ctx)
 
-    def _stream_raw(self, **kwargs: Any) -> Iterator[StreamEvent]:
-        chat_kwargs, ctx = self._build_chat_kwargs(**kwargs)
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
+        chat_kwargs, ctx = self._build_chat_kwargs(req)
         chat_kwargs["stream"] = True
         try:
             stream = self._client.chat(**chat_kwargs)
@@ -161,8 +145,8 @@ class OllamaProvider(Provider):
         except Exception as e:
             raise ProviderError(str(e), original=e) from e
 
-    async def _astream_raw(self, **kwargs: Any) -> AsyncIterator[StreamEvent]:
-        chat_kwargs, ctx = self._build_chat_kwargs(**kwargs)
+    async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
+        chat_kwargs, ctx = self._build_chat_kwargs(req)
         chat_kwargs["stream"] = True
         try:
             stream = await self._aclient.chat(**chat_kwargs)

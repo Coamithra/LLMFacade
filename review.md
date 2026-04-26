@@ -22,7 +22,7 @@ Critical review of LLMFacade as of the initial commit. Tackle top-down within ea
 
 ## Architecture (will haunt us)
 
-- [ ] **#9 `_complete_raw` has 12 keyword arguments.** `provider.py:135-150`. Replace with a `CompletionRequest` dataclass; adding a setting then touches one type instead of four providers + facade + tests.
+- [x] **#9 `_complete_raw` has 12 keyword arguments.** Resolved by introducing a frozen `CompletionRequest` dataclass in `provider.py`. The four abstract hooks (`_complete_raw`/`_acomplete_raw`/`_stream_raw`/`_astream_raw`) now take a single `req: CompletionRequest` argument; concrete providers dropped their `**kwargs: Any` punt and read fields off `req` directly (which restored the type-checking the kwargs flattening had silently discarded). `Conversation._call_kwargs` was renamed to `_build_request` and now returns a `CompletionRequest`; the logging path (`_log_request`/`_log_response`/`_cache_summary`/`_estimate_cached_boundary`) takes the dataclass too instead of reaching into a dict by string key. `MockProvider` and the two tests that built kwargs by hand were updated. Sets up a clean path for #10/#11: collapsing the three settings facades will only touch `CompletionRequest` and the read sites, not 16 hook signatures.
 
 - [ ] **#10 Three-level `_SettingsFacade` is reimplemented identically.** `provider.py:23-65`. Provider/Model/Conversation each hold their own facade with the same SUPPORTS set. Collapse to one settings store keyed by scope; drop the duplication and the "where do I read this from" branching in `_call_kwargs`.
 

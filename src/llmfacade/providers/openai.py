@@ -24,7 +24,7 @@ from llmfacade.models import (
     ToolUseBlock,
     Usage,
 )
-from llmfacade.provider import Provider
+from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.settings import (
     AnySetting,
     ConvoSettings,
@@ -93,52 +93,36 @@ class OpenAIProvider(Provider):
             self._tiktoken_cache[model_id] = enc
         return len(enc.encode(text))
 
-    def _build_kwargs(
-        self,
-        *,
-        model: str,
-        messages: list[Message],
-        system_blocks: list[tuple[str, bool]],
-        tools: list,
-        tool_choice: str,
-        max_tokens: int,
-        temperature: float | None,
-        stop: list[str] | None,
-        provider_settings: dict[AnySetting, Any],
-        model_settings: dict[AnySetting, Any],
-        convo_settings: dict[AnySetting, Any],
-        per_call_overrides: dict[AnySetting, Any],
-    ) -> dict[str, Any]:
-        del provider_settings
+    def _build_kwargs(self, req: CompletionRequest) -> dict[str, Any]:
         api_msgs: list[dict[str, Any]] = []
-        if system_blocks:
+        if req.system_blocks:
             api_msgs.append(
                 {
                     "role": "system",
-                    "content": "\n\n".join(text for text, _cache in system_blocks),
+                    "content": "\n\n".join(text for text, _cache in req.system_blocks),
                 }
             )
-        for m in messages:
+        for m in req.messages:
             api_msgs.extend(self._message_to_api(m))
 
         api_kwargs: dict[str, Any] = {
-            "model": model,
+            "model": req.model,
             "messages": api_msgs,
-            "max_tokens": max_tokens,
+            "max_tokens": req.max_tokens,
         }
-        if temperature is not None:
-            api_kwargs["temperature"] = temperature
-        if stop:
-            api_kwargs["stop"] = stop
-        top_p = per_call_overrides.get(Settings.TopP, model_settings.get(Settings.TopP))
+        if req.temperature is not None:
+            api_kwargs["temperature"] = req.temperature
+        if req.stop:
+            api_kwargs["stop"] = req.stop
+        top_p = req.per_call_overrides.get(Settings.TopP, req.model_settings.get(Settings.TopP))
         if top_p is not None:
             api_kwargs["top_p"] = top_p
 
-        if tools:
-            api_kwargs["tools"] = [self._tool_to_api(t) for t in tools]
-            api_kwargs["tool_choice"] = self._tool_choice_to_api(tool_choice)
+        if req.tools:
+            api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
+            api_kwargs["tool_choice"] = self._tool_choice_to_api(req.tool_choice)
 
-        out_format = convo_settings.get(ConvoSettings.OutputFormat)
+        out_format = req.convo_settings.get(ConvoSettings.OutputFormat)
         if out_format is not None:
             value = out_format.value if isinstance(out_format, OutputFormat) else out_format
             if value == "json":
@@ -146,8 +130,8 @@ class OpenAIProvider(Provider):
 
         return api_kwargs
 
-    def _complete_raw(self, **kwargs: Any) -> Response:
-        api_kwargs = self._build_kwargs(**kwargs)
+    def _complete_raw(self, req: CompletionRequest) -> Response:
+        api_kwargs = self._build_kwargs(req)
         try:
             raw = self._client.chat.completions.create(**api_kwargs)
         except self._module.AuthenticationError as e:
@@ -158,8 +142,8 @@ class OpenAIProvider(Provider):
             raise ProviderError(str(e), original=e) from e
         return self._parse_response(raw)
 
-    async def _acomplete_raw(self, **kwargs: Any) -> Response:
-        api_kwargs = self._build_kwargs(**kwargs)
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
+        api_kwargs = self._build_kwargs(req)
         try:
             raw = await self._aclient.chat.completions.create(**api_kwargs)
         except self._module.AuthenticationError as e:
@@ -170,8 +154,8 @@ class OpenAIProvider(Provider):
             raise ProviderError(str(e), original=e) from e
         return self._parse_response(raw)
 
-    def _stream_raw(self, **kwargs: Any) -> Iterator[StreamEvent]:
-        api_kwargs = self._build_kwargs(**kwargs)
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
+        api_kwargs = self._build_kwargs(req)
         api_kwargs["stream"] = True
         api_kwargs["stream_options"] = {"include_usage": True}
         try:
@@ -186,8 +170,8 @@ class OpenAIProvider(Provider):
         except self._module.APIError as e:
             raise ProviderError(str(e), original=e) from e
 
-    async def _astream_raw(self, **kwargs: Any) -> AsyncIterator[StreamEvent]:
-        api_kwargs = self._build_kwargs(**kwargs)
+    async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
+        api_kwargs = self._build_kwargs(req)
         api_kwargs["stream"] = True
         api_kwargs["stream_options"] = {"include_usage": True}
         try:

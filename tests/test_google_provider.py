@@ -65,7 +65,9 @@ def test_build_kwargs_threads_name_through_history():
             content=[ToolResultBlock(tool_use_id="call-abc", content="cold")],
         ),
     ]
-    api_kwargs = p._build_kwargs(
+    from llmfacade.provider import CompletionRequest
+
+    req = CompletionRequest(
         model="gemini-2.5-pro",
         messages=messages,
         system_blocks=[],
@@ -74,11 +76,8 @@ def test_build_kwargs_threads_name_through_history():
         max_tokens=128,
         temperature=None,
         stop=None,
-        provider_settings={},
-        model_settings={},
-        convo_settings={},
-        per_call_overrides={},
     )
+    api_kwargs = p._build_kwargs(req)
     tool_part = api_kwargs["contents"][-1]["parts"][0]
     assert tool_part["function_response"]["name"] == "get_weather"
 

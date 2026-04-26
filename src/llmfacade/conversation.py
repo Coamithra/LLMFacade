@@ -26,7 +26,7 @@ from llmfacade.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from llmfacade.provider import _SettingsFacade
+from llmfacade.provider import CompletionRequest, _SettingsFacade
 from llmfacade.settings import AnySetting, ConvoSettings, Settings
 from llmfacade.tools import Tool
 
@@ -311,14 +311,14 @@ class Conversation:
             repeat_penalty=repeat_penalty,
             effort=effort,
         )
-        kwargs = self._call_kwargs(
+        req = self._build_request(
             tool_choice=tool_choice,
             stop=stop,
             overrides=overrides,
         )
-        self._log_request(kwargs)
-        resp = self._model.provider._complete_raw(**kwargs)
-        self._log_response(kwargs, resp)
+        self._log_request(req)
+        resp = self._model.provider._complete_raw(req)
+        self._log_response(req, resp)
         self._history.append(Message(role="assistant", content=list(resp.blocks)))
         return resp
 
@@ -349,14 +349,14 @@ class Conversation:
             repeat_penalty=repeat_penalty,
             effort=effort,
         )
-        kwargs = self._call_kwargs(
+        req = self._build_request(
             tool_choice=tool_choice,
             stop=stop,
             overrides=overrides,
         )
-        self._log_request(kwargs)
-        resp = await self._model.provider._acomplete_raw(**kwargs)
-        self._log_response(kwargs, resp)
+        self._log_request(req)
+        resp = await self._model.provider._acomplete_raw(req)
+        self._log_response(req, resp)
         self._history.append(Message(role="assistant", content=list(resp.blocks)))
         return resp
 
@@ -386,18 +386,18 @@ class Conversation:
             repeat_penalty=repeat_penalty,
             effort=effort,
         )
-        kwargs = self._call_kwargs(
+        req = self._build_request(
             tool_choice=tool_choice,
             stop=stop,
             overrides=overrides,
         )
-        self._log_request(kwargs)
+        self._log_request(req)
 
         text_buf: list[str] = []
         thinking_buf: list[str] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
-        for ev in self._model.provider._stream_raw(**kwargs):
+        for ev in self._model.provider._stream_raw(req):
             if ev.text_delta:
                 text_buf.append(ev.text_delta)
             if ev.thinking_delta:
@@ -436,18 +436,18 @@ class Conversation:
             repeat_penalty=repeat_penalty,
             effort=effort,
         )
-        kwargs = self._call_kwargs(
+        req = self._build_request(
             tool_choice=tool_choice,
             stop=stop,
             overrides=overrides,
         )
-        self._log_request(kwargs)
+        self._log_request(req)
 
         text_buf: list[str] = []
         thinking_buf: list[str] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
-        async for ev in self._model.provider._astream_raw(**kwargs):
+        async for ev in self._model.provider._astream_raw(req):
             if ev.text_delta:
                 text_buf.append(ev.text_delta)
             if ev.thinking_delta:
@@ -487,13 +487,13 @@ class Conversation:
             out[setting] = value
         return out
 
-    def _call_kwargs(
+    def _build_request(
         self,
         *,
         tool_choice: str,
         stop: list[str] | None,
         overrides: dict[AnySetting, Any],
-    ) -> dict[str, Any]:
+    ) -> CompletionRequest:
         provider = self._model.provider
         max_tokens = overrides.get(
             Settings.DefaultMaxTokens,
@@ -503,20 +503,20 @@ class Conversation:
             Settings.DefaultTemperature,
             self._model.settings.get(Settings.DefaultTemperature),
         )
-        return {
-            "model": self._model.model_id,
-            "messages": list(self._history),
-            "system_blocks": [(b.text, b.cache) for b in self._system_blocks],
-            "tools": list(self._tools.values()),
-            "tool_choice": tool_choice,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stop": stop,
-            "provider_settings": provider.settings._snapshot(),
-            "model_settings": self._model.settings._snapshot(),
-            "convo_settings": self.settings._snapshot(),
-            "per_call_overrides": overrides,
-        }
+        return CompletionRequest(
+            model=self._model.model_id,
+            messages=list(self._history),
+            system_blocks=[(b.text, b.cache) for b in self._system_blocks],
+            tools=list(self._tools.values()),
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+            provider_settings=provider.settings._snapshot(),
+            model_settings=self._model.settings._snapshot(),
+            convo_settings=self.settings._snapshot(),
+            per_call_overrides=overrides,
+        )
 
     def _check_no_dangling_tool_use(self) -> None:
         """Raise if any assistant tool_use in history lacks a matching tool_result.
@@ -555,20 +555,20 @@ class Conversation:
     def _only_text_image(self, blocks: list[ContentBlock]) -> list[Any]:
         return [b for b in blocks if isinstance(b, (TextBlock, ImageBlock))]
 
-    def _log_request(self, kwargs: dict[str, Any]) -> None:
+    def _log_request(self, req: CompletionRequest) -> None:
         if self._log_path is None:
             return
-        messages: list[Message] = list(kwargs.get("messages", []))
+        messages = list(req.messages)
         prior = messages[: self._logged_msg_count]
         new = messages[self._logged_msg_count :]
 
         record: dict[str, Any] = {
             "type": "request",
             "convo": self.name,
-            "model": kwargs.get("model"),
-            "system_blocks": kwargs.get("system_blocks"),
-            "tools": [t.name for t in kwargs.get("tools", [])],
-            "tool_choice": kwargs.get("tool_choice"),
+            "model": req.model,
+            "system_blocks": req.system_blocks,
+            "tools": [t.name for t in req.tools],
+            "tool_choice": req.tool_choice,
             "new_messages": [
                 _dump_message(m, max_lines=self._log_max_message_lines) for m in new
             ],
@@ -582,7 +582,7 @@ class Conversation:
         self._append_log(record)
         self._logged_msg_count = len(messages)
 
-    def _log_response(self, kwargs: dict[str, Any], resp: Response) -> None:
+    def _log_response(self, req: CompletionRequest, resp: Response) -> None:
         if self._log_path is None:
             self._logged_msg_count += 1
             return
@@ -601,13 +601,13 @@ class Conversation:
             "usage": _dump_usage(resp.usage),
             "finish_reason": resp.finish_reason,
         }
-        summary = self._cache_summary(kwargs, resp.usage)
+        summary = self._cache_summary(req, resp.usage)
         if summary is not None:
             record["cache_summary"] = summary
         self._append_log(record)
         self._logged_msg_count += 1
 
-    def _cache_summary(self, kwargs: dict[str, Any], usage: Any) -> dict[str, Any] | None:
+    def _cache_summary(self, req: CompletionRequest, usage: Any) -> dict[str, Any] | None:
         """Compute a human-readable cache breakdown from response usage.
 
         Uses provider-specific token estimates (chars/4 fallback) to map the
@@ -626,7 +626,7 @@ class Conversation:
         if total_input == 0:
             return None
 
-        boundary = self._estimate_cached_boundary(kwargs, cache_read)
+        boundary = self._estimate_cached_boundary(req, cache_read)
         provider = self._model.provider
         explicit = self._model.isAvailable(ConvoSettings.AutoCacheLastUser)
         auto = bool(
@@ -636,7 +636,7 @@ class Conversation:
         if cache_read > 0:
             note = (
                 f"Provider cache hit ~{cache_read} tokens "
-                f"(~{boundary} of {len(kwargs.get('messages', []))} prefix messages). "
+                f"(~{boundary} of {len(req.messages)} prefix messages). "
                 "Caching is working."
             )
         elif cache_creation > 0:
@@ -675,7 +675,7 @@ class Conversation:
         }
 
     def _estimate_cached_boundary(
-        self, kwargs: dict[str, Any], cache_read_tokens: int
+        self, req: CompletionRequest, cache_read_tokens: int
     ) -> int:
         """Walk system blocks then messages, counting how many messages are
         FULLY covered by the cache_read_tokens count (the boundary may fall
@@ -686,11 +686,11 @@ class Conversation:
         provider = self._model.provider
         model_id = self._model.model_id
         accumulated = 0
-        for text, _cache in kwargs.get("system_blocks") or []:
+        for text, _cache in req.system_blocks:
             accumulated += provider._estimate_tokens(text, model_id)
             if accumulated > cache_read_tokens:
                 return 0
-        msgs: list[Message] = list(kwargs.get("messages") or [])
+        msgs = list(req.messages)
         fully_covered = 0
         for i, msg in enumerate(msgs):
             text = _message_to_text(msg)

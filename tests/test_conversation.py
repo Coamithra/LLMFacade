@@ -78,9 +78,9 @@ def test_per_call_overrides_pass_to_provider(mock_model):
     convo = mock_model.NewConversation()
     convo.Start()
     convo.Send("x", max_tokens=999, temperature=0.3)
-    last = p.calls[-1].kwargs
-    assert last["max_tokens"] == 999
-    assert last["temperature"] == 0.3
+    last = p.calls[-1].req
+    assert last.max_tokens == 999
+    assert last.temperature == 0.3
 
 
 def test_send_records_tool_calls_in_history():
@@ -399,11 +399,12 @@ def test_anthropic_cache_ttl_emits_in_request_body():
 
 def test_anthropic_cache_ttl_via_convo_setting():
     """End-to-end: ConvoSettings.CacheTTL plumbs into the wire body."""
+    from llmfacade.provider import CompletionRequest
     from llmfacade.providers.anthropic import AnthropicProvider
     from llmfacade.settings import ConvoSettings, EphemeralCacheTTL
 
     p = object.__new__(AnthropicProvider)
-    api_kwargs = p._build_kwargs(
+    req = CompletionRequest(
         model="claude-sonnet-4-5",
         messages=[],
         system_blocks=[("hi", True)],
@@ -412,12 +413,10 @@ def test_anthropic_cache_ttl_via_convo_setting():
         max_tokens=1024,
         temperature=None,
         stop=None,
-        provider_settings={},
-        model_settings={},
         convo_settings={
             ConvoSettings.AutoCacheLastUser: False,
             ConvoSettings.CacheTTL: EphemeralCacheTTL.ONE_HOUR,
         },
-        per_call_overrides={},
     )
+    api_kwargs = p._build_kwargs(req)
     assert api_kwargs["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}

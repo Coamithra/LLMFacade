@@ -71,6 +71,5 @@ def test_auto_cache_last_user_passes_to_provider(mock_model):
     convo.settings.set(ConvoSettings.AutoCacheLastUser, True)
     convo.Start()
     convo.Send("hi")
-    last = p.calls[-1].kwargs
-    convo_settings = last["convo_settings"]
-    assert convo_settings.get(ConvoSettings.AutoCacheLastUser) is True
+    last = p.calls[-1].req
+    assert last.convo_settings.get(ConvoSettings.AutoCacheLastUser) is True

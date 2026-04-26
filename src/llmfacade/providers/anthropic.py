@@ -21,7 +21,7 @@ from llmfacade.models import (
     ToolUseBlock,
     Usage,
 )
-from llmfacade.provider import Provider
+from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.settings import (
     AnySetting,
     ConvoSettings,
@@ -84,23 +84,8 @@ class AnthropicProvider(Provider):
             **kwargs,
         )
 
-    def _build_kwargs(
-        self,
-        *,
-        model: str,
-        messages: list[Message],
-        system_blocks: list[tuple[str, bool]],
-        tools: list,
-        tool_choice: str,
-        max_tokens: int,
-        temperature: float | None,
-        stop: list[str] | None,
-        provider_settings: dict[AnySetting, Any],
-        model_settings: dict[AnySetting, Any],
-        convo_settings: dict[AnySetting, Any],
-        per_call_overrides: dict[AnySetting, Any],
-    ) -> dict[str, Any]:
-        ttl = convo_settings.get(ConvoSettings.CacheTTL)
+    def _build_kwargs(self, req: CompletionRequest) -> dict[str, Any]:
+        ttl = req.convo_settings.get(ConvoSettings.CacheTTL)
         if isinstance(ttl, EphemeralCacheTTL):
             ttl_value = ttl.value
         elif isinstance(ttl, str):
@@ -109,57 +94,59 @@ class AnthropicProvider(Provider):
             ttl_value = None  # SDK default (5m)
 
         api_msgs = self._messages_to_api(
-            messages,
-            auto_cache_last=bool(convo_settings.get(ConvoSettings.AutoCacheLastUser)),
+            req.messages,
+            auto_cache_last=bool(req.convo_settings.get(ConvoSettings.AutoCacheLastUser)),
             ttl=ttl_value,
         )
         api_kwargs: dict[str, Any] = {
-            "model": model,
-            "max_tokens": max_tokens,
+            "model": req.model,
+            "max_tokens": req.max_tokens,
             "messages": api_msgs,
         }
-        if temperature is not None:
-            api_kwargs["temperature"] = temperature
-        if stop:
-            api_kwargs["stop_sequences"] = stop
+        if req.temperature is not None:
+            api_kwargs["temperature"] = req.temperature
+        if req.stop:
+            api_kwargs["stop_sequences"] = req.stop
 
-        sys_blocks = self._system_to_api(system_blocks, ttl=ttl_value)
+        sys_blocks = self._system_to_api(req.system_blocks, ttl=ttl_value)
         if sys_blocks:
             api_kwargs["system"] = sys_blocks
 
-        if tools:
-            api_kwargs["tools"] = [self._tool_to_api(t) for t in tools]
-            api_kwargs["tool_choice"] = self._tool_choice_to_api(tool_choice)
+        if req.tools:
+            api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
+            api_kwargs["tool_choice"] = self._tool_choice_to_api(req.tool_choice)
 
-        thinking_val = per_call_overrides.get(
-            Settings.Thinking, model_settings.get(Settings.Thinking)
+        thinking_val = req.per_call_overrides.get(
+            Settings.Thinking, req.model_settings.get(Settings.Thinking)
         )
         if thinking_val is not None:
             budget = thinking_val if isinstance(thinking_val, int) else int(thinking_val)
             api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
 
-        effort = per_call_overrides.get(Settings.Effort, model_settings.get(Settings.Effort))
+        effort = req.per_call_overrides.get(
+            Settings.Effort, req.model_settings.get(Settings.Effort)
+        )
         if effort is not None:
             api_kwargs["effort"] = effort.value if isinstance(effort, EffortLevel) else effort
 
         for key in ("TopP", "TopK"):
             setting = getattr(Settings, key)
-            value = per_call_overrides.get(setting, model_settings.get(setting))
+            value = req.per_call_overrides.get(setting, req.model_settings.get(setting))
             if value is not None:
                 api_kwargs["top_p" if key == "TopP" else "top_k"] = value
 
-        metadata = convo_settings.get(ConvoSettings.UserMetadata)
+        metadata = req.convo_settings.get(ConvoSettings.UserMetadata)
         if metadata:
             api_kwargs["metadata"] = metadata
 
-        beta_headers = provider_settings.get(ProviderSettings.BetaHeaders)
+        beta_headers = req.provider_settings.get(ProviderSettings.BetaHeaders)
         if beta_headers:
             api_kwargs["extra_headers"] = {"anthropic-beta": ",".join(beta_headers)}
 
         return api_kwargs
 
-    def _complete_raw(self, **kwargs: Any) -> Response:
-        api_kwargs = self._build_kwargs(**kwargs)
+    def _complete_raw(self, req: CompletionRequest) -> Response:
+        api_kwargs = self._build_kwargs(req)
         try:
             raw = self._client.messages.create(**api_kwargs)
         except self._module.AuthenticationError as e:
@@ -170,8 +157,8 @@ class AnthropicProvider(Provider):
             raise ProviderError(str(e), original=e) from e
         return self._parse_response(raw)
 
-    async def _acomplete_raw(self, **kwargs: Any) -> Response:
-        api_kwargs = self._build_kwargs(**kwargs)
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
+        api_kwargs = self._build_kwargs(req)
         try:
             raw = await self._aclient.messages.create(**api_kwargs)
         except self._module.AuthenticationError as e:
@@ -182,8 +169,8 @@ class AnthropicProvider(Provider):
             raise ProviderError(str(e), original=e) from e
         return self._parse_response(raw)
 
-    def _stream_raw(self, **kwargs: Any) -> Iterator[StreamEvent]:
-        api_kwargs = self._build_kwargs(**kwargs)
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
+        api_kwargs = self._build_kwargs(req)
         try:
             with self._client.messages.stream(**api_kwargs) as stream:
                 yield from self._iter_stream_events(stream)
@@ -194,8 +181,8 @@ class AnthropicProvider(Provider):
         except self._module.APIError as e:
             raise ProviderError(str(e), original=e) from e
 
-    async def _astream_raw(self, **kwargs: Any) -> AsyncIterator[StreamEvent]:
-        api_kwargs = self._build_kwargs(**kwargs)
+    async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
+        api_kwargs = self._build_kwargs(req)
         try:
             async with self._aclient.messages.stream(**api_kwargs) as stream:
                 async for ev in self._aiter_stream_events(stream):

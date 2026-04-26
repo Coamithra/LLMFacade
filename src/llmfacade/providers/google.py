@@ -22,7 +22,7 @@ from llmfacade.models import (
     ToolUseBlock,
     Usage,
 )
-from llmfacade.provider import Provider
+from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.settings import (
     AnySetting,
     ConvoSettings,
@@ -59,64 +59,50 @@ class GoogleProvider(Provider):
         self._client = _genai.Client(api_key=key)
         self._module = _genai
 
-    def _build_kwargs(
-        self,
-        *,
-        model: str,
-        messages: list[Message],
-        system_blocks: list[tuple[str, bool]],
-        tools: list,
-        tool_choice: str,
-        max_tokens: int,
-        temperature: float | None,
-        stop: list[str] | None,
-        provider_settings: dict[AnySetting, Any],
-        model_settings: dict[AnySetting, Any],
-        convo_settings: dict[AnySetting, Any],
-        per_call_overrides: dict[AnySetting, Any],
-    ) -> dict[str, Any]:
-        del provider_settings, tool_choice
+    def _build_kwargs(self, req: CompletionRequest) -> dict[str, Any]:
         tool_id_to_name: dict[str, str] = {}
-        for m in messages:
+        for m in req.messages:
             if isinstance(m.content, list):
                 for b in m.content:
                     if isinstance(b, ToolUseBlock):
                         tool_id_to_name[b.id] = b.name
         contents: list[dict[str, Any]] = []
-        for m in messages:
+        for m in req.messages:
             contents.extend(self._message_to_api(m, tool_id_to_name))
 
         config: dict[str, Any] = {
-            "max_output_tokens": max_tokens,
+            "max_output_tokens": req.max_tokens,
         }
-        if temperature is not None:
-            config["temperature"] = temperature
-        if stop:
-            config["stop_sequences"] = stop
+        if req.temperature is not None:
+            config["temperature"] = req.temperature
+        if req.stop:
+            config["stop_sequences"] = req.stop
         for setting, key in (
             (Settings.TopP, "top_p"),
             (Settings.TopK, "top_k"),
         ):
-            value = per_call_overrides.get(setting, model_settings.get(setting))
+            value = req.per_call_overrides.get(setting, req.model_settings.get(setting))
             if value is not None:
                 config[key] = value
 
-        if system_blocks:
-            config["system_instruction"] = "\n\n".join(text for text, _cache in system_blocks)
+        if req.system_blocks:
+            config["system_instruction"] = "\n\n".join(text for text, _cache in req.system_blocks)
 
-        if tools:
-            config["tools"] = [{"function_declarations": [self._tool_to_api(t) for t in tools]}]
+        if req.tools:
+            config["tools"] = [
+                {"function_declarations": [self._tool_to_api(t) for t in req.tools]}
+            ]
 
-        out_format = convo_settings.get(ConvoSettings.OutputFormat)
+        out_format = req.convo_settings.get(ConvoSettings.OutputFormat)
         if out_format is not None:
             value = out_format.value if isinstance(out_format, OutputFormat) else out_format
             if value == "json":
                 config["response_mime_type"] = "application/json"
 
-        return {"model": model, "contents": contents, "config": config}
+        return {"model": req.model, "contents": contents, "config": config}
 
-    def _complete_raw(self, **kwargs: Any) -> Response:
-        api_kwargs = self._build_kwargs(**kwargs)
+    def _complete_raw(self, req: CompletionRequest) -> Response:
+        api_kwargs = self._build_kwargs(req)
         try:
             raw = self._client.models.generate_content(**api_kwargs)
         except Exception as e:
@@ -124,8 +110,8 @@ class GoogleProvider(Provider):
             raise
         return self._parse_response(raw, api_kwargs["model"])
 
-    async def _acomplete_raw(self, **kwargs: Any) -> Response:
-        api_kwargs = self._build_kwargs(**kwargs)
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
+        api_kwargs = self._build_kwargs(req)
         try:
             raw = await self._client.aio.models.generate_content(**api_kwargs)
         except Exception as e:
@@ -133,8 +119,8 @@ class GoogleProvider(Provider):
             raise
         return self._parse_response(raw, api_kwargs["model"])
 
-    def _stream_raw(self, **kwargs: Any) -> Iterator[StreamEvent]:
-        api_kwargs = self._build_kwargs(**kwargs)
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
+        api_kwargs = self._build_kwargs(req)
         try:
             stream = self._client.models.generate_content_stream(**api_kwargs)
             last_usage: Usage | None = None
@@ -148,8 +134,8 @@ class GoogleProvider(Provider):
             self._reraise(e)
             raise
 
-    async def _astream_raw(self, **kwargs: Any) -> AsyncIterator[StreamEvent]:
-        api_kwargs = self._build_kwargs(**kwargs)
+    async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
+        api_kwargs = self._build_kwargs(req)
         try:
             stream = await self._client.aio.models.generate_content_stream(**api_kwargs)
             last_usage: Usage | None = None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from llmfacade.exceptions import AuthenticationError, SettingsLockedError, UnsupportedFeature
@@ -18,6 +19,29 @@ if TYPE_CHECKING:
     from llmfacade.model import Model
     from llmfacade.models import Message, Response, StreamEvent
     from llmfacade.tools import Tool
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionRequest:
+    """Single round-trip request to a provider's raw hook.
+
+    Bundles every input the four `_*_raw` hooks need. Built once by
+    `Conversation._build_request` per call; consumed positionally by
+    `_complete_raw` / `_acomplete_raw` / `_stream_raw` / `_astream_raw`.
+    """
+
+    model: str
+    messages: list[Message]
+    system_blocks: list[tuple[str, bool]]
+    tools: list[Tool]
+    tool_choice: str
+    max_tokens: int
+    temperature: float | None
+    stop: list[str] | None
+    provider_settings: dict[AnySetting, Any] = field(default_factory=dict)
+    model_settings: dict[AnySetting, Any] = field(default_factory=dict)
+    convo_settings: dict[AnySetting, Any] = field(default_factory=dict)
+    per_call_overrides: dict[AnySetting, Any] = field(default_factory=dict)
 
 
 class _SettingsFacade:
@@ -150,80 +174,21 @@ class Provider:
         del model_id
         return max(1, len(text) // 4)
 
-    def _complete_raw(
-        self,
-        *,
-        model: str,
-        messages: list[Message],
-        system_blocks: list[tuple[str, bool]],
-        tools: list[Tool],
-        tool_choice: str,
-        max_tokens: int,
-        temperature: float | None,
-        stop: list[str] | None,
-        provider_settings: dict[AnySetting, Any],
-        model_settings: dict[AnySetting, Any],
-        convo_settings: dict[AnySetting, Any],
-        per_call_overrides: dict[AnySetting, Any],
-    ) -> Response:
+    def _complete_raw(self, req: CompletionRequest) -> Response:
         raise NotImplementedError
 
-    async def _acomplete_raw(
-        self,
-        *,
-        model: str,
-        messages: list[Message],
-        system_blocks: list[tuple[str, bool]],
-        tools: list[Tool],
-        tool_choice: str,
-        max_tokens: int,
-        temperature: float | None,
-        stop: list[str] | None,
-        provider_settings: dict[AnySetting, Any],
-        model_settings: dict[AnySetting, Any],
-        convo_settings: dict[AnySetting, Any],
-        per_call_overrides: dict[AnySetting, Any],
-    ) -> Response:
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
         raise NotImplementedError
 
-    def _stream_raw(
-        self,
-        *,
-        model: str,
-        messages: list[Message],
-        system_blocks: list[tuple[str, bool]],
-        tools: list[Tool],
-        tool_choice: str,
-        max_tokens: int,
-        temperature: float | None,
-        stop: list[str] | None,
-        provider_settings: dict[AnySetting, Any],
-        model_settings: dict[AnySetting, Any],
-        convo_settings: dict[AnySetting, Any],
-        per_call_overrides: dict[AnySetting, Any],
-    ) -> Iterator[StreamEvent]:
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
         raise NotImplementedError
 
-    def _astream_raw(
-        self,
-        *,
-        model: str,
-        messages: list[Message],
-        system_blocks: list[tuple[str, bool]],
-        tools: list[Tool],
-        tool_choice: str,
-        max_tokens: int,
-        temperature: float | None,
-        stop: list[str] | None,
-        provider_settings: dict[AnySetting, Any],
-        model_settings: dict[AnySetting, Any],
-        convo_settings: dict[AnySetting, Any],
-        per_call_overrides: dict[AnySetting, Any],
-    ) -> AsyncIterator[StreamEvent]:
+    def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
         raise NotImplementedError
 
 
 __all__ = [
+    "CompletionRequest",
     "Provider",
     "ProviderSettings",
     "Settings",

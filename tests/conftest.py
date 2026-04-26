@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
-from typing import Any
 
 import pytest
 
@@ -17,7 +16,7 @@ from llmfacade.models import (
     ToolUseBlock,
     Usage,
 )
-from llmfacade.provider import Provider
+from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.settings import (
     AnySetting,
     ConvoSettings,
@@ -28,7 +27,7 @@ from llmfacade.settings import (
 
 @dataclass
 class MockCall:
-    kwargs: dict[str, Any]
+    req: CompletionRequest
 
 
 class MockProvider(Provider):
@@ -95,24 +94,24 @@ class MockProvider(Provider):
             raw=None,
         )
 
-    def _complete_raw(self, **kwargs: Any) -> Response:
-        self.calls.append(MockCall(kwargs=dict(kwargs)))
+    def _complete_raw(self, req: CompletionRequest) -> Response:
+        self.calls.append(MockCall(req=req))
         return self._make_response()
 
-    async def _acomplete_raw(self, **kwargs: Any) -> Response:
-        self.calls.append(MockCall(kwargs=dict(kwargs)))
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
+        self.calls.append(MockCall(req=req))
         return self._make_response()
 
-    def _stream_raw(self, **kwargs: Any) -> Iterator[StreamEvent]:
-        self.calls.append(MockCall(kwargs=dict(kwargs)))
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
+        self.calls.append(MockCall(req=req))
         for chunk in self.canned_text.split():
             yield StreamEvent(text_delta=chunk + " ")
         for tc in self.canned_tool_calls:
             yield StreamEvent(tool_call_delta=tc)
         yield StreamEvent(done=True, usage=self.canned_usage)
 
-    async def _astream_raw(self, **kwargs: Any) -> AsyncIterator[StreamEvent]:
-        self.calls.append(MockCall(kwargs=dict(kwargs)))
+    async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
+        self.calls.append(MockCall(req=req))
         for chunk in self.canned_text.split():
             yield StreamEvent(text_delta=chunk + " ")
         for tc in self.canned_tool_calls:
