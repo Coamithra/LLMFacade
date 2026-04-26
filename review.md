@@ -6,9 +6,9 @@ Critical review of LLMFacade as of the initial commit. Tackle top-down within ea
 
 - [x] **#1 Google tool-result roundtrip is broken.** `providers/google.py:188-200` sets `function_response.name = b.tool_use_id`, but `tool_use_id` is a synthetic ID. Gemini matches `function_response.name` against the original `function_call.name`. Fix: store the function name on the `ToolResultBlock` (or look it up from history) and emit it here. Add a Gemini integration test that does a tool roundtrip.
 
-- [x] **#2 Tool-dispatch loop has no max iteration guard.** `conversation.py:207-223` (and `aComplete` mirror at 252-268) is `while True:`. A misbehaving model can spin forever and burn tokens. Add `max_tool_iterations` (default ~16) and raise on overflow.
+- [x] **#2 Tool-dispatch loop has no max iteration guard.** `conversation.py:207-223` (and `aComplete` mirror at 252-268) is `while True:`. A misbehaving model can spin forever and burn tokens. Add `max_tool_iterations` (default ~16) and raise on overflow. *(Resolved more thoroughly by #3: the loop was removed from Conversation entirely. The cap now lives in `helpers.run_to_completion`, which still raises `ToolIterationLimitError`.)*
 
-- [ ] **#3 Streaming silently drops tool dispatch.** `Stream`/`aStream` collect `tool_call_delta`s but never dispatch tools, even though `Complete`'s default is `auto_tools=True`. Either implement the loop in streaming (yield tool events, then dispatch, then continue the stream) or document and remove the asymmetry.
+- [x] **#3 Streaming silently drops tool dispatch.** Resolved by removing auto-dispatch from `Conversation` entirely. `Complete`/`aComplete` were renamed to `Send`/`aSend` and are now strict single round-trips matching `Stream`/`aStream`. Tool execution moved to `llmfacade.helpers` (`run_bound_tools`, `run_to_completion`, plus async equivalents), built on the public API. Wire-format invariant is now enforced: `Send`/`Stream` raise `ConversationStateError` if any `tool_use` in history lacks a matching `tool_result`. This fixes the silent-corruption failure mode and removes the streaming/non-streaming asymmetry at its root rather than papering over it.
 
 - [ ] **#4 `_log_request` writes the entire history every turn.** `conversation.py:465-477`. JSONL grows quadratically. Log only the new turn (delta), or split request envelope from history.
 
@@ -54,9 +54,9 @@ Critical review of LLMFacade as of the initial commit. Tackle top-down within ea
 
 - [ ] **#23 Zero integration tests.** All tests use `MockProvider`. Bugs #1 and #15 would never surface. Add at least one skip-if-no-key live test per provider that does a tool roundtrip.
 
-- [x] **#24 No test for the `auto_tools` infinite-loop case.** Add once #2 is fixed.
+- [x] **#24 No test for the `auto_tools` infinite-loop case.** Add once #2 is fixed. *(Now covered by `test_helpers_run_to_completion_caps_iterations`.)*
 
-- [ ] **#25 No test for streaming + tool calls.** Add once #3 is decided.
+- [x] **#25 No test for streaming + tool calls.** ~~Add once #3 is decided.~~ Moot after #3: `Send` and `Stream` are both strict single round-trips, so streaming + tool calls is just "stream returns a Response with tool_calls; caller dispatches via `helpers.run_bound_tools` like the non-streaming path." `test_send_with_dangling_tool_use_raises` covers the wire-format guard that applies to both paths.
 
 - [x] **#26 No test that `LLM.default()` stays clean across tests.** Add once #5 is fixed.
 

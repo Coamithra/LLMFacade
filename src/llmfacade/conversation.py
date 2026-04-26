@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from llmfacade.exceptions import (
+    ConversationStateError,
     NotStartedError,
     SettingsLockedError,
-    ToolIterationLimitError,
     UnsupportedFeature,
 )
+from llmfacade.helpers import _dump_message, _dump_usage, _log_default
 from llmfacade.models import (
     ContentBlock,
     ImageBlock,
@@ -97,6 +98,14 @@ class Conversation:
 
     def getCapabilities(self) -> set[AnySetting]:
         return self.settings.getCapabilities()
+
+    @property
+    def tools(self) -> list[Tool]:
+        return list(self._tools.values())
+
+    def tool(self, name: str) -> Tool | None:
+        """Look up a registered tool by name (returns None if not registered)."""
+        return self._tools.get(name)
 
     def AddTool(self, t: Tool) -> None:
         self._require_not_started("AddTool")
@@ -185,7 +194,7 @@ class Conversation:
         clone._log_path = self._log_path
         return clone
 
-    def Complete(
+    def Send(
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
@@ -197,10 +206,15 @@ class Conversation:
         stop: list[str] | None = None,
         tool_choice: str = "auto",
         effort: Any | None = None,
-        auto_tools: bool = True,
-        max_tool_iterations: int = 16,
     ) -> Response:
-        self._require_started("Complete")
+        """Send one request to the model and return the response.
+
+        If the response includes tool calls, the caller is responsible for
+        executing them and appending results via `AddToolResult` before the
+        next `Send`/`Stream` call. The convenience helpers in
+        `llmfacade.helpers` automate that loop for `@tool`-bound functions."""
+        self._require_started("Send")
+        self._check_no_dangling_tool_use()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
@@ -212,31 +226,18 @@ class Conversation:
             repeat_penalty=repeat_penalty,
             effort=effort,
         )
-
-        for _ in range(max_tool_iterations):
-            kwargs = self._call_kwargs(
-                tool_choice=tool_choice,
-                stop=stop,
-                overrides=overrides,
-            )
-            self._log_request(kwargs)
-            resp = self._model.provider._complete_raw(**kwargs)
-            self._log_response(resp)
-            self._history.append(Message(role="assistant", content=list(resp.blocks)))
-            self._bind_tool_fns(resp.tool_calls)
-
-            if not auto_tools or not resp.tool_calls:
-                return resp
-
-            for call in resp.tool_calls:
-                self._dispatch_tool_call(call)
-
-        raise ToolIterationLimitError(
-            f"Auto-tool dispatch exceeded max_tool_iterations={max_tool_iterations}. "
-            f"The model kept calling tools without producing a final answer."
+        kwargs = self._call_kwargs(
+            tool_choice=tool_choice,
+            stop=stop,
+            overrides=overrides,
         )
+        self._log_request(kwargs)
+        resp = self._model.provider._complete_raw(**kwargs)
+        self._log_response(resp)
+        self._history.append(Message(role="assistant", content=list(resp.blocks)))
+        return resp
 
-    async def aComplete(
+    async def aSend(
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
@@ -248,10 +249,10 @@ class Conversation:
         stop: list[str] | None = None,
         tool_choice: str = "auto",
         effort: Any | None = None,
-        auto_tools: bool = True,
-        max_tool_iterations: int = 16,
     ) -> Response:
-        self._require_started("aComplete")
+        """Async equivalent of `Send`."""
+        self._require_started("aSend")
+        self._check_no_dangling_tool_use()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
@@ -263,29 +264,16 @@ class Conversation:
             repeat_penalty=repeat_penalty,
             effort=effort,
         )
-
-        for _ in range(max_tool_iterations):
-            kwargs = self._call_kwargs(
-                tool_choice=tool_choice,
-                stop=stop,
-                overrides=overrides,
-            )
-            self._log_request(kwargs)
-            resp = await self._model.provider._acomplete_raw(**kwargs)
-            self._log_response(resp)
-            self._history.append(Message(role="assistant", content=list(resp.blocks)))
-            self._bind_tool_fns(resp.tool_calls)
-
-            if not auto_tools or not resp.tool_calls:
-                return resp
-
-            for call in resp.tool_calls:
-                await self._adispatch_tool_call(call)
-
-        raise ToolIterationLimitError(
-            f"Auto-tool dispatch exceeded max_tool_iterations={max_tool_iterations}. "
-            f"The model kept calling tools without producing a final answer."
+        kwargs = self._call_kwargs(
+            tool_choice=tool_choice,
+            stop=stop,
+            overrides=overrides,
         )
+        self._log_request(kwargs)
+        resp = await self._model.provider._acomplete_raw(**kwargs)
+        self._log_response(resp)
+        self._history.append(Message(role="assistant", content=list(resp.blocks)))
+        return resp
 
     def Stream(
         self,
@@ -301,6 +289,7 @@ class Conversation:
         effort: Any | None = None,
     ) -> Iterator[StreamEvent]:
         self._require_started("Stream")
+        self._check_no_dangling_tool_use()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
@@ -350,6 +339,7 @@ class Conversation:
         effort: Any | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self._require_started("aStream")
+        self._check_no_dangling_tool_use()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
@@ -443,26 +433,29 @@ class Conversation:
             "per_call_overrides": overrides,
         }
 
-    def _bind_tool_fns(self, calls: list[ToolCall]) -> None:
-        for i, call in enumerate(calls):
-            tool_def = self._tools.get(call.name)
-            if tool_def is None:
+    def _check_no_dangling_tool_use(self) -> None:
+        """Raise if any assistant tool_use in history lacks a matching tool_result.
+
+        Wire format requires each ToolUseBlock to be answered by a ToolResultBlock
+        before the next request. Sending without that produces a 400 from most
+        providers, so we fail loudly here instead."""
+        used: set[str] = set()
+        resolved: set[str] = set()
+        for msg in self._history:
+            if isinstance(msg.content, str):
                 continue
-            calls[i] = ToolCall(id=call.id, name=call.name, input=call.input, _fn=tool_def.fn)
-
-    def _dispatch_tool_call(self, call: ToolCall) -> None:
-        try:
-            result = call.invoke()
-            self.AddToolResult(call.id, _stringify_tool_result(result), name=call.name)
-        except Exception as e:
-            self.AddToolResult(call.id, f"Tool error: {e}", is_error=True, name=call.name)
-
-    async def _adispatch_tool_call(self, call: ToolCall) -> None:
-        try:
-            result = await call.ainvoke()
-            self.AddToolResult(call.id, _stringify_tool_result(result), name=call.name)
-        except Exception as e:
-            self.AddToolResult(call.id, f"Tool error: {e}", is_error=True, name=call.name)
+            for block in msg.content:
+                if isinstance(block, ToolUseBlock):
+                    used.add(block.id)
+                elif isinstance(block, ToolResultBlock):
+                    resolved.add(block.tool_use_id)
+        unresolved = used - resolved
+        if unresolved:
+            raise ConversationStateError(
+                f"Conversation has unresolved tool calls: {sorted(unresolved)}. "
+                f"Append a ToolResult for each via AddToolResult() (or use "
+                f"llmfacade.helpers.run_bound_tools) before the next Send/Stream."
+            )
 
     def _require_started(self, op: str) -> None:
         if not self._started:
@@ -512,52 +505,3 @@ class Conversation:
         assert self._log_path is not None
         with self._log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=_log_default) + "\n")
-
-
-def _stringify_tool_result(result: Any) -> str:
-    if isinstance(result, str):
-        return result
-    try:
-        return json.dumps(result, default=str)
-    except Exception:
-        return str(result)
-
-
-def _dump_message(m: Message) -> dict[str, Any]:
-    if isinstance(m.content, str):
-        return {"role": m.role, "content": m.content}
-    return {
-        "role": m.role,
-        "content": [_dump_block(b) for b in m.content],
-    }
-
-
-def _dump_block(b: ContentBlock) -> dict[str, Any]:
-    cls = type(b).__name__
-    if isinstance(b, TextBlock):
-        return {"type": cls, "text": b.text}
-    if isinstance(b, ToolUseBlock):
-        return {"type": cls, "name": b.name, "input": b.input}
-    if isinstance(b, ToolResultBlock):
-        return {"type": cls, "tool_use_id": b.tool_use_id, "is_error": b.is_error}
-    if isinstance(b, ImageBlock):
-        return {"type": cls, "media_type": b.media_type, "bytes": len(b.data)}
-    return {"type": cls}
-
-
-def _dump_usage(u: Any) -> dict[str, int] | None:
-    if u is None:
-        return None
-    return {
-        "prompt_tokens": u.prompt_tokens,
-        "completion_tokens": u.completion_tokens,
-        "total_tokens": u.total_tokens,
-        "cache_creation_tokens": u.cache_creation_tokens,
-        "cache_read_tokens": u.cache_read_tokens,
-    }
-
-
-def _log_default(obj: Any) -> Any:
-    if isinstance(obj, bytes):
-        return f"<{len(obj)} bytes>"
-    return str(obj)

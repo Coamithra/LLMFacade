@@ -21,7 +21,7 @@ ruff format src/
 
 # Test
 pytest
-pytest tests/test_conversation.py::test_complete_round_trip   # single test
+pytest tests/test_conversation.py::test_send_appends_user_and_assistant   # single test
 ```
 
 ## Architecture
@@ -40,22 +40,24 @@ Key files:
 - `src/llmfacade/facade.py` - `LLM` manager; `NewProvider()` dynamically imports a provider module via `PROVIDER_REGISTRY` and instantiates it.
 - `src/llmfacade/provider.py` - `Provider` base class. Owns API-key resolution (override > manager dict > env var), `_init_client()`, and the `_complete_raw` / `_acomplete_raw` / `_stream_raw` / `_astream_raw` hooks subclasses implement. Also defines `_SettingsFacade`, the capability-aware settings store reused at every level.
 - `src/llmfacade/model.py` - `Model` binds a `model_id` to a `Provider` and gets its own settings facade. Supports a `capability_override` (used by Anthropic to drop `Settings.Thinking` for non-thinking models).
-- `src/llmfacade/conversation.py` - `Conversation` is the stateful API: history, system blocks (with optional `cache=True`), tools, JSONL logging, `Snapshot`/`Rollback`/`Clone`. Lifecycle: configure -> `Start()` (locks settings) -> `Complete`/`aComplete`/`Stream`/`aStream`. `Complete` runs the full tool-use loop by default; `auto_tools=False` returns control to the caller.
+- `src/llmfacade/conversation.py` - `Conversation` is the stateful API: history, system blocks (with optional `cache=True`), tools, JSONL logging, `Snapshot`/`Rollback`/`Clone`. Lifecycle: configure -> `Start()` (locks settings) -> `Send`/`aSend`/`Stream`/`aStream`. Each call is exactly one provider round-trip: tool calls in the response are returned to the caller, who must dispatch them and append results via `AddToolResult` before the next call. The wire-format invariant (every `tool_use` matched by a `tool_result`) is enforced at request time and raises `ConversationStateError` if violated.
+- `src/llmfacade/helpers.py` - Optional convenience built on the public Conversation API. `run_bound_tools(convo, resp)` dispatches every tool call whose name matches a `@tool` registered on the conversation and appends results. `run_to_completion(convo, prompt)` is the agent loop (`Send` -> dispatch -> `Send` -> ...) with a `max_iterations` cap, raising `ToolIterationLimitError` on overflow. Async equivalents: `arun_bound_tools`, `arun_to_completion`. Helpers touch only the public surface — no underscore attributes.
 - `src/llmfacade/settings.py` - Three enums: `ProviderSettings` (BaseURL, OrgID, BetaHeaders, KeepAlive), `Settings` (ContextSize, DefaultMaxTokens, DefaultTemperature, TopP, TopK, RepeatPenalty, Effort, Thinking), `ConvoSettings` (AutoCacheLastUser, UserMetadata, OutputFormat). Plus `EffortLevel` and `OutputFormat` value enums. `AnySetting = ProviderSettings | Settings | ConvoSettings`.
 - `src/llmfacade/models.py` - Frozen dataclasses for the wire format: `Message`, `TextBlock`, `ImageBlock`, `ToolUseBlock`, `ToolResultBlock`, `ToolCall`, `Response`, `Usage`, `StreamEvent`. `ImageBlock` has `from_path` / `from_base64`.
 - `src/llmfacade/tools.py` - `@tool` decorator that builds a JSON schema from a function's signature + type hints + docstring. Handles primitives, `Literal`, `Optional`/`Union`, `list[T]`, `dict`.
-- `src/llmfacade/exceptions.py` - Hierarchy rooted at `LLMError`: `AuthenticationError`, `RateLimitError`, `ProviderError`, `ModelNotFoundError`, `ProviderNotInstalledError`, `UnsupportedFeature`, `NotStartedError`, `SettingsLockedError`.
+- `src/llmfacade/exceptions.py` - Hierarchy rooted at `LLMError`: `AuthenticationError`, `RateLimitError`, `ProviderError`, `ModelNotFoundError`, `ProviderNotInstalledError`, `UnsupportedFeature`, `NotStartedError`, `SettingsLockedError`, `ToolIterationLimitError`, `ConversationStateError`.
 - `src/llmfacade/providers/__init__.py` - `PROVIDER_REGISTRY` mapping names to `(module_path, class_name)`. `"google"` and `"gemini"` both resolve to `GoogleProvider`.
 - `src/llmfacade/providers/{anthropic,openai,google,ollama}.py` - Provider implementations.
 
 ### Capability gating
 
-Every settings facade enforces a `SUPPORTS: frozenset[AnySetting]` declared on the provider class. Setting an unsupported value raises `UnsupportedFeature`. Per-call kwargs on `Complete`/`Stream` (`max_tokens`, `temperature`, `top_p`, `top_k`, `repeat_penalty`, `effort`) are validated against `Model.isAvailable` before the call. Always check `isAvailable` / `getCapabilities` rather than catching the exception when branching is the goal.
+Every settings facade enforces a `SUPPORTS: frozenset[AnySetting]` declared on the provider class. Setting an unsupported value raises `UnsupportedFeature`. Per-call kwargs on `Send`/`Stream` (`max_tokens`, `temperature`, `top_p`, `top_k`, `repeat_penalty`, `effort`) are validated against `Model.isAvailable` before the call. Always check `isAvailable` / `getCapabilities` rather than catching the exception when branching is the goal.
 
 ### Conversation lifecycle
 
 - Pre-`Start()`: add system blocks, tools, set `SetLogging`, mutate settings.
-- `Start()`: locks settings; `AddUserMessage` / `AddAssistantMessage` / `AddToolResult` / `Complete` / `Stream` become legal.
+- `Start()`: locks settings; `AddUserMessage` / `AddAssistantMessage` / `AddToolResult` / `Send` / `Stream` become legal.
+- `Send`/`aSend`/`Stream`/`aStream` are single round-trips. They never auto-execute tools. If the response contains `tool_calls`, dispatch them yourself (or via `helpers.run_bound_tools`) and append results before the next call.
 - `Snapshot()` returns an opaque token capturing history + system blocks; `Rollback(snap)` restores them. `Clone()` deep-copies everything into a fresh, unstarted conversation.
 
 ### Provider quirks
@@ -80,4 +82,4 @@ Every settings facade enforces a `SUPPORTS: frozenset[AnySetting]` declared on t
 - All wire-format models use `@dataclass(frozen=True, slots=True)`.
 - Full type annotations throughout.
 - src/ layout - imports as `from llmfacade import ...`.
-- Naming: public lifecycle methods on the main classes use PascalCase (`NewProvider`, `NewModel`, `NewConversation`, `Start`, `Complete`, `Stream`, `Snapshot`, `Rollback`, `Clone`, `AddTool`, `AddSystemBlock`, `SetLogging`). Internal helpers use snake_case.
+- Naming: public lifecycle methods on the main classes use PascalCase (`NewProvider`, `NewModel`, `NewConversation`, `Start`, `Send`, `Stream`, `Snapshot`, `Rollback`, `Clone`, `AddTool`, `AddSystemBlock`, `SetLogging`). Internal helpers use snake_case. Standalone helper functions in `llmfacade.helpers` use snake_case (they're not methods).

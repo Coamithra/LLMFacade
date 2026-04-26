@@ -1,7 +1,9 @@
+from llmfacade import helpers
 from llmfacade._version import __version__
 from llmfacade.conversation import Conversation, Snapshot
 from llmfacade.exceptions import (
     AuthenticationError,
+    ConversationStateError,
     LLMError,
     ModelNotFoundError,
     NotStartedError,
@@ -76,6 +78,9 @@ __all__ = [
     "NotStartedError",
     "SettingsLockedError",
     "ToolIterationLimitError",
+    "ConversationStateError",
+    # Helpers
+    "helpers",
     # Misc
     "__version__",
 ]

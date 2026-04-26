@@ -1,16 +1,16 @@
-"""Async mirrors: aComplete and aStream."""
+"""Async mirrors: aSend and aStream."""
 
 from __future__ import annotations
 
 import asyncio
 
 
-def test_acomplete(mock_model):
+def test_asend(mock_model):
     convo = mock_model.NewConversation()
     convo.Start()
 
     async def run():
-        return await convo.aComplete("hi")
+        return await convo.aSend("hi")
 
     resp = asyncio.run(run())
     assert resp.text == "ok"

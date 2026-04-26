@@ -80,7 +80,7 @@ def test_per_call_unsupported_override_raises(mock_model):
     convo = mock_model.NewConversation()
     convo.Start()
     with pytest.raises(UnsupportedFeature):
-        convo.Complete("hi", repeat_penalty=1.1)
+        convo.Send("hi", repeat_penalty=1.1)
 
 
 def test_falsy_override_still_validates(mock_model):
@@ -90,4 +90,4 @@ def test_falsy_override_still_validates(mock_model):
     convo = mock_model.NewConversation()
     convo.Start()
     with pytest.raises(UnsupportedFeature):
-        convo.Complete("hi", top_k=0)
+        convo.Send("hi", top_k=0)

@@ -1,0 +1,184 @@
+"""Convenience helpers built on top of the public Conversation API.
+
+These functions are not part of the core lifecycle. They exist so common
+patterns (running every tool call the model produced, then sending the
+results back until the model stops calling tools) don't have to be hand-
+rolled by every caller — but they are *just* loops over `Send` /
+`AddToolResult`, with no privileged access to internals."""
+
+from __future__ import annotations
+
+import inspect
+import json
+from typing import TYPE_CHECKING, Any
+
+from llmfacade.exceptions import ToolIterationLimitError
+from llmfacade.models import (
+    ContentBlock,
+    ImageBlock,
+    Message,
+    Response,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    Usage,
+)
+
+if TYPE_CHECKING:
+    from llmfacade.conversation import Conversation
+
+
+def flatten_text_blocks(blocks: list[Any]) -> str:
+    """Concatenate the `.text` of every TextBlock in `blocks`. Non-text blocks ignored.
+
+    Useful for collapsing a tool result's mixed content (text + images) down to a
+    plain-text payload that providers without rich tool-result content can accept."""
+    return "".join(b.text for b in blocks if isinstance(b, TextBlock))
+
+
+def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock]:
+    """Run every tool call in `resp` whose name matches a tool registered on `convo`.
+
+    For each match, calls the function with the model's arguments and appends
+    a ToolResultBlock to the conversation via `AddToolResult`. Tool calls whose
+    name is *not* registered are skipped — the caller is then responsible for
+    handling them (or letting the next `Send` raise `ConversationStateError`).
+
+    Returns the list of ToolResultBlocks that were appended."""
+    out: list[ToolResultBlock] = []
+    for call in resp.tool_calls:
+        tool_def = convo.tool(call.name)
+        if tool_def is None:
+            continue
+        try:
+            result = tool_def.fn(**call.input)
+            content = _stringify(result)
+            convo.AddToolResult(call.id, content, name=call.name)
+            out.append(ToolResultBlock(tool_use_id=call.id, content=content, name=call.name))
+        except Exception as e:
+            content = f"Tool error: {e}"
+            convo.AddToolResult(call.id, content, is_error=True, name=call.name)
+            out.append(
+                ToolResultBlock(
+                    tool_use_id=call.id, content=content, is_error=True, name=call.name
+                )
+            )
+    return out
+
+
+async def arun_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock]:
+    """Async equivalent of `run_bound_tools`. Awaits coroutine-returning tool fns."""
+    out: list[ToolResultBlock] = []
+    for call in resp.tool_calls:
+        tool_def = convo.tool(call.name)
+        if tool_def is None:
+            continue
+        try:
+            result = tool_def.fn(**call.input)
+            if inspect.isawaitable(result):
+                result = await result
+            content = _stringify(result)
+            convo.AddToolResult(call.id, content, name=call.name)
+            out.append(ToolResultBlock(tool_use_id=call.id, content=content, name=call.name))
+        except Exception as e:
+            content = f"Tool error: {e}"
+            convo.AddToolResult(call.id, content, is_error=True, name=call.name)
+            out.append(
+                ToolResultBlock(
+                    tool_use_id=call.id, content=content, is_error=True, name=call.name
+                )
+            )
+    return out
+
+
+def run_to_completion(
+    convo: Conversation,
+    prompt: Any = None,
+    *,
+    max_iterations: int = 16,
+    **send_kwargs: Any,
+) -> Response:
+    """Send `prompt`, then dispatch any bound tool calls and continue sending until
+    the model returns a response with no tool calls (or `max_iterations` is hit).
+
+    `send_kwargs` are forwarded to `Conversation.Send` on every iteration. Raises
+    `ToolIterationLimitError` if the loop doesn't terminate."""
+    resp = convo.Send(prompt, **send_kwargs)
+    for _ in range(max_iterations):
+        if not resp.tool_calls:
+            return resp
+        run_bound_tools(convo, resp)
+        resp = convo.Send(**send_kwargs)
+    raise ToolIterationLimitError(
+        f"run_to_completion exceeded max_iterations={max_iterations}. "
+        f"The model kept calling tools without producing a final answer."
+    )
+
+
+async def arun_to_completion(
+    convo: Conversation,
+    prompt: Any = None,
+    *,
+    max_iterations: int = 16,
+    **send_kwargs: Any,
+) -> Response:
+    """Async equivalent of `run_to_completion`."""
+    resp = await convo.aSend(prompt, **send_kwargs)
+    for _ in range(max_iterations):
+        if not resp.tool_calls:
+            return resp
+        await arun_bound_tools(convo, resp)
+        resp = await convo.aSend(**send_kwargs)
+    raise ToolIterationLimitError(
+        f"arun_to_completion exceeded max_iterations={max_iterations}. "
+        f"The model kept calling tools without producing a final answer."
+    )
+
+
+def _stringify(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    try:
+        return json.dumps(result, default=str)
+    except Exception:
+        return str(result)
+
+
+def _dump_message(m: Message) -> dict[str, Any]:
+    if isinstance(m.content, str):
+        return {"role": m.role, "content": m.content}
+    return {
+        "role": m.role,
+        "content": [_dump_block(b) for b in m.content],
+    }
+
+
+def _dump_block(b: ContentBlock) -> dict[str, Any]:
+    cls = type(b).__name__
+    if isinstance(b, TextBlock):
+        return {"type": cls, "text": b.text}
+    if isinstance(b, ToolUseBlock):
+        return {"type": cls, "name": b.name, "input": b.input}
+    if isinstance(b, ToolResultBlock):
+        return {"type": cls, "tool_use_id": b.tool_use_id, "is_error": b.is_error}
+    if isinstance(b, ImageBlock):
+        return {"type": cls, "media_type": b.media_type, "bytes": len(b.data)}
+    return {"type": cls}
+
+
+def _dump_usage(u: Usage | None) -> dict[str, int] | None:
+    if u is None:
+        return None
+    return {
+        "prompt_tokens": u.prompt_tokens,
+        "completion_tokens": u.completion_tokens,
+        "total_tokens": u.total_tokens,
+        "cache_creation_tokens": u.cache_creation_tokens,
+        "cache_read_tokens": u.cache_read_tokens,
+    }
+
+
+def _log_default(obj: Any) -> Any:
+    if isinstance(obj, bytes):
+        return f"<{len(obj)} bytes>"
+    return str(obj)

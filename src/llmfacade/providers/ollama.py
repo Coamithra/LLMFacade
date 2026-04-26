@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 from llmfacade.exceptions import ProviderError, ProviderNotInstalledError
+from llmfacade.helpers import flatten_text_blocks
 from llmfacade.models import (
     ContentBlock,
     ImageBlock,
@@ -202,7 +203,11 @@ class OllamaProvider(Provider):
             blocks = m.content if isinstance(m.content, list) else []
             for b in blocks:
                 if isinstance(b, ToolResultBlock):
-                    text = b.content if isinstance(b.content, str) else _flatten_text(b.content)
+                    text = (
+                        b.content
+                        if isinstance(b.content, str)
+                        else flatten_text_blocks(b.content)
+                    )
                     results.append(
                         {
                             "role": "tool",
@@ -300,9 +305,3 @@ class OllamaProvider(Provider):
         )
 
 
-def _flatten_text(blocks: list[Any]) -> str:
-    parts: list[str] = []
-    for b in blocks:
-        if isinstance(b, TextBlock):
-            parts.append(b.text)
-    return "".join(parts)

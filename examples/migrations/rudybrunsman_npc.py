@@ -49,7 +49,7 @@ async def chat_loop(npc, lines: list[str]):
         if len(npc.history) > history_cap * 2:
             npc.Rollback(npc.Snapshot())  # no-op rollback to current; in practice
             # you'd snapshot before each turn and roll back to a trimmed point.
-        resp = await npc.aComplete(line, max_tokens=100)
+        resp = await npc.aSend(line, max_tokens=100)
         print(f"  player: {line}")
         print(f"  npc:    {resp.text.strip()}")
         if resp.usage:

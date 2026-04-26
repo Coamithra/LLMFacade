@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from llmfacade import ToolIterationLimitError, tool
-from llmfacade.models import ToolCall
+from llmfacade import ConversationStateError, ToolIterationLimitError, helpers, tool
+from llmfacade.models import ToolCall, ToolUseBlock
 
 from .conftest import MockProvider
 
 
-def test_complete_appends_user_and_assistant(started_convo):
-    resp = started_convo.Complete("hello")
+def test_send_appends_user_and_assistant(started_convo):
+    resp = started_convo.Send("hello")
     assert resp.text == "ok"
     history = started_convo.history
     assert len(history) == 2
@@ -20,11 +20,11 @@ def test_complete_appends_user_and_assistant(started_convo):
     assert history[1].role == "assistant"
 
 
-def test_complete_no_arg_uses_existing_history(mock_model):
+def test_send_no_arg_uses_existing_history(mock_model):
     convo = mock_model.NewConversation()
     convo.Start()
     convo.AddUserMessage("seeded")
-    resp = convo.Complete()
+    resp = convo.Send()
     assert resp.text == "ok"
     assert len(convo.history) == 2
 
@@ -74,13 +74,13 @@ def test_per_call_overrides_pass_to_provider(mock_model):
     p: MockProvider = mock_model.provider  # type: ignore[assignment]
     convo = mock_model.NewConversation()
     convo.Start()
-    convo.Complete("x", max_tokens=999, temperature=0.3)
+    convo.Send("x", max_tokens=999, temperature=0.3)
     last = p.calls[-1].kwargs
     assert last["max_tokens"] == 999
     assert last["temperature"] == 0.3
 
 
-def test_complete_records_tool_calls_in_history():
+def test_send_records_tool_calls_in_history():
     p = MockProvider(
         canned_text="",
         canned_tool_calls=[ToolCall(id="t1", name="echo", input={"x": 1})],
@@ -88,15 +88,44 @@ def test_complete_records_tool_calls_in_history():
     model = p.NewModel("mock-model")
     convo = model.NewConversation()
     convo.Start()
-    # auto_tools=False so we don't try to dispatch (no tool registered)
-    resp = convo.Complete("go", auto_tools=False)
+    resp = convo.Send("go")
     assert len(resp.tool_calls) == 1
     last = convo.history[-1]
     assert last.role == "assistant"
     assert isinstance(last.content, list)
 
 
-def test_max_tool_iterations_raises():
+def test_send_with_dangling_tool_use_raises(started_convo):
+    started_convo.AddUserMessage("hi")
+    started_convo.AddAssistantMessage(
+        [ToolUseBlock(id="abc", name="echo", input={"x": 1})]
+    )
+    with pytest.raises(ConversationStateError):
+        started_convo.Send("again")
+
+
+def test_helpers_run_bound_tools_dispatches_and_continues():
+    @tool
+    def echo(x: int) -> int:
+        """Echo x."""
+        return x
+
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="echo", input={"x": 7})],
+    )
+    convo = p.NewModel("mock-model").NewConversation()
+    convo.AddTool(echo)
+    convo.Start()
+    resp = convo.Send("go")
+    results = helpers.run_bound_tools(convo, resp)
+    assert len(results) == 1
+    assert results[0].content == "7"
+    last = convo.history[-1]
+    assert last.role == "tool"
+
+
+def test_helpers_run_to_completion_caps_iterations():
     @tool
     def echo(x: int) -> int:
         """Echo x."""
@@ -110,4 +139,4 @@ def test_max_tool_iterations_raises():
     convo.AddTool(echo)
     convo.Start()
     with pytest.raises(ToolIterationLimitError):
-        convo.Complete("go", max_tool_iterations=3)
+        helpers.run_to_completion(convo, "go", max_iterations=3)

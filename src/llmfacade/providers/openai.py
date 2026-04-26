@@ -11,6 +11,7 @@ from llmfacade.exceptions import (
     ProviderNotInstalledError,
     RateLimitError,
 )
+from llmfacade.helpers import flatten_text_blocks
 from llmfacade.models import (
     ContentBlock,
     ImageBlock,
@@ -232,7 +233,7 @@ class OpenAIProvider(Provider):
                     text = (
                         b.content
                         if isinstance(b.content, str)
-                        else _flatten_text_blocks(b.content)
+                        else flatten_text_blocks(b.content)
                     )
                     results.append(
                         {
@@ -346,9 +347,3 @@ class OpenAIProvider(Provider):
         )
 
 
-def _flatten_text_blocks(blocks: list[Any]) -> str:
-    parts: list[str] = []
-    for b in blocks:
-        if isinstance(b, TextBlock):
-            parts.append(b.text)
-    return "".join(parts)

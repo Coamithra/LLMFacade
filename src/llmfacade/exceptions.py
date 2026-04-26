@@ -65,7 +65,15 @@ class SettingsLockedError(LLMError):
 
 
 class ToolIterationLimitError(LLMError):
-    """The auto-tool dispatch loop exceeded its maximum iteration count.
+    """A tool-dispatch loop exceeded its maximum iteration count.
 
-    A misbehaving model may keep calling tools instead of producing a final
-    answer; this exception bounds the loop so it cannot run forever."""
+    Raised by `helpers.run_to_completion` (and its async equivalent) when a
+    model keeps calling tools without producing a final answer."""
+
+
+class ConversationStateError(LLMError):
+    """Conversation history is in an invalid state for the requested operation.
+
+    Most commonly: the last assistant turn contains tool-use blocks that have
+    no matching tool-result blocks, so the wire format is incomplete and the
+    next call would be rejected by the provider."""

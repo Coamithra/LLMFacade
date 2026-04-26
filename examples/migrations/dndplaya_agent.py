@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-from llmfacade import LLM, ConvoSettings, Settings, tool
+from llmfacade import LLM, ConvoSettings, Settings, helpers, tool
 
 
 @tool
@@ -47,11 +47,15 @@ def build_dm_agent():
 
 
 def turn(dm, player_action: str):
-    """One DM turn with snapshot/rollback for failure recovery (DnDPlaya pattern)."""
+    """One DM turn with snapshot/rollback for failure recovery (DnDPlaya pattern).
+
+    Uses the helpers' agent loop so registered @tool functions get dispatched
+    automatically until the model produces a final answer."""
     snap = dm.Snapshot()
     try:
-        resp = dm.Complete(player_action, max_tokens=2048, tool_choice="auto")
-        return resp
+        return helpers.run_to_completion(
+            dm, player_action, max_tokens=2048, tool_choice="auto"
+        )
     except Exception:
         dm.Rollback(snap)
         raise

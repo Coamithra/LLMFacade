@@ -38,7 +38,7 @@ def test_response_propagates_cache_tokens(mock_model):
     )
     convo = mock_model.NewConversation()
     convo.Start()
-    resp = convo.Complete("hi")
+    resp = convo.Send("hi")
     assert resp.usage.cache_creation_tokens == 42
     assert resp.usage.cache_read_tokens == 11
 
@@ -70,7 +70,7 @@ def test_auto_cache_last_user_passes_to_provider(mock_model):
     convo = mock_model.NewConversation()
     convo.settings.set(ConvoSettings.AutoCacheLastUser, True)
     convo.Start()
-    convo.Complete("hi")
+    convo.Send("hi")
     last = p.calls[-1].kwargs
     convo_settings = last["convo_settings"]
     assert convo_settings.get(ConvoSettings.AutoCacheLastUser) is True

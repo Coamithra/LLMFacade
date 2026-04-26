@@ -46,11 +46,10 @@ def gen_card():
     convo.AddTool(card_design)
     convo.Start()
 
-    resp = convo.Complete(
+    resp = convo.Send(
         "Design a 2-mana green creature with vigilance.",
         max_tokens=2048,
         tool_choice="card_design",
-        auto_tools=False,  # we want the tool call but not auto-dispatch
     )
     print("forced tool call:", resp.tool_calls[0].input)
     return resp
@@ -73,11 +72,10 @@ def select_art_demo(art_paths: list[Path]):
         blocks.append(TextBlock(f"\nCandidate #{i}:"))
         blocks.append(ImageBlock.from_path(p))
 
-    resp = convo.Complete(
+    resp = convo.Send(
         prompt=blocks,
         max_tokens=500,
         tool_choice="select_art",
-        auto_tools=False,
     )
     print("art pick:", resp.tool_calls[0].input if resp.tool_calls else "none")
     return resp

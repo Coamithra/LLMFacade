@@ -27,7 +27,7 @@ chat     = model.NewConversation()
 chat.AddSystemBlock("You are a terse assistant.")
 chat.Start()
 
-resp = chat.Complete("What is 2 + 2?")
+resp = chat.Send("What is 2 + 2?")
 print(resp.text)
 ```
 
@@ -79,7 +79,7 @@ except UnsupportedFeature as e:
     print(e)
 ```
 
-Conversation settings lock when you call `Start()`. After that, only per-call overrides on `Complete`/`Stream` are allowed.
+Conversation settings lock when you call `Start()`. After that, only per-call overrides on `Send`/`Stream` are allowed.
 
 ## Tools
 
@@ -96,11 +96,24 @@ def forge_item(item: str, material: str = "iron") -> str:
 chat.AddTool(forge_item)
 chat.Start()
 
-resp = chat.Complete("Make me a sword.")     # tool runs automatically
+# One round-trip: model may return tool_calls.
+resp = chat.Send("Make me a sword.")
+for call in resp.tool_calls:
+    chat.AddToolResult(call.id, str(forge_item(**call.input)), name=call.name)
+resp = chat.Send()                # continue with the tool results
 print(resp.text)
 ```
 
-By default `Complete` runs the full tool loop: model -> tool calls -> dispatch -> tool results -> model, repeating until the model returns no more tool calls. Pass `auto_tools=False` to inspect `resp.tool_calls` and run them yourself.
+`Send`/`Stream` are exactly one provider round-trip. The library never auto-executes user code. For the common case — run every tool the model calls, send results back, repeat until done — use `llmfacade.helpers.run_to_completion`:
+
+```python
+from llmfacade import helpers
+
+resp = helpers.run_to_completion(chat, "Make me a sword.")
+print(resp.text)
+```
+
+`helpers.run_bound_tools(chat, resp)` is the lower-level building block: it dispatches tool calls whose name matches a `@tool` registered on the conversation. Because the helpers only use the public API, you can write your own (e.g. with approval prompts or parallel dispatch) without subclassing anything.
 
 ## Streaming, async, multimodal
 
@@ -112,7 +125,7 @@ for ev in chat.Stream("Tell me a story."):
 
 # Async
 import asyncio
-resp = asyncio.run(chat.aComplete("Briefly?"))
+resp = asyncio.run(chat.aSend("Briefly?"))
 
 # Multimodal
 from llmfacade import ImageBlock, TextBlock
@@ -120,14 +133,14 @@ chat.AddUserMessage(content=[
     TextBlock("What's in this image?"),
     ImageBlock.from_path("photo.png"),
 ])
-resp = chat.Complete()
+resp = chat.Send()
 ```
 
 ## Snapshot / Rollback / Clone
 
 ```python
 snap = chat.Snapshot()
-chat.Complete("[experiment]")
+chat.Send("[experiment]")
 chat.Rollback(snap)               # back to pre-experiment state
 
 alt = chat.Clone()                # independent copy with the same history & tools
@@ -158,6 +171,8 @@ All errors derive from `LLMError`:
 - `UnsupportedFeature` - setting not supported by this provider/model
 - `NotStartedError` - operation needs `Conversation.Start()`
 - `SettingsLockedError` - tried to mutate settings after `Start()`
+- `ConversationStateError` - history has unresolved `tool_use` blocks; append `tool_result`s before sending again
+- `ToolIterationLimitError` - `helpers.run_to_completion` exceeded `max_iterations`
 
 ## Development
 

@@ -19,6 +19,7 @@ from llmfacade import (
     ConvoSettings,
     Settings,
     UnsupportedFeature,
+    helpers,
     tool,
 )
 
@@ -57,19 +58,19 @@ def main() -> None:
     blacksmith.SetLogging(f"./logs/{args.provider}-blacksmith.jsonl")
     blacksmith.Start()
 
-    print("\n[sync Complete]")
-    resp = blacksmith.Complete("Hi there.", max_tokens=200)
+    print("\n[sync Send]")
+    resp = blacksmith.Send("Hi there.", max_tokens=200)
     print("response:", resp.text[:200])
     if resp.usage:
         print(f"usage: prompt={resp.usage.prompt_tokens} out={resp.usage.completion_tokens}")
 
-    print("\n[tool use]")
-    resp = blacksmith.Complete(
+    print("\n[tool use via helpers.run_to_completion]")
+    resp = helpers.run_to_completion(
+        blacksmith,
         "I need a sword. Use the forge_item tool to make me one.",
         max_tokens=300,
     )
     print("text:", resp.text[:200])
-    print("tool calls used:", len(resp.tool_calls))
 
     print("\n[Stream]")
     for ev in blacksmith.Stream("Now describe the sword poetically.", max_tokens=200):
@@ -77,17 +78,17 @@ def main() -> None:
             print(ev.text_delta, end="", flush=True)
     print()
 
-    print("\n[aComplete]")
+    print("\n[aSend]")
 
     async def go():
-        return await blacksmith.aComplete("Anything else, smith?", max_tokens=100)
+        return await blacksmith.aSend("Anything else, smith?", max_tokens=100)
 
     resp = asyncio.run(go())
     print("async response:", resp.text[:200])
 
     print("\n[Snapshot/Rollback]")
     snap = blacksmith.Snapshot()
-    blacksmith.Complete("[ignore me]", max_tokens=20)
+    blacksmith.Send("[ignore me]", max_tokens=20)
     print("history len before rollback:", len(blacksmith.history))
     blacksmith.Rollback(snap)
     print("history len after rollback:", len(blacksmith.history))
@@ -95,7 +96,7 @@ def main() -> None:
     print("\n[Clone]")
     alt = blacksmith.Clone()
     alt.Start()
-    alt.Complete("Now refuse rudely.", max_tokens=80)
+    alt.Send("Now refuse rudely.", max_tokens=80)
     print("original history:", len(blacksmith.history), "clone history:", len(alt.history))
 
     print("\n[capability gating]")
