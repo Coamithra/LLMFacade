@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json as _json
 from collections.abc import AsyncIterator, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -226,7 +227,13 @@ class AnthropicProvider(Provider):
         api_kwargs = self._build_kwargs(req)
         try:
             with self._client.messages.stream(**api_kwargs) as stream:
-                yield from self._iter_stream_events(stream)
+                state: dict[str, Any] = {"current_tool": None, "current_thinking": None}
+                for event in stream:
+                    if getattr(event, "type", None) == "message_stop":
+                        msg = stream.get_final_message()
+                        yield StreamEvent(done=True, usage=self._usage_from(msg))
+                    else:
+                        yield from self._chunk_to_events(event, state)
         except self._module.AuthenticationError as e:
             raise AuthenticationError(str(e)) from e
         except self._module.RateLimitError as e:
@@ -238,8 +245,14 @@ class AnthropicProvider(Provider):
         api_kwargs = self._build_kwargs(req)
         try:
             async with self._aclient.messages.stream(**api_kwargs) as stream:
-                async for ev in self._aiter_stream_events(stream):
-                    yield ev
+                state: dict[str, Any] = {"current_tool": None, "current_thinking": None}
+                async for event in stream:
+                    if getattr(event, "type", None) == "message_stop":
+                        msg = await stream.get_final_message()
+                        yield StreamEvent(done=True, usage=self._usage_from(msg))
+                    else:
+                        for ev in self._chunk_to_events(event, state):
+                            yield ev
         except self._module.AuthenticationError as e:
             raise AuthenticationError(str(e)) from e
         except self._module.RateLimitError as e:
@@ -247,139 +260,64 @@ class AnthropicProvider(Provider):
         except self._module.APIError as e:
             raise ProviderError(str(e), original=e) from e
 
-    def _iter_stream_events(self, stream: Any) -> Iterator[StreamEvent]:
-        current_tool: dict[str, Any] | None = None
-        current_thinking: dict[str, Any] | None = None
-        for event in stream:
-            event_type = getattr(event, "type", None)
-            if event_type == "content_block_start":
-                block = getattr(event, "content_block", None)
-                block_type = getattr(block, "type", None) if block is not None else None
-                if block_type == "tool_use":
-                    current_tool = {
-                        "id": getattr(block, "id", ""),
-                        "name": getattr(block, "name", ""),
-                        "input_json": "",
-                    }
-                elif block_type == "thinking":
-                    current_thinking = {"text": "", "signature": None}
-                elif block_type == "redacted_thinking":
-                    data = getattr(block, "data", "") or ""
-                    yield StreamEvent(
-                        thinking_block=ThinkingBlock(
-                            text="", encrypted=True, provider_data={"data": data}
-                        )
+    def _chunk_to_events(self, event: Any, state: dict[str, Any]) -> Iterator[StreamEvent]:
+        event_type = getattr(event, "type", None)
+        if event_type == "content_block_start":
+            block = getattr(event, "content_block", None)
+            block_type = getattr(block, "type", None) if block is not None else None
+            if block_type == "tool_use":
+                state["current_tool"] = {
+                    "id": getattr(block, "id", ""),
+                    "name": getattr(block, "name", ""),
+                    "input_json": "",
+                }
+            elif block_type == "thinking":
+                state["current_thinking"] = {"text": "", "signature": None}
+            elif block_type == "redacted_thinking":
+                data = getattr(block, "data", "") or ""
+                yield StreamEvent(
+                    thinking_block=ThinkingBlock(
+                        text="", encrypted=True, provider_data={"data": data}
                     )
-            elif event_type == "content_block_delta":
-                delta = getattr(event, "delta", None)
-                d_type = getattr(delta, "type", None)
-                if d_type == "text_delta":
-                    yield StreamEvent(text_delta=getattr(delta, "text", ""))
-                elif d_type == "thinking_delta":
-                    t = getattr(delta, "thinking", "")
-                    if current_thinking is not None:
-                        current_thinking["text"] += t
-                    yield StreamEvent(thinking_delta=t)
-                elif d_type == "signature_delta" and current_thinking is not None:
-                    current_thinking["signature"] = (current_thinking["signature"] or "") + (
-                        getattr(delta, "signature", "") or ""
+                )
+        elif event_type == "content_block_delta":
+            delta = getattr(event, "delta", None)
+            d_type = getattr(delta, "type", None)
+            if d_type == "text_delta":
+                yield StreamEvent(text_delta=getattr(delta, "text", ""))
+            elif d_type == "thinking_delta":
+                t = getattr(delta, "thinking", "")
+                if state["current_thinking"] is not None:
+                    state["current_thinking"]["text"] += t
+                yield StreamEvent(thinking_delta=t)
+            elif d_type == "signature_delta" and state["current_thinking"] is not None:
+                state["current_thinking"]["signature"] = (
+                    state["current_thinking"]["signature"] or ""
+                ) + (getattr(delta, "signature", "") or "")
+            elif d_type == "input_json_delta" and state["current_tool"] is not None:
+                state["current_tool"]["input_json"] += getattr(delta, "partial_json", "")
+        elif event_type == "content_block_stop":
+            if state["current_tool"] is not None:
+                try:
+                    parsed = _json.loads(state["current_tool"]["input_json"] or "{}")
+                except _json.JSONDecodeError:
+                    parsed = {}
+                yield StreamEvent(
+                    tool_call_delta=ToolCall(
+                        id=state["current_tool"]["id"],
+                        name=state["current_tool"]["name"],
+                        input=parsed,
                     )
-                elif d_type == "input_json_delta" and current_tool is not None:
-                    current_tool["input_json"] += getattr(delta, "partial_json", "")
-            elif event_type == "content_block_stop":
-                if current_tool is not None:
-                    import json as _json
-
-                    try:
-                        parsed = _json.loads(current_tool["input_json"] or "{}")
-                    except _json.JSONDecodeError:
-                        parsed = {}
-                    yield StreamEvent(
-                        tool_call_delta=ToolCall(
-                            id=current_tool["id"],
-                            name=current_tool["name"],
-                            input=parsed,
-                        )
+                )
+                state["current_tool"] = None
+            elif state["current_thinking"] is not None:
+                yield StreamEvent(
+                    thinking_block=ThinkingBlock(
+                        text=state["current_thinking"]["text"],
+                        signature=state["current_thinking"]["signature"],
                     )
-                    current_tool = None
-                elif current_thinking is not None:
-                    yield StreamEvent(
-                        thinking_block=ThinkingBlock(
-                            text=current_thinking["text"],
-                            signature=current_thinking["signature"],
-                        )
-                    )
-                    current_thinking = None
-            elif event_type == "message_stop":
-                msg = stream.get_final_message()
-                yield StreamEvent(done=True, usage=self._usage_from(msg))
-
-    async def _aiter_stream_events(self, stream: Any) -> AsyncIterator[StreamEvent]:
-        current_tool: dict[str, Any] | None = None
-        current_thinking: dict[str, Any] | None = None
-        async for event in stream:
-            event_type = getattr(event, "type", None)
-            if event_type == "content_block_start":
-                block = getattr(event, "content_block", None)
-                block_type = getattr(block, "type", None) if block is not None else None
-                if block_type == "tool_use":
-                    current_tool = {
-                        "id": getattr(block, "id", ""),
-                        "name": getattr(block, "name", ""),
-                        "input_json": "",
-                    }
-                elif block_type == "thinking":
-                    current_thinking = {"text": "", "signature": None}
-                elif block_type == "redacted_thinking":
-                    data = getattr(block, "data", "") or ""
-                    yield StreamEvent(
-                        thinking_block=ThinkingBlock(
-                            text="", encrypted=True, provider_data={"data": data}
-                        )
-                    )
-            elif event_type == "content_block_delta":
-                delta = getattr(event, "delta", None)
-                d_type = getattr(delta, "type", None)
-                if d_type == "text_delta":
-                    yield StreamEvent(text_delta=getattr(delta, "text", ""))
-                elif d_type == "thinking_delta":
-                    t = getattr(delta, "thinking", "")
-                    if current_thinking is not None:
-                        current_thinking["text"] += t
-                    yield StreamEvent(thinking_delta=t)
-                elif d_type == "signature_delta" and current_thinking is not None:
-                    current_thinking["signature"] = (current_thinking["signature"] or "") + (
-                        getattr(delta, "signature", "") or ""
-                    )
-                elif d_type == "input_json_delta" and current_tool is not None:
-                    current_tool["input_json"] += getattr(delta, "partial_json", "")
-            elif event_type == "content_block_stop":
-                if current_tool is not None:
-                    import json as _json
-
-                    try:
-                        parsed = _json.loads(current_tool["input_json"] or "{}")
-                    except _json.JSONDecodeError:
-                        parsed = {}
-                    yield StreamEvent(
-                        tool_call_delta=ToolCall(
-                            id=current_tool["id"],
-                            name=current_tool["name"],
-                            input=parsed,
-                        )
-                    )
-                    current_tool = None
-                elif current_thinking is not None:
-                    yield StreamEvent(
-                        thinking_block=ThinkingBlock(
-                            text=current_thinking["text"],
-                            signature=current_thinking["signature"],
-                        )
-                    )
-                    current_thinking = None
-            elif event_type == "message_stop":
-                msg = await stream.get_final_message()
-                yield StreamEvent(done=True, usage=self._usage_from(msg))
+                )
+                state["current_thinking"] = None
 
     def _system_to_api(
         self, blocks: list[SystemBlock], *, ttl: str | None = None
