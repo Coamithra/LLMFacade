@@ -81,6 +81,47 @@ def test_per_call_overrides_propagate_to_request(mock_model):
     assert last.settings_source["max_tokens"] == "per_call"
 
 
+def test_anthropic_model_enum_applies_capabilities():
+    """Passing an `AnthropicModel` member to `new_model` resolves the canonical
+    model id and applies the enum's capability set automatically."""
+    from llmfacade.providers.anthropic import AnthropicModel, AnthropicProvider
+
+    p = object.__new__(AnthropicProvider)
+    m = p.new_model(AnthropicModel.SONNET_4_6)
+    assert m.model_id == "claude-sonnet-4-6"
+    assert m.get_capabilities() == set(AnthropicProvider.SUPPORTS)
+
+    m_haiku = p.new_model(AnthropicModel.HAIKU_4_5)
+    assert m_haiku.model_id == "claude-haiku-4-5-20251001"
+    assert "thinking" in m_haiku.get_capabilities()
+
+
+def test_anthropic_string_falls_back_to_full_supports():
+    """A raw string (unknown to the enum) gets the provider's full SUPPORTS
+    set; the caller is on their own to narrow via `capability_override=`."""
+    from llmfacade.providers.anthropic import AnthropicProvider
+
+    p = object.__new__(AnthropicProvider)
+    m = p.new_model("claude-some-future-model-2099")
+    assert m.model_id == "claude-some-future-model-2099"
+    assert m.get_capabilities() == set(AnthropicProvider.SUPPORTS)
+
+
+def test_anthropic_explicit_override_beats_enum():
+    """If a caller passes both an enum member and an explicit
+    `capability_override`, the explicit override wins."""
+    from llmfacade.providers.anthropic import AnthropicModel, AnthropicProvider
+
+    p = object.__new__(AnthropicProvider)
+    custom = AnthropicProvider.SUPPORTS - {"top_k"}
+    m = p.new_model(AnthropicModel.SONNET_4_6, capability_override=custom)
+    # Enum default would have given full SUPPORTS; the explicit override
+    # narrows further by dropping "top_k", and that narrowed set is what we
+    # see (not the enum's full default).
+    assert "top_k" not in m.get_capabilities()
+    assert m.get_capabilities() == set(custom)
+
+
 def test_cascade_precedence(mock_provider):
     """provider < model < convo < per_call."""
     p = MockProvider(temperature=0.1, max_tokens=10)

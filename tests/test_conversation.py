@@ -384,7 +384,7 @@ def test_anthropic_cache_ttl_via_convo_setting():
 
     p = object.__new__(AnthropicProvider)
     req = CompletionRequest(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         messages=[],
         system_blocks=[SystemBlock(text="hi", cache=True)],
         tools=[],

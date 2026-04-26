@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from enum import Enum
+from typing import TYPE_CHECKING, Any
 
 from llmfacade.exceptions import (
     AuthenticationError,
@@ -24,28 +25,103 @@ from llmfacade.models import (
 from llmfacade.provider import CompletionRequest, Provider, SystemBlock
 from llmfacade.settings import EffortLevel, EphemeralCacheTTL
 
+if TYPE_CHECKING:
+    from llmfacade.model import Model
+
+_SUPPORTS: frozenset[str] = frozenset(
+    {
+        "context_size",
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "effort",
+        "thinking",
+        "auto_cache_last_user",
+        "user_metadata",
+        "cache_ttl",
+        "beta_headers",
+    }
+)
+
+
+class AnthropicModel(Enum):
+    """Known Anthropic model ids with capability metadata.
+
+    Pass an enum member to `provider.new_model()` and both the canonical model
+    id and a matching `capability_override` are applied automatically. Pass a
+    raw string instead to opt out — the provider's full SUPPORTS set is used
+    and the caller is responsible for narrowing via `capability_override=` if
+    the model needs it.
+
+    This enum is a snapshot of what the library knows about as of its release.
+    Use a string for any model not listed here (new releases between library
+    versions, fine-tunes, custom deployments)."""
+
+    OPUS_4_7 = ("claude-opus-4-7", _SUPPORTS)
+    SONNET_4_6 = ("claude-sonnet-4-6", _SUPPORTS)
+    HAIKU_4_5 = ("claude-haiku-4-5-20251001", _SUPPORTS)
+
+    def __init__(self, model_id: str, capabilities: frozenset[str]):
+        self.model_id = model_id
+        self.capabilities = capabilities
+
 
 class AnthropicProvider(Provider):
     NAME = "anthropic"
     API_KEY_ENV = "ANTHROPIC_API_KEY"
-    SUPPORTS: frozenset[str] = frozenset(
-        {
-            "context_size",
-            "max_tokens",
-            "temperature",
-            "top_p",
-            "top_k",
-            "effort",
-            "thinking",
-            "auto_cache_last_user",
-            "user_metadata",
-            "cache_ttl",
-            "beta_headers",
-        }
-    )
+    SUPPORTS: frozenset[str] = _SUPPORTS
 
-    # Models that don't support extended thinking get this override.
-    _NO_THINKING_MODELS = {"claude-haiku-3-5", "claude-3-5-haiku-20241022"}
+    def new_model(
+        self,
+        model_id: AnthropicModel | str,
+        *,
+        capability_override: frozenset[str] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        effort: Any | None = None,
+        thinking: int | None = None,
+        output_format: Any | None = None,
+        user_metadata: dict[str, str] | None = None,
+        cache_ttl: Any | None = None,
+        auto_cache_last_user: bool | None = None,
+        beta_headers: list[str] | None = None,
+        keep_alive: str | int | None = None,
+        context_size: int | None = None,
+    ) -> Model:
+        """Bind a model id (or `AnthropicModel` member) to this provider.
+
+        If `model_id` is an `AnthropicModel` enum member, its `.capabilities`
+        are applied as `capability_override` automatically. If `model_id` is a
+        raw string, the provider's full SUPPORTS set is used — pass
+        `capability_override=` if the model needs narrowing. An explicit
+        `capability_override=` always wins, even when an enum member is
+        passed."""
+        if isinstance(model_id, AnthropicModel):
+            if capability_override is None:
+                capability_override = model_id.capabilities
+            model_id = model_id.model_id
+        return super().new_model(
+            model_id,
+            capability_override=capability_override,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            effort=effort,
+            thinking=thinking,
+            output_format=output_format,
+            user_metadata=user_metadata,
+            cache_ttl=cache_ttl,
+            auto_cache_last_user=auto_cache_last_user,
+            beta_headers=beta_headers,
+            keep_alive=keep_alive,
+            context_size=context_size,
+        )
 
     def _init_client(self) -> None:
         try:
@@ -62,19 +138,6 @@ class AnthropicProvider(Provider):
         self._client = _anthropic.Anthropic(**client_kwargs)
         self._aclient = _anthropic.AsyncAnthropic(**client_kwargs)
         self._module = _anthropic
-
-    def new_model(self, model_id: str, **kwargs: Any):
-        from llmfacade.model import Model
-
-        override = kwargs.pop("capability_override", None)
-        if override is None and any(m in model_id for m in self._NO_THINKING_MODELS):
-            override = self.SUPPORTS - {"thinking"}
-        return Model(
-            provider=self,
-            model_id=model_id,
-            capability_override=override,
-            **kwargs,
-        )
 
     def _build_kwargs(self, req: CompletionRequest) -> dict[str, Any]:
         ttl_raw = req.settings.get("cache_ttl")
