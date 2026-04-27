@@ -24,11 +24,11 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.40"]
-openai = ["openai>=1.50"]
-google = ["google-genai>=1.0"]
-ollama = ["ollama>=0.4"]
-all = ["anthropic>=0.40", "openai>=1.50", "google-genai>=1.0", "ollama>=0.4"]
+anthropic = ["anthropic>=0.97"]
+openai = ["openai>=2.32"]
+google = ["google-genai>=1.73"]
+ollama = ["ollama>=0.6"]
+all = ["anthropic>=0.97", "openai>=2.32", "google-genai>=1.73", "ollama>=0.6"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

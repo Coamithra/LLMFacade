@@ -68,7 +68,7 @@ Critical review of LLMFacade as of the initial commit. Tackle top-down within ea
 
 - [x] **#29 No CI.** Add `.github/workflows/ci.yml` running `ruff check`, `ruff format --check`, and `pytest` on push/PR.
 
-- [ ] **#30 Bump SDK version floors.** `pyproject.toml` pins like `anthropic>=0.40` are pre-tool-use-2.0 era. Bump to current majors and re-test.
+- [x] **#30 Bump SDK version floors.** Bumped `anthropic` 0.40→0.97, `openai` 1.50→2.32, `google-genai` 1.0→1.73, `ollama` 0.4→0.6 (latest of each at the time). Verified by upgrading in the dev env and running the full unit suite — 80/80 passing on the new floors. OpenAI 2.0's only breaking change is in the Responses API (`ResponseFunctionToolCallOutputItem.output` shape); we use Chat Completions so unaffected. Policy going forward: keep floors at latest, bump on each provider release.
 
 - [ ] **#31 `examples/migrations/` is unreferenced.** Either link from README or move out of the published distribution.
 
