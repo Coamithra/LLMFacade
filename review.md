@@ -52,7 +52,7 @@ Critical review of LLMFacade as of the initial commit. Tackle top-down within ea
 
 ## Test gaps
 
-- [ ] **#23 Zero integration tests.** All tests use `MockProvider`. Bugs #1 and #15 would never surface. Add at least one skip-if-no-key live test per provider that does a tool roundtrip.
+- [x] **#23 Zero integration tests.** Added `tests/integration/` with one tool-roundtrip live test per provider (Anthropic, OpenAI, Google, Ollama). Each test uses `helpers.run_to_completion` to force a tool call and asserts the wire-format roundtrip (history contains both a `ToolUseBlock` and a `ToolResultBlock`, model produces a final text response). Gated by an `integration` pytest marker registered in `pyproject.toml` with `addopts = "-m 'not integration'"`, so default `pytest` runs still skip them — opt in with `pytest -m integration`. Per-provider skips trigger when the relevant API key (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY`) is unset; the Ollama test pings the server first and skips if unreachable. Keys are loaded from a gitignored `.env` at repo root via `python-dotenv` (added to dev extras); `.env.example` documents the four supported vars (three keys plus `OLLAMA_HOST` / `OLLAMA_TEST_MODEL` overrides). Not wired into CI — opt-in only since they cost money.
 
 - [x] **#24 No test for the `auto_tools` infinite-loop case.** Add once #2 is fixed. *(Now covered by `test_helpers_run_to_completion_caps_iterations`.)*
 

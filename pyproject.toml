@@ -32,6 +32,8 @@ all = ["anthropic>=0.40", "openai>=1.50", "google-genai>=1.0", "ollama>=0.4"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
+    "python-dotenv>=1.0",
     "ruff>=0.8",
 ]
 
@@ -41,6 +43,10 @@ packages = ["src/llmfacade"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: live tests that hit real provider APIs (opt-in, costs money)",
+]
+addopts = "-m 'not integration'"
 
 [tool.ruff]
 target-version = "py310"

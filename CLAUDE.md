@@ -24,6 +24,10 @@ pytest
 pytest tests/test_conversation.py::test_send_appends_user_and_assistant   # single test
 ```
 
+**Integration tests cost money. Do not run them without express permission.**
+
+`tests/integration/` hits real provider APIs (Anthropic, OpenAI, Google) and burns credits on every run. They are gated behind `-m integration` and skipped by default — keep it that way. Never invoke `pytest -m integration`, `pytest -m "integration or not integration"`, `pytest tests/integration/`, or any variant that includes them, unless the user has explicitly asked for that specific run in the current turn. Past authorization in earlier turns does not carry over. The Ollama integration test is local and free, but still requires explicit permission so the rule stays simple: never auto-run anything under `tests/integration/`.
+
 ## Architecture
 
 Four-level hierarchy. Each level owns its own concerns and spawns the next:
