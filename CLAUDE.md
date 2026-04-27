@@ -70,6 +70,12 @@ Precedence on read is `provider < model < convo < per_call` (later wins). Unknow
 
 When `log_path=` is passed at convo construction, the JSONL log starts with a single `settings` header record listing every effective knob, its value, and which scope (`provider`/`model`/`convo`) supplied it — plus the system blocks and tool names. Subsequent entries are tight: `request` records carry only `overrides` (per-call kwargs) and `new_messages` (delta since last log), and `response` records carry the assistant content and a `cache_summary` block.
 
+`cache_summary.approximate_messages_cached` maps `cache_read_tokens` back to a message index. The lookup uses **turn-boundary tracking**: each successful send/stream records `(msg_count_at_send, total_input_tokens)` from `usage`, and a later turn's `cache_read_tokens` is matched exactly against that list (cache markers always sit at turn boundaries, so a hit typically equals some prior turn's recorded total). When matched, `tokenizer` reports `"exact (turn-boundary)"`. If no recorded boundary matches (first-turn caching, system-block-only markers, mid-prefix divergence after rollback), it falls back to a per-message walk via `Provider.count_tokens` — exact for OpenAI (tiktoken) and Google (sentencepiece via `google-genai[local-tokenizer]`), `chars/4` for Anthropic and Ollama.
+
+### Token counting
+
+`Provider.count_tokens(text, *, model_id=None)` and `Provider.tokenizer_name(model_id=None)` are the public local-tokenizer API. Convenience wrappers `Model.count_tokens(text)` and `Model.tokenizer_name()` bind the model id automatically. Always local — never makes a network call. Install the optional `tokenizers` extra (`pip install llmfacade[tokenizers]`) to enable tiktoken (OpenAI) and sentencepiece (Google). Anthropic and Ollama have no offline tokenizer; they return `chars/4`. For exact Anthropic counts, call `client.messages.count_tokens` via the SDK directly — the facade keeps it out of the logging hot path.
+
 ### Capability gating
 
 Every provider declares `SUPPORTS: frozenset[str]` listing the knob names it accepts. Setting an unsupported knob at any layer raises `UnsupportedFeature`. Use `provider.is_available("temperature")` / `model.is_available(...)` / `convo.is_available(...)` and `get_capabilities()` to query (returns plain string sets). Never catch `UnsupportedFeature` to branch — query first.

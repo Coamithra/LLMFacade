@@ -249,14 +249,25 @@ class Provider:
     def _init_client(self) -> None:
         """Subclasses override to construct their SDK client."""
 
-    def _estimate_tokens(self, text: str, model_id: str) -> int:
-        """Approximate token count for ``text``. Used by the cache-summary
-        diagnostic to map cache_read_tokens back to message indices.
+    def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
+        """Count tokens in ``text`` using the provider's best available local
+        tokenizer. Default base implementation is ``chars / 4`` (coarse,
+        English-biased). Subclasses override with a real local tokenizer where
+        one is available — see ``OpenAIProvider`` (tiktoken) and
+        ``GoogleProvider`` (sentencepiece via ``google-genai[local-tokenizer]``).
 
-        Default is ``chars / 4``, which is a coarse English-biased fallback.
-        Subclasses should override with a real local tokenizer when available."""
+        Always local — never makes a network call. For exact counts on
+        providers without a local tokenizer (e.g. Anthropic), call the SDK's
+        ``count_tokens`` endpoint directly."""
         del model_id
         return max(1, len(text) // 4)
+
+    def tokenizer_name(self, *, model_id: str | None = None) -> str:
+        """Human-readable label for the tokenizer ``count_tokens`` will use.
+        Useful for log-level diagnostics so callers know whether the count is
+        exact or an approximation."""
+        del model_id
+        return "chars/4"
 
     def _complete_raw(self, req: CompletionRequest) -> Response:
         raise NotImplementedError

@@ -86,6 +86,16 @@ class Model:
     def get_capabilities(self) -> set[str]:
         return set(self._supports)
 
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in ``text`` using the provider's local tokenizer for
+        this model. Convenience wrapper around ``provider.count_tokens(text,
+        model_id=self.model_id)``."""
+        return self._provider.count_tokens(text, model_id=self._model_id)
+
+    def tokenizer_name(self) -> str:
+        """Label of the tokenizer ``count_tokens`` will use for this model."""
+        return self._provider.tokenizer_name(model_id=self._model_id)
+
     def new_conversation(
         self,
         *,

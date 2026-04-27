@@ -77,19 +77,31 @@ class OpenAIProvider(Provider):
 
     _tiktoken_cache: dict[str, Any] = {}
 
-    def _estimate_tokens(self, text: str, model_id: str) -> int:
+    def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
         try:
             import tiktoken
         except ImportError:
-            return super()._estimate_tokens(text, model_id)
-        enc = self._tiktoken_cache.get(model_id)
+            return super().count_tokens(text, model_id=model_id)
+        key = model_id or "__default__"
+        enc = self._tiktoken_cache.get(key)
         if enc is None:
-            try:
-                enc = tiktoken.encoding_for_model(model_id)
-            except KeyError:
+            if model_id:
+                try:
+                    enc = tiktoken.encoding_for_model(model_id)
+                except KeyError:
+                    enc = tiktoken.get_encoding("o200k_base")
+            else:
                 enc = tiktoken.get_encoding("o200k_base")
-            self._tiktoken_cache[model_id] = enc
+            self._tiktoken_cache[key] = enc
         return len(enc.encode(text))
+
+    def tokenizer_name(self, *, model_id: str | None = None) -> str:
+        del model_id
+        try:
+            import tiktoken  # noqa: F401
+        except ImportError:
+            return "chars/4 (tiktoken not installed)"
+        return "tiktoken"
 
     def _build_kwargs(self, req: CompletionRequest) -> dict[str, Any]:
         api_msgs: list[dict[str, Any]] = []

@@ -39,6 +39,7 @@ class Snapshot:
     """Opaque snapshot token for ``Conversation.rollback()``."""
 
     history: tuple[Message, ...]
+    turn_boundaries: tuple[tuple[int, int], ...] = ()
 
 
 def _render_message_oneline(m: Message) -> str:
@@ -86,15 +87,7 @@ def _message_to_text(m: Message) -> str:
 
 
 def _tokenizer_label(provider: Any, model_id: str) -> str:
-    del model_id
-    if provider.NAME == "openai":
-        try:
-            import tiktoken  # noqa: F401
-
-            return "tiktoken"
-        except ImportError:
-            return "chars/4 (tiktoken not installed)"
-    return "chars/4"
+    return provider.tokenizer_name(model_id=model_id)
 
 
 def _abbreviate_lines(text: str, *, head: int = 3, tail: int = 3) -> str:
@@ -203,6 +196,10 @@ class Conversation:
         self._log_path: Path | None = Path(log_path) if log_path is not None else None
         self._log_max_message_lines = log_max_message_lines
         self._logged_msg_count: int = 0
+        # (msg_count_at_send, total_input_tokens) per completed send/stream.
+        # Used by _estimate_cached_boundary to short-circuit the tokenizer
+        # walk when a later turn's cache_read matches a recorded total.
+        self._turn_boundaries: list[tuple[int, int]] = []
 
         if self._log_path is not None:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,12 +268,19 @@ class Conversation:
         self._history.append(Message(role="tool", content=[block]))
 
     def snapshot(self) -> Snapshot:
-        return Snapshot(history=tuple(self._history))
+        return Snapshot(
+            history=tuple(self._history),
+            turn_boundaries=tuple(self._turn_boundaries),
+        )
 
     def rollback(self, snap: Snapshot) -> None:
         self._history = list(snap.history)
         if self._logged_msg_count > len(self._history):
             self._logged_msg_count = len(self._history)
+        # Restore the boundaries captured at snapshot time. Any boundary
+        # recorded after the snapshot referred to a longer prefix than the
+        # rolled-back history and is now invalid.
+        self._turn_boundaries = list(snap.turn_boundaries)
 
     def clone(
         self,
@@ -295,6 +299,10 @@ class Conversation:
         clone._history = copy.deepcopy(self._history)
         clone._tools = dict(self._tools)
         clone._defaults = dict(self._defaults)
+        # Boundaries reference cumulative token counts of a strict prefix of
+        # history. Cloning preserves that prefix verbatim, so boundaries stay
+        # valid for the clone's first turn.
+        clone._turn_boundaries = list(self._turn_boundaries)
         clone._log_path = Path(log_path) if log_path is not None else None
         clone._log_max_message_lines = (
             log_max_message_lines
@@ -361,6 +369,7 @@ class Conversation:
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
         resp = self._model.provider._complete_raw(req)
+        self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
         self._history.append(Message(role="assistant", content=list(resp.blocks)))
         return resp
@@ -411,6 +420,7 @@ class Conversation:
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
         resp = await self._model.provider._acomplete_raw(req)
+        self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
         self._history.append(Message(role="assistant", content=list(resp.blocks)))
         return resp
@@ -464,6 +474,7 @@ class Conversation:
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
+        msg_count_at_send = len(req.messages)
         for ev in self._model.provider._stream_raw(req):
             if ev.text_delta:
                 text_buf.append(ev.text_delta)
@@ -475,6 +486,7 @@ class Conversation:
                 last_usage = ev.usage
             yield ev
 
+        self._record_turn_boundary(last_usage, msg_count_at_send)
         self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
 
     async def astream(
@@ -526,6 +538,7 @@ class Conversation:
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
+        msg_count_at_send = len(req.messages)
         async for ev in self._model.provider._astream_raw(req):
             if ev.text_delta:
                 text_buf.append(ev.text_delta)
@@ -537,6 +550,7 @@ class Conversation:
                 last_usage = ev.usage
             yield ev
 
+        self._record_turn_boundary(last_usage, msg_count_at_send)
         self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
 
     def _finalize_stream(
@@ -744,7 +758,7 @@ class Conversation:
         if total_input == 0:
             return None
 
-        boundary = self._estimate_cached_boundary(req, cache_read)
+        boundary, exact_boundary = self._estimate_cached_boundary(req, cache_read)
         provider = self._model.provider
         explicit = self._model.is_available("auto_cache_last_user")
         auto = bool(explicit and req.settings.get("auto_cache_last_user", False))
@@ -780,36 +794,84 @@ class Conversation:
                 "cache stats, or the prompt was below the cache threshold."
             )
 
+        if exact_boundary:
+            tokenizer_label = "exact (turn-boundary)"
+        else:
+            tokenizer_label = _tokenizer_label(provider, self._model.model_id)
+
         return {
             "cache_read_tokens": cache_read,
             "cache_creation_tokens": cache_creation,
             "uncached_input_tokens": prompt_uncached,
             "hit_ratio": round(cache_read / total_input, 3) if total_input else 0.0,
             "approximate_messages_cached": boundary,
-            "tokenizer": _tokenizer_label(provider, self._model.model_id),
+            "tokenizer": tokenizer_label,
             "_note": note,
         }
 
-    def _estimate_cached_boundary(self, req: CompletionRequest, cache_read_tokens: int) -> int:
+    def _estimate_cached_boundary(
+        self, req: CompletionRequest, cache_read_tokens: int
+    ) -> tuple[int, bool]:
+        """Map ``cache_read_tokens`` back to a message index in ``req.messages``.
+
+        Returns ``(boundary, exact)`` where ``exact=True`` means we matched
+        ``cache_read_tokens`` against a previously recorded turn boundary
+        (no tokenizer estimation needed). Provider cache markers always sit
+        at turn boundaries (system blocks + a previous turn's last user
+        message), so a hit reported in this turn typically equals the total
+        input-token count of some prior send — which we already get for free
+        in ``Usage`` and stash in ``self._turn_boundaries``.
+
+        Falls back to a per-message tokenizer estimate via
+        ``provider.count_tokens`` when no recorded boundary matches (e.g.
+        first-turn caching, system-block-only markers, mid-prefix divergence
+        after rollback)."""
         if cache_read_tokens <= 0:
-            return 0
+            return 0, False
+
+        # Fast path: exact match against a recorded turn boundary.
+        msg_count_now = len(req.messages)
+        best_match: int | None = None
+        for msg_count, total in self._turn_boundaries:
+            if msg_count > msg_count_now:
+                continue
+            if total == cache_read_tokens and (best_match is None or msg_count > best_match):
+                best_match = msg_count
+        if best_match is not None:
+            return best_match, True
+
+        # Fallback: walk messages with the provider's local tokenizer.
         provider = self._model.provider
         model_id = self._model.model_id
         accumulated = 0
         for sb in req.system_blocks:
-            accumulated += provider._estimate_tokens(sb.text, model_id)
+            accumulated += provider.count_tokens(sb.text, model_id=model_id)
             if accumulated > cache_read_tokens:
-                return 0
+                return 0, False
         msgs = list(req.messages)
         fully_covered = 0
         for i, msg in enumerate(msgs):
             text = _message_to_text(msg)
-            tokens = provider._estimate_tokens(text, model_id) if text else 0
+            tokens = provider.count_tokens(text, model_id=model_id) if text else 0
             if accumulated + tokens > cache_read_tokens:
-                return i
+                return i, False
             accumulated += tokens
             fully_covered = i + 1
-        return fully_covered
+        return fully_covered, False
+
+    def _record_turn_boundary(self, usage: Any, msg_count_at_send: int) -> None:
+        """Persist (msg_count_at_send, total_input_tokens) so a later turn's
+        cache_read can be mapped back to an exact message index without a
+        tokenizer call. Called after every successful send/stream."""
+        if usage is None:
+            return
+        prompt = usage.prompt_tokens or 0
+        cache_read = usage.cache_read_tokens or 0
+        cache_creation = usage.cache_creation_tokens or 0
+        total = prompt + cache_read + cache_creation
+        if total <= 0:
+            return
+        self._turn_boundaries.append((msg_count_at_send, total))
 
     def _append_log(self, record: dict[str, Any]) -> None:
         assert self._log_path is not None

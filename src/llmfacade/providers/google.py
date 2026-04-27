@@ -55,6 +55,49 @@ class GoogleProvider(Provider):
         self._client = _genai.Client(api_key=key)
         self._module = _genai
 
+    _local_tokenizer_cache: dict[str, Any] = {}
+
+    def _get_local_tokenizer(self, model_id: str | None) -> Any | None:
+        # google.genai.LocalTokenizer wraps a sentencepiece model. The
+        # gemma3 model file is fetched from GitHub on first use and cached
+        # to a temp dir; subsequent calls are pure-local. Currently covers
+        # Gemini 2.0/2.5 plus the 3.0 preview — all on the gemma3 tokenizer.
+        # 1.x is not supported by google-genai's loader.
+        target = model_id or "gemini-2.5-flash"
+        cached = self._local_tokenizer_cache.get(target)
+        if cached is not None:
+            return cached if cached is not False else None
+        try:
+            from google import genai as _genai
+        except ImportError:
+            self._local_tokenizer_cache[target] = False
+            return None
+        local_tokenizer_cls = getattr(_genai, "LocalTokenizer", None)
+        if local_tokenizer_cls is None:
+            self._local_tokenizer_cache[target] = False
+            return None
+        try:
+            tok = local_tokenizer_cls(model_name=target)
+        except Exception:
+            self._local_tokenizer_cache[target] = False
+            return None
+        self._local_tokenizer_cache[target] = tok
+        return tok
+
+    def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
+        tok = self._get_local_tokenizer(model_id)
+        if tok is None:
+            return super().count_tokens(text, model_id=model_id)
+        try:
+            return int(tok.count_tokens(text).total_tokens)
+        except Exception:
+            return super().count_tokens(text, model_id=model_id)
+
+    def tokenizer_name(self, *, model_id: str | None = None) -> str:
+        if self._get_local_tokenizer(model_id) is None:
+            return "chars/4 (google-genai[local-tokenizer] not installed)"
+        return "sentencepiece (gemma3)"
+
     def _build_kwargs(self, req: CompletionRequest) -> dict[str, Any]:
         tool_id_to_name: dict[str, str] = {}
         for m in req.messages:
