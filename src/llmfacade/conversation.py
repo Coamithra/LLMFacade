@@ -161,6 +161,7 @@ class Conversation:
         beta_headers: list[str] | None = None,
         keep_alive: str | int | None = None,
         context_size: int | None = None,
+        tool_choice: str | None = None,
     ):
         self._model = model
         self.name = name or f"convo-{uuid.uuid4().hex[:8]}"
@@ -171,6 +172,8 @@ class Conversation:
             provider=model.provider.NAME,
             model=model.model_id,
         )
+        if tools and not model.is_available("tools"):
+            raise UnsupportedFeature("tools", model.provider.NAME, model.model_id)
         self._tools: dict[str, Tool] = {t.name: t for t in (tools or [])}
 
         self._defaults = _validate_knobs(
@@ -189,6 +192,7 @@ class Conversation:
                 "beta_headers": beta_headers,
                 "keep_alive": keep_alive,
                 "context_size": context_size,
+                "tool_choice": tool_choice,
             },
             model._supports,
             model.provider.NAME,
@@ -310,7 +314,7 @@ class Conversation:
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
-        tool_choice: str = "auto",
+        tool_choice: str | None = None,
         stop: list[str] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -348,12 +352,13 @@ class Conversation:
             beta_headers=beta_headers,
             keep_alive=keep_alive,
             context_size=context_size,
+            tool_choice=tool_choice,
         )
         self._check_no_dangling_tool_use()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
-        req = self._build_request(tool_choice=tool_choice, stop=stop, per_call=per_call)
+        req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
         resp = self._model.provider._complete_raw(req)
         self._log_response(req, resp)
@@ -364,7 +369,7 @@ class Conversation:
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
-        tool_choice: str = "auto",
+        tool_choice: str | None = None,
         stop: list[str] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -397,12 +402,13 @@ class Conversation:
             beta_headers=beta_headers,
             keep_alive=keep_alive,
             context_size=context_size,
+            tool_choice=tool_choice,
         )
         self._check_no_dangling_tool_use()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
-        req = self._build_request(tool_choice=tool_choice, stop=stop, per_call=per_call)
+        req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
         resp = await self._model.provider._acomplete_raw(req)
         self._log_response(req, resp)
@@ -413,7 +419,7 @@ class Conversation:
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
-        tool_choice: str = "auto",
+        tool_choice: str | None = None,
         stop: list[str] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -445,12 +451,13 @@ class Conversation:
             beta_headers=beta_headers,
             keep_alive=keep_alive,
             context_size=context_size,
+            tool_choice=tool_choice,
         )
         self._check_no_dangling_tool_use()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
-        req = self._build_request(tool_choice=tool_choice, stop=stop, per_call=per_call)
+        req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
         text_buf: list[str] = []
@@ -474,7 +481,7 @@ class Conversation:
         self,
         prompt: str | list[ContentBlock] | None = None,
         *,
-        tool_choice: str = "auto",
+        tool_choice: str | None = None,
         stop: list[str] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -506,12 +513,13 @@ class Conversation:
             beta_headers=beta_headers,
             keep_alive=keep_alive,
             context_size=context_size,
+            tool_choice=tool_choice,
         )
         self._check_no_dangling_tool_use()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
-        req = self._build_request(tool_choice=tool_choice, stop=stop, per_call=per_call)
+        req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
         text_buf: list[str] = []
@@ -560,7 +568,6 @@ class Conversation:
     def _build_request(
         self,
         *,
-        tool_choice: str,
         stop: list[str] | None,
         per_call: dict[str, Any],
     ) -> CompletionRequest:
@@ -590,12 +597,29 @@ class Conversation:
             merged["max_tokens"] = 1024
             sources["max_tokens"] = "default"
 
+        # Validate forced-tool selection: a named tool_choice must match a
+        # registered tool, and any non-"auto" tool_choice requires tools to be
+        # registered. "auto" / "required" / "none" / "<name>" are the four
+        # canonical values; unknown reserved-word lookalikes ("any", typo'd
+        # "requiered") fall into the named branch and are caught below.
+        tc = merged.get("tool_choice")
+        if tc is not None and tc != "auto":
+            if not self._tools:
+                raise ValueError(
+                    f"tool_choice={tc!r} requires tools to be registered on the "
+                    "conversation, but tools is empty."
+                )
+            if tc not in {"required", "none"} and tc not in self._tools:
+                raise ValueError(
+                    f"tool_choice={tc!r} is not 'auto'/'required'/'none' and does "
+                    f"not match any registered tool. Known: {sorted(self._tools)}."
+                )
+
         return CompletionRequest(
             model=self._model.model_id,
             messages=list(self._history),
             system_blocks=list(self._system_blocks),
             tools=list(self._tools.values()),
-            tool_choice=tool_choice,
             stop=stop,
             settings=merged,
             settings_source=sources,
@@ -671,7 +695,7 @@ class Conversation:
         record: dict[str, Any] = {
             "type": "request",
             "convo": self.name,
-            "tool_choice": req.tool_choice,
+            "tool_choice": req.settings.get("tool_choice", "auto"),
             "stop": req.stop,
             "overrides": {k: _logsafe(v) for k, v in per_call.items()},
             "new_messages": [_dump_message(m, max_lines=self._log_max_message_lines) for m in new],

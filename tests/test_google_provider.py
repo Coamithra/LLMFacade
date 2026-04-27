@@ -70,7 +70,6 @@ def test_build_kwargs_threads_name_through_history():
         messages=messages,
         system_blocks=[],
         tools=[],
-        tool_choice="auto",
         stop=None,
         settings={"max_tokens": 128},
     )

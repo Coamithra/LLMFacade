@@ -39,7 +39,6 @@ class CompletionRequest:
     messages: list[Message]
     system_blocks: list[SystemBlock]
     tools: list[Tool]
-    tool_choice: str
     stop: list[str] | None
     settings: dict[str, Any] = field(default_factory=dict)
     settings_source: dict[str, str] = field(default_factory=dict)
@@ -136,6 +135,7 @@ class Provider:
         beta_headers: list[str] | None = None,
         keep_alive: str | int | None = None,
         context_size: int | None = None,
+        tool_choice: str | None = None,
     ):
         self._manager = manager
         self._api_key_override = api_key
@@ -156,6 +156,7 @@ class Provider:
                 "beta_headers": beta_headers,
                 "keep_alive": keep_alive,
                 "context_size": context_size,
+                "tool_choice": tool_choice,
             },
             self.SUPPORTS,
             self.NAME,
@@ -189,6 +190,7 @@ class Provider:
         beta_headers: list[str] | None = None,
         keep_alive: str | int | None = None,
         context_size: int | None = None,
+        tool_choice: str | None = None,
     ) -> Model:
         from llmfacade.model import Model
 
@@ -207,6 +209,7 @@ class Provider:
             "beta_headers": beta_headers,
             "keep_alive": keep_alive,
             "context_size": context_size,
+            "tool_choice": tool_choice,
         }
         return Model(
             provider=self,

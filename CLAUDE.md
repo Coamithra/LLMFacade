@@ -92,12 +92,14 @@ Every provider declares `SUPPORTS: frozenset[str]` listing the knob names it acc
 
 1. Create `src/llmfacade/providers/<name>.py` with a `class <Name>Provider(Provider)`.
 2. Set `NAME`, `API_KEY_ENV`, and a `SUPPORTS: frozenset[str]` of knob names.
-3. Implement `_init_client()` and `_complete_raw` / `_acomplete_raw` / `_stream_raw` / `_astream_raw`. Each receives a `CompletionRequest` (model, messages, system_blocks, tools, tool_choice, stop, plus a single merged `settings: dict[str, Any]` and `settings_source: dict[str, str]`).
+3. Implement `_init_client()` and `_complete_raw` / `_acomplete_raw` / `_stream_raw` / `_astream_raw`. Each receives a `CompletionRequest` (model, messages, system_blocks, tools, stop, plus a single merged `settings: dict[str, Any]` and `settings_source: dict[str, str]`). Generation knobs — including `tool_choice` — live in `settings`; read them via `req.settings.get("tool_choice", "auto")`.
 4. Register `(module_path, class_name)` in `PROVIDER_REGISTRY`.
 5. Add an optional dependency block to `pyproject.toml`.
 6. Map SDK errors to facade exceptions (`AuthenticationError`, `RateLimitError`, `ProviderError`).
 
-If your provider needs extra identity args (e.g. `org_id`), add them to a `__init__` override that pops them before calling `super().__init__(**kwargs)`. The base accepts `manager`, `api_key`, `base_url`, plus the 14 generation kwargs (gated by `SUPPORTS`).
+If your provider needs extra identity args (e.g. `org_id`), add them to a `__init__` override that pops them before calling `super().__init__(**kwargs)`. The base accepts `manager`, `api_key`, `base_url`, plus the 15 generation kwargs (gated by `SUPPORTS`).
+
+`SUPPORTS` carries two pure capability flags alongside the runtime knobs: `"tools"` (the provider can route a tool list — without it, `Conversation(tools=[...])` raises `UnsupportedFeature` at construction) and `"tool_choice"` (forced selection beyond `"auto"` is supported). The two are orthogonal: Ollama declares `"tools"` but not `"tool_choice"`. For models that don't support tool calling at all, callers narrow with `capability_override=provider.SUPPORTS - {"tools"}` on `new_model()`.
 
 ## Code Style
 

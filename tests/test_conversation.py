@@ -388,7 +388,6 @@ def test_anthropic_cache_ttl_via_convo_setting():
         messages=[],
         system_blocks=[SystemBlock(text="hi", cache=True)],
         tools=[],
-        tool_choice="auto",
         stop=None,
         settings={
             "auto_cache_last_user": False,

@@ -41,6 +41,7 @@ RUNTIME_KNOBS: frozenset[str] = frozenset(
         "beta_headers",
         "keep_alive",
         "context_size",
+        "tool_choice",
     }
 )
 

@@ -38,6 +38,7 @@ class Model:
         beta_headers: list[str] | None = None,
         keep_alive: str | int | None = None,
         context_size: int | None = None,
+        tool_choice: str | None = None,
     ):
         self._provider = provider
         self._model_id = model_id
@@ -60,6 +61,7 @@ class Model:
                 "beta_headers": beta_headers,
                 "keep_alive": keep_alive,
                 "context_size": context_size,
+                "tool_choice": tool_choice,
             },
             self._supports,
             provider.NAME,
@@ -106,6 +108,7 @@ class Model:
         beta_headers: list[str] | None = None,
         keep_alive: str | int | None = None,
         context_size: int | None = None,
+        tool_choice: str | None = None,
     ) -> Conversation:
         from llmfacade.conversation import Conversation
 
@@ -130,6 +133,7 @@ class Model:
             beta_headers=beta_headers,
             keep_alive=keep_alive,
             context_size=context_size,
+            tool_choice=tool_choice,
         )
 
     def __repr__(self) -> str:

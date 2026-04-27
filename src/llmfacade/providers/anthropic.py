@@ -43,6 +43,8 @@ _SUPPORTS: frozenset[str] = frozenset(
         "user_metadata",
         "cache_ttl",
         "beta_headers",
+        "tools",
+        "tool_choice",
     }
 )
 
@@ -93,6 +95,7 @@ class AnthropicProvider(Provider):
         beta_headers: list[str] | None = None,
         keep_alive: str | int | None = None,
         context_size: int | None = None,
+        tool_choice: str | None = None,
     ) -> Model:
         """Bind a model id (or `AnthropicModel` member) to this provider.
 
@@ -123,6 +126,7 @@ class AnthropicProvider(Provider):
             beta_headers=beta_headers,
             keep_alive=keep_alive,
             context_size=context_size,
+            tool_choice=tool_choice,
         )
 
     def _init_client(self) -> None:
@@ -173,7 +177,9 @@ class AnthropicProvider(Provider):
 
         if req.tools:
             api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
-            api_kwargs["tool_choice"] = self._tool_choice_to_api(req.tool_choice)
+            api_kwargs["tool_choice"] = self._tool_choice_to_api(
+                req.settings.get("tool_choice", "auto")
+            )
 
         thinking_val = req.settings.get("thinking")
         if thinking_val is not None:
@@ -449,7 +455,7 @@ class AnthropicProvider(Provider):
         if tc == "required":
             return {"type": "any"}
         if tc == "none":
-            return {"type": "auto", "disable_parallel_tool_use": False}
+            return {"type": "none"}
         return {"type": "tool", "name": tc}
 
     def _parse_response(self, raw: Any) -> Response:

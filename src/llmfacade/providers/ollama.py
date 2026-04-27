@@ -42,6 +42,13 @@ class OllamaProvider(Provider):
             "repeat_penalty",
             "output_format",
             "keep_alive",
+            # "tools" is included by default; for a model that doesn't support
+            # tool calling at all (e.g. some smaller local models), pass
+            # capability_override=provider.SUPPORTS - {"tools"} to new_model().
+            "tools",
+            # Note: "tool_choice" is intentionally absent. The Ollama chat API
+            # has no equivalent of forced tool selection, so any non-default
+            # tool_choice is rejected at the cascade as UnsupportedFeature.
         }
     )
 

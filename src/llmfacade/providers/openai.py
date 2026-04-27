@@ -48,6 +48,8 @@ class OpenAIProvider(Provider):
             "temperature",
             "top_p",
             "output_format",
+            "tools",
+            "tool_choice",
         }
     )
 
@@ -117,7 +119,9 @@ class OpenAIProvider(Provider):
 
         if req.tools:
             api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
-            api_kwargs["tool_choice"] = self._tool_choice_to_api(req.tool_choice)
+            api_kwargs["tool_choice"] = self._tool_choice_to_api(
+                req.settings.get("tool_choice", "auto")
+            )
 
         out_format = req.settings.get("output_format")
         if out_format is not None:

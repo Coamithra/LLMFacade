@@ -38,6 +38,8 @@ class GoogleProvider(Provider):
             "top_p",
             "top_k",
             "output_format",
+            "tools",
+            "tool_choice",
         }
     )
 
@@ -84,6 +86,9 @@ class GoogleProvider(Provider):
             config["tools"] = [
                 {"function_declarations": [self._tool_to_api(t) for t in req.tools]}
             ]
+            tc_cfg = self._tool_choice_to_api(req.settings.get("tool_choice", "auto"))
+            if tc_cfg is not None:
+                config["tool_config"] = tc_cfg
 
         out_format = req.settings.get("output_format")
         if out_format is not None:
@@ -264,6 +269,24 @@ class GoogleProvider(Provider):
             "name": t.name,
             "description": t.description,
             "parameters": t.schema,
+        }
+
+    def _tool_choice_to_api(self, tc: str) -> dict[str, Any] | None:
+        # Gemini's tool_config.function_calling_config has three modes:
+        # AUTO (model decides), ANY (must call a tool — optionally restricted to
+        # an allow-list), and NONE (no tool calls). AUTO is the SDK default and
+        # we omit tool_config entirely in that case to keep the request lean.
+        if tc == "auto":
+            return None
+        if tc == "required":
+            return {"function_calling_config": {"mode": "ANY"}}
+        if tc == "none":
+            return {"function_calling_config": {"mode": "NONE"}}
+        return {
+            "function_calling_config": {
+                "mode": "ANY",
+                "allowed_function_names": [tc],
+            }
         }
 
     def _parse_response(self, raw: Any, model: str) -> Response:

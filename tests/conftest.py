@@ -38,6 +38,8 @@ class MockProvider(Provider):
             "thinking",
             "auto_cache_last_user",
             "user_metadata",
+            "tools",
+            "tool_choice",
         }
     )
 
