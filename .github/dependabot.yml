@@ -1,0 +1,24 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      provider-sdks:
+        patterns:
+          - anthropic
+          - openai
+          - google-genai
+          - ollama
+      dev-tools:
+        patterns:
+          - pytest*
+          - ruff
+          - python-dotenv
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
