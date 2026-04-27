@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from llmfacade._html_log import HtmlLogger
 from llmfacade.exceptions import ConversationStateError, UnsupportedFeature
 from llmfacade.helpers import _abbreviate_text, _dump_message, _dump_usage, _log_default
 from llmfacade.models import (
@@ -200,6 +201,7 @@ class Conversation:
         # Used by _estimate_cached_boundary to short-circuit the tokenizer
         # walk when a later turn's cache_read matches a recorded total.
         self._turn_boundaries: list[tuple[int, int]] = []
+        self._html_logger: HtmlLogger | None = _make_html_logger(self._log_path)
 
         if self._log_path is not None:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -309,6 +311,7 @@ class Conversation:
             if log_max_message_lines is not None
             else self._log_max_message_lines
         )
+        clone._html_logger = _make_html_logger(clone._log_path)
         # Inherited history was already part of the parent; treat it as already
         # logged so the clone's first send shows it under prior_history rather
         # than dumping all of it into new_messages.
@@ -698,6 +701,15 @@ class Conversation:
             "settings": settings_block,
         }
         self._append_log(record)
+        if self._html_logger is not None:
+            self._html_logger.write_header(
+                convo_name=self.name,
+                provider=provider.NAME,
+                model_id=self._model.model_id,
+                system_blocks=list(self._system_blocks),
+                tools=[t.name for t in self._tools.values()],
+                settings=settings_block,
+            )
 
     def _log_request(self, req: CompletionRequest, per_call: dict[str, Any]) -> None:
         if self._log_path is None:
@@ -721,6 +733,13 @@ class Conversation:
                 "preview": _abbreviate_lines(rendered),
             }
         self._append_log(record)
+        if self._html_logger is not None:
+            self._html_logger.write_request(
+                new_messages=new,
+                overrides={k: _logsafe(v) for k, v in per_call.items()},
+                tool_choice=req.settings.get("tool_choice"),
+                stop=req.stop,
+            )
         self._logged_msg_count = len(messages)
 
     def _log_response(self, req: CompletionRequest, resp: Response) -> None:
@@ -746,6 +765,15 @@ class Conversation:
         if summary is not None:
             record["cache_summary"] = summary
         self._append_log(record)
+        if self._html_logger is not None:
+            self._html_logger.write_response(
+                blocks=list(resp.blocks),
+                text=resp.text,
+                usage=_dump_usage(resp.usage),
+                cache_summary=summary,
+                finish_reason=resp.finish_reason,
+                model_id=resp.model,
+            )
         self._logged_msg_count += 1
 
     def _cache_summary(self, req: CompletionRequest, usage: Any) -> dict[str, Any] | None:
@@ -886,3 +914,15 @@ def _logsafe(v: Any) -> Any:
     if isinstance(v, Enum):
         return v.value
     return v
+
+
+def _make_html_logger(log_path: Path | None) -> HtmlLogger | None:
+    """Pair an HTML log alongside the JSONL log unless the JSONL itself
+    already lives at the .html path (in which case writing both would
+    clobber the JSONL)."""
+    if log_path is None:
+        return None
+    html_path = log_path.with_suffix(".html")
+    if html_path == log_path:
+        return None
+    return HtmlLogger(html_path)
