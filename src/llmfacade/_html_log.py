@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from llmfacade.helpers import _abbreviate_text
 from llmfacade.models import (
     ContentBlock,
     ImageBlock,
@@ -194,9 +195,9 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def _render_block(block: ContentBlock) -> str:
+def _render_block(block: ContentBlock, *, max_lines: int | None = None) -> str:
     if isinstance(block, TextBlock):
-        return f'<div class="msg-text">{_escape(block.text)}</div>\n'
+        return f'<div class="msg-text">{_escape(_abbreviate_text(block.text, max_lines))}</div>\n'
     if isinstance(block, ImageBlock):
         return (
             f'<div class="msg-text"><em>[image: {_escape(block.media_type)}, '
@@ -211,12 +212,12 @@ def _render_block(block: ContentBlock) -> str:
             '<div class="tool-use">\n'
             f'  <span class="name">{_escape(block.name)}</span>'
             f"  <small>id={_escape(block.id)}</small>\n"
-            f"  <pre>{_escape(args)}</pre>\n"
+            f"  <pre>{_escape(_abbreviate_text(args, max_lines))}</pre>\n"
             "</div>\n"
         )
     if isinstance(block, ToolResultBlock):
         if isinstance(block.content, str):
-            body = _escape(block.content)
+            body = _escape(_abbreviate_text(block.content, max_lines))
         else:
             parts: list[str] = []
             for b in block.content:
@@ -224,7 +225,7 @@ def _render_block(block: ContentBlock) -> str:
                     parts.append(b.text)
                 elif isinstance(b, ImageBlock):
                     parts.append(f"[image {b.media_type}, {len(b.data)} bytes]")
-            body = _escape("\n".join(parts))
+            body = _escape(_abbreviate_text("\n".join(parts), max_lines))
         err_cls = ' class="error"' if block.is_error else ""
         name = f" ({_escape(block.name)})" if block.name else ""
         return (
@@ -235,7 +236,7 @@ def _render_block(block: ContentBlock) -> str:
     # ContentBlock is a closed Union; ThinkingBlock is the last branch.
     assert isinstance(block, ThinkingBlock)
     tag = "redacted_thinking" if block.encrypted else "thinking"
-    body = _escape(block.text) if block.text else "<em>(opaque)</em>"
+    body = _escape(_abbreviate_text(block.text, max_lines)) if block.text else "<em>(opaque)</em>"
     return (
         f'<details class="thinking-block"><summary>{tag}'
         f" ({len(block.text)} chars)</summary>\n"
@@ -243,10 +244,10 @@ def _render_block(block: ContentBlock) -> str:
     )
 
 
-def _render_message_body(msg: Message) -> str:
+def _render_message_body(msg: Message, *, max_lines: int | None = None) -> str:
     if isinstance(msg.content, str):
-        return f'<div class="msg-text">{_escape(msg.content)}</div>\n'
-    return "".join(_render_block(b) for b in msg.content)
+        return f'<div class="msg-text">{_escape(_abbreviate_text(msg.content, max_lines))}</div>\n'
+    return "".join(_render_block(b, max_lines=max_lines) for b in msg.content)
 
 
 class HtmlLogger:
@@ -258,8 +259,9 @@ class HtmlLogger:
     with collapsibles for thinking, tool use, usage, and cache summary.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, max_lines: int | None = None):
         self.path = path
+        self.max_lines = max_lines
 
     def write_header(
         self,
@@ -334,7 +336,7 @@ class HtmlLogger:
                 f'  <header><span class="role-badge {badge_class}">'
                 f"{_escape(role)}</span></header>\n"
             )
-            out.append(_render_message_body(msg))
+            out.append(_render_message_body(msg, max_lines=self.max_lines))
             out.append("</section>\n")
 
         notable = {k: v for k, v in overrides.items() if v is not None}
@@ -376,9 +378,10 @@ class HtmlLogger:
         # tool_use ordering). Fall back to plain text if blocks is empty.
         if blocks:
             for b in blocks:
-                out.append(_render_block(b))
+                out.append(_render_block(b, max_lines=self.max_lines))
         elif text:
-            out.append(f'<div class="msg-text">{_escape(text)}</div>\n')
+            body = _escape(_abbreviate_text(text, self.max_lines))
+            out.append(f'<div class="msg-text">{body}</div>\n')
 
         if usage:
             badges: list[str] = []

@@ -285,6 +285,29 @@ def test_log_max_message_lines_does_not_truncate_short_messages(mock_model, tmp_
     assert req["new_messages"][0]["content"] == "short message"
 
 
+def test_log_max_message_lines_abbreviates_html_log(mock_model, tmp_path):
+    log = tmp_path / "log.jsonl"
+    convo = mock_model.new_conversation(name="t", log_path=log, log_max_message_lines=10)
+    novel = "\n".join(f"line-{i}" for i in range(100))
+    convo.send(novel)
+
+    html = (tmp_path / "log.html").read_text(encoding="utf-8")
+    assert "[90 lines skipped]" in html
+    assert "line-50" not in html
+    assert "line-0" in html and "line-99" in html
+
+
+def test_log_max_message_lines_unset_writes_full_html(mock_model, tmp_path):
+    log = tmp_path / "log.jsonl"
+    convo = mock_model.new_conversation(name="t", log_path=log)
+    novel = "\n".join(f"line-{i}" for i in range(50))
+    convo.send(novel)
+
+    html = (tmp_path / "log.html").read_text(encoding="utf-8")
+    assert "lines skipped" not in html
+    assert "line-25" in html
+
+
 def test_cache_summary_present_when_usage_has_cache_read(tmp_path):
     from llmfacade.models import Usage
 

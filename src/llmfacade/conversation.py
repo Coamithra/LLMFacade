@@ -211,7 +211,9 @@ class Conversation:
         # Used by _estimate_cached_boundary to short-circuit the tokenizer
         # walk when a later turn's cache_read matches a recorded total.
         self._turn_boundaries: list[tuple[int, int]] = []
-        self._html_logger: HtmlLogger | None = _make_html_logger(self._log_path)
+        self._html_logger: HtmlLogger | None = _make_html_logger(
+            self._log_path, max_lines=self._log_max_message_lines
+        )
 
         if self._log_path is not None:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -988,7 +990,9 @@ def _resolve_log_path(
     return run_dir / f"{convo_name}.jsonl"
 
 
-def _make_html_logger(log_path: Path | None) -> HtmlLogger | None:
+def _make_html_logger(
+    log_path: Path | None, *, max_lines: int | None = None
+) -> HtmlLogger | None:
     """Pair an HTML log alongside the JSONL log unless the JSONL itself
     already lives at the .html path (in which case writing both would
     clobber the JSONL)."""
@@ -997,4 +1001,4 @@ def _make_html_logger(log_path: Path | None) -> HtmlLogger | None:
     html_path = log_path.with_suffix(".html")
     if html_path == log_path:
         return None
-    return HtmlLogger(html_path)
+    return HtmlLogger(html_path, max_lines=max_lines)
