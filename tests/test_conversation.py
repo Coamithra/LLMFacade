@@ -221,6 +221,62 @@ def test_log_response_advances_msg_count(mock_model, tmp_path):
     assert reqs[1]["new_messages"] == [{"role": "user", "content": "b"}]
 
 
+def test_stream_writes_response_record(mock_model, tmp_path):
+    """Streaming must write a 'response' log entry on completion, just like send."""
+    mock_model.provider.canned_text = "alpha beta gamma"
+    log = tmp_path / "log.jsonl"
+    convo = mock_model.new_conversation(name="t", log_path=log)
+    list(convo.stream("hi"))
+
+    [resp] = _response_records(log)
+    assert resp["model"] == "mock-model"
+    assert resp["text"].strip() == "alpha beta gamma"
+    assert resp["usage"]["prompt_tokens"] == 10
+    # The next request must see the streamed assistant turn as prior_history,
+    # not redump it as new_messages — _logged_msg_count must have been bumped.
+    convo.send("again")
+    reqs = _request_records(log)
+    assert reqs[1]["new_messages"] == [{"role": "user", "content": "again"}]
+    assert reqs[1]["prior_history"]["messages"] == 2
+
+
+def test_astream_writes_response_record(mock_model, tmp_path):
+    import asyncio
+
+    mock_model.provider.canned_text = "one two three"
+    log = tmp_path / "log.jsonl"
+    convo = mock_model.new_conversation(name="t", log_path=log)
+
+    async def run():
+        async for _ in convo.astream("hi"):
+            pass
+
+    asyncio.run(run())
+    [resp] = _response_records(log)
+    assert resp["text"].strip() == "one two three"
+    assert resp["finish_reason"] is None or isinstance(resp["finish_reason"], str)
+
+
+def test_stream_early_break_still_logs_partial_response(mock_model, tmp_path):
+    """A consumer that breaks out of the iterator early should still get a
+    response record reflecting the partial assistant turn that was flushed
+    into history — symmetric with the partial-history flush behavior."""
+    mock_model.provider.canned_text = "one two three four five"
+    log = tmp_path / "log.jsonl"
+    convo = mock_model.new_conversation(name="t", log_path=log)
+
+    chunks: list[str] = []
+    for ev in convo.stream("hi"):
+        if ev.text_delta:
+            chunks.append(ev.text_delta)
+            if len(chunks) >= 2:
+                break
+
+    [resp] = _response_records(log)
+    assert resp["text"] == "".join(chunks)
+    assert "five" not in resp["text"]
+
+
 def test_clone_inherits_history_as_prior(mock_model, tmp_path):
     parent = mock_model.new_conversation(name="parent")
     parent.send("a")

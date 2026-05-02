@@ -504,6 +504,7 @@ class Conversation:
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
+        last_finish_reason: str | None = None
         msg_count_at_send = len(req.messages)
         # Use try/finally so a consumer that breaks out of the iterator early
         # (break, exception, generator close) still gets the partial assistant
@@ -520,10 +521,14 @@ class Conversation:
                     tool_calls.append(ev.tool_call_delta)
                 if ev.usage is not None:
                     last_usage = ev.usage
+                if ev.finish_reason is not None:
+                    last_finish_reason = ev.finish_reason
                 yield ev
         finally:
             self._record_turn_boundary(last_usage, msg_count_at_send)
-            self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
+            self._finalize_stream(
+                req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
+            )
 
     async def astream(
         self,
@@ -576,6 +581,7 @@ class Conversation:
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
+        last_finish_reason: str | None = None
         msg_count_at_send = len(req.messages)
         try:
             async for ev in self._model.provider._astream_raw(req):
@@ -587,28 +593,46 @@ class Conversation:
                     tool_calls.append(ev.tool_call_delta)
                 if ev.usage is not None:
                     last_usage = ev.usage
+                if ev.finish_reason is not None:
+                    last_finish_reason = ev.finish_reason
                 yield ev
         finally:
             self._record_turn_boundary(last_usage, msg_count_at_send)
-            self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
+            self._finalize_stream(
+                req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
+            )
 
     def _finalize_stream(
         self,
+        req: CompletionRequest,
         text_buf: list[str],
         thinking_blocks: list[ThinkingBlock],
         tool_calls: list[ToolCall],
         usage: Any,
+        finish_reason: str | None,
     ) -> None:
-        del usage
         # Order matters: Anthropic and Gemini both expect thinking blocks
         # before any text or tool_use in the assistant turn when sent back.
         blocks: list[ContentBlock] = list(thinking_blocks)
+        text = "".join(text_buf)
         if text_buf:
-            blocks.append(TextBlock("".join(text_buf)))
+            blocks.append(TextBlock(text))
         for call in tool_calls:
             blocks.append(ToolUseBlock(id=call.id, name=call.name, input=call.input))
-        if blocks:
-            self._history.append(Message(role="assistant", content=blocks))
+        if not blocks:
+            return
+        self._history.append(Message(role="assistant", content=blocks))
+        thinking_text = "".join(b.text for b in thinking_blocks if not b.encrypted) or None
+        resp = Response(
+            text=text,
+            blocks=blocks,
+            tool_calls=list(tool_calls),
+            thinking=thinking_text,
+            usage=usage,
+            finish_reason=finish_reason,
+            model=req.model,
+        )
+        self._log_response(req, resp)
 
     def _collect_per_call(self, **kwargs: Any) -> dict[str, Any]:
         return _validate_knobs(
