@@ -1,0 +1,388 @@
+"""Filesystem-backed response cache: hashing, hit/miss, modes, streaming."""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from llmfacade import (
+    CacheMissError,
+    ImageBlock,
+    SystemBlock,
+    TextBlock,
+    Usage,
+    tool,
+)
+from llmfacade.cache import (
+    fingerprint_request,
+    hash_fingerprint,
+    replay_stream,
+)
+from llmfacade.models import ToolCall, ToolUseBlock
+
+from .conftest import MockProvider
+
+# --- fingerprint stability ----------------------------------------------
+
+
+def _build_req(convo, *, prompt: str | list = "hello"):
+    """Drive a convo to the point where we can introspect a CompletionRequest
+    without making the provider call. Returns the CompletionRequest the
+    convo would send for ``prompt``."""
+    from llmfacade.models import Message
+
+    convo._history.append(Message(role="user", content=prompt))
+    return convo._build_request(stop=None, per_call={})
+
+
+def test_hash_stable_across_runs(mock_model):
+    convo1 = mock_model.new_conversation(system_blocks=["sys"])
+    convo2 = mock_model.new_conversation(system_blocks=["sys"])
+    req1 = _build_req(convo1)
+    req2 = _build_req(convo2)
+    fp1 = fingerprint_request(req1, "mock")
+    fp2 = fingerprint_request(req2, "mock")
+    assert hash_fingerprint(fp1) == hash_fingerprint(fp2)
+
+
+def test_hash_changes_with_prompt(mock_model):
+    convo = mock_model.new_conversation()
+    req_a = _build_req(convo, prompt="hello")
+    convo._history.clear()
+    req_b = _build_req(convo, prompt="goodbye")
+    assert hash_fingerprint(fingerprint_request(req_a, "mock")) != hash_fingerprint(
+        fingerprint_request(req_b, "mock")
+    )
+
+
+def test_hash_changes_with_settings(mock_model):
+    p: MockProvider = mock_model.provider
+    convo_a = mock_model.new_conversation(temperature=0.1)
+    convo_b = mock_model.new_conversation(temperature=0.9)
+    req_a = _build_req(convo_a)
+    req_b = _build_req(convo_b)
+    assert hash_fingerprint(fingerprint_request(req_a, p.NAME)) != hash_fingerprint(
+        fingerprint_request(req_b, p.NAME)
+    )
+
+
+def test_hash_changes_with_system_block_cache_flag(mock_model):
+    """Per the design choice: cache=True markers are part of the fingerprint
+    even though they don't affect generation, so flipping caching gets fresh
+    output."""
+    convo_a = mock_model.new_conversation(system_blocks=[SystemBlock("sys", cache=False)])
+    convo_b = mock_model.new_conversation(system_blocks=[SystemBlock("sys", cache=True)])
+    req_a = _build_req(convo_a)
+    req_b = _build_req(convo_b)
+    assert hash_fingerprint(fingerprint_request(req_a, "mock")) != hash_fingerprint(
+        fingerprint_request(req_b, "mock")
+    )
+
+
+def test_hash_changes_with_provider_name(mock_model):
+    convo = mock_model.new_conversation()
+    req = _build_req(convo)
+    assert hash_fingerprint(fingerprint_request(req, "mock")) != hash_fingerprint(
+        fingerprint_request(req, "anthropic")
+    )
+
+
+def test_hash_changes_with_image_bytes(mock_model):
+    convo_a = mock_model.new_conversation()
+    convo_b = mock_model.new_conversation()
+    img_a = ImageBlock(data=b"\x00\x01", media_type="image/png")
+    img_b = ImageBlock(data=b"\x00\x02", media_type="image/png")
+    req_a = _build_req(convo_a, prompt=[TextBlock("look"), img_a])
+    req_b = _build_req(convo_b, prompt=[TextBlock("look"), img_b])
+    assert hash_fingerprint(fingerprint_request(req_a, "mock")) != hash_fingerprint(
+        fingerprint_request(req_b, "mock")
+    )
+
+
+def test_hash_changes_with_tool_schema(mock_model):
+    @tool
+    def alpha(x: int) -> str:
+        """alpha"""
+        return str(x)
+
+    @tool
+    def beta(x: str) -> str:
+        """beta"""
+        return x
+
+    convo_a = mock_model.new_conversation(tools=[alpha])
+    convo_b = mock_model.new_conversation(tools=[beta])
+    req_a = _build_req(convo_a)
+    req_b = _build_req(convo_b)
+    assert hash_fingerprint(fingerprint_request(req_a, "mock")) != hash_fingerprint(
+        fingerprint_request(req_b, "mock")
+    )
+
+
+# --- send: cache hit / miss ---------------------------------------------
+
+
+def test_send_writes_then_reads(tmp_path):
+    p = MockProvider(canned_text="cached-answer")
+    model = p.new_model("mock-model")
+
+    # Convo 1: write
+    c1 = model.new_conversation(cache_dir=tmp_path)
+    r1 = c1.send("question")
+    assert r1.text == "cached-answer"
+    assert len(p.calls) == 1
+
+    # Convo 2: same model, same prompt -> hit, no second call
+    c2 = model.new_conversation(cache_dir=tmp_path)
+    r2 = c2.send("question")
+    assert r2.text == "cached-answer"
+    assert len(p.calls) == 1, "provider should not have been called on cache hit"
+    assert c2.history[-1].role == "assistant"
+
+
+def test_send_miss_when_prompt_changes(tmp_path):
+    p = MockProvider(canned_text="answer")
+    model = p.new_model("mock-model")
+    c1 = model.new_conversation(cache_dir=tmp_path)
+    c1.send("first")
+    assert len(p.calls) == 1
+    c2 = model.new_conversation(cache_dir=tmp_path)
+    c2.send("second")
+    assert len(p.calls) == 2
+
+
+def test_read_only_does_not_write(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="read_only")
+    c.send("q")
+    assert len(p.calls) == 1
+    # Nothing should have been written.
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_record_only_writes_but_always_calls_provider(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c1 = model.new_conversation(cache_dir=tmp_path, cache_mode="record_only")
+    c1.send("q")
+    c2 = model.new_conversation(cache_dir=tmp_path, cache_mode="record_only")
+    c2.send("q")
+    assert len(p.calls) == 2
+    assert list(tmp_path.rglob("*.json"))
+
+
+def test_replay_only_raises_on_miss(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    with pytest.raises(CacheMissError):
+        c.send("never-cached")
+    assert len(p.calls) == 0
+
+
+def test_replay_only_returns_hit(tmp_path):
+    p = MockProvider(canned_text="seeded")
+    model = p.new_model("mock-model")
+    # Seed via read_write run.
+    seed = model.new_conversation(cache_dir=tmp_path)
+    seed.send("hello")
+    # Now replay-only.
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    r = c.send("hello")
+    assert r.text == "seeded"
+    assert len(p.calls) == 1
+
+
+# --- cascade -------------------------------------------------------------
+
+
+def test_cache_cascade_provider_to_convo(tmp_path):
+    p = MockProvider(canned_text="x", cache_dir=tmp_path)
+    model = p.new_model("mock-model")
+    c = model.new_conversation()
+    c.send("q")
+    c2 = model.new_conversation()
+    c2.send("q")
+    assert len(p.calls) == 1
+
+
+def test_cache_cascade_convo_disable(tmp_path):
+    p = MockProvider(canned_text="x", cache_dir=tmp_path)
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=False)
+    c.send("q")
+    c2 = model.new_conversation(cache_dir=False)
+    c2.send("q")
+    assert len(p.calls) == 2  # cache disabled per-convo
+
+
+def test_cache_mode_cascade(tmp_path):
+    p = MockProvider(canned_text="x", cache_dir=tmp_path, cache_mode="record_only")
+    model = p.new_model("mock-model")
+    c1 = model.new_conversation()
+    c1.send("q")
+    c2 = model.new_conversation()
+    c2.send("q")
+    # record_only inherits from provider -> always call provider.
+    assert len(p.calls) == 2
+
+
+# --- streaming -----------------------------------------------------------
+
+
+def test_stream_replay_yields_events(tmp_path):
+    p = MockProvider(canned_text="hello world")
+    model = p.new_model("mock-model")
+    seed = model.new_conversation(cache_dir=tmp_path)
+    seed_text = "".join(ev.text_delta for ev in seed.stream("q") if ev.text_delta)
+    assert len(p.calls) == 1
+
+    replay = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    events = list(replay.stream("q"))
+    assert len(p.calls) == 1, "no provider call expected on replay"
+
+    replay_text = "".join(ev.text_delta for ev in events if ev.text_delta)
+    # Replay must reproduce exactly what the seed run assembled — even
+    # whitespace artefacts from the mock chunker. Equivalence, not the
+    # canned string.
+    assert replay_text == seed_text
+    assert events[-1].done is True
+    # History should still hold the assistant turn.
+    assert replay.history[-1].role == "assistant"
+
+
+def test_stream_records_on_miss(tmp_path):
+    p = MockProvider(canned_text="streamed")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path)
+    list(c.stream("hi"))
+    assert list(tmp_path.rglob("*.json"))
+
+
+def test_replay_only_stream_raises_on_miss(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    with pytest.raises(CacheMissError):
+        list(c.stream("never"))
+
+
+# --- async ---------------------------------------------------------------
+
+
+def test_asend_uses_cache(tmp_path):
+    p = MockProvider(canned_text="async")
+    model = p.new_model("mock-model")
+
+    async def run():
+        c1 = model.new_conversation(cache_dir=tmp_path)
+        await c1.asend("hi")
+        c2 = model.new_conversation(cache_dir=tmp_path)
+        await c2.asend("hi")
+
+    asyncio.run(run())
+    assert len(p.calls) == 1
+
+
+def test_astream_replay(tmp_path):
+    p = MockProvider(canned_text="hi there")
+    model = p.new_model("mock-model")
+
+    async def seed():
+        c = model.new_conversation(cache_dir=tmp_path)
+        out = []
+        async for ev in c.astream("hi"):
+            if ev.text_delta:
+                out.append(ev.text_delta)
+        return "".join(out)
+
+    async def replay():
+        c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+        out = []
+        async for ev in c.astream("hi"):
+            if ev.text_delta:
+                out.append(ev.text_delta)
+        return "".join(out)
+
+    seed_text = asyncio.run(seed())
+    replay_text = asyncio.run(replay())
+    assert replay_text == seed_text
+    assert len(p.calls) == 1
+
+
+# --- multi-turn / tool replay -------------------------------------------
+
+
+def test_tool_replay_round_trip(tmp_path):
+    """After a turn that produced tool calls, sending the tool result and
+    receiving the model's continuation should hit the cache on a second run
+    of the same sequence."""
+    # Turn 1: model emits a tool call.
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="echo", input={"x": 1})],
+    )
+    model = p.new_model("mock-model")
+
+    def drive(p_):
+        c = model.new_conversation(cache_dir=tmp_path)
+        c.send("go")
+        # Append tool result.
+        c.add_tool_result("t1", "result-text", name="echo")
+        # Turn 2: model now returns a final answer.
+        p_.canned_text = "final"
+        p_.canned_tool_calls = []
+        c.send()
+        return c
+
+    c1 = drive(p)
+    assert len(p.calls) == 2
+    assert c1.history[-1].role == "assistant"
+
+    # Reset canned state and replay the same sequence on a fresh provider.
+    p2 = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="echo", input={"x": 1})],
+    )
+    model2 = p2.new_model("mock-model")
+    c2 = model2.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    r1 = c2.send("go")
+    assert r1.tool_calls and r1.tool_calls[0].name == "echo"
+    c2.add_tool_result("t1", "result-text", name="echo")
+    r2 = c2.send()
+    assert r2.text == "final"
+    assert len(p2.calls) == 0
+
+
+# --- replay_stream helper directly --------------------------------------
+
+
+def test_replay_stream_emits_thinking_then_text_then_tools():
+    from llmfacade.models import Response, ThinkingBlock
+
+    blocks = [
+        ThinkingBlock(text="reasoning"),
+        TextBlock(text="answer"),
+        ToolUseBlock(id="t1", name="f", input={}),
+    ]
+    resp = Response(
+        text="answer",
+        blocks=blocks,
+        tool_calls=[ToolCall(id="t1", name="f", input={})],
+        thinking="reasoning",
+        usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        finish_reason="end_turn",
+        model="mock",
+    )
+    events = list(replay_stream(resp))
+    # First event family: thinking.
+    assert events[0].thinking_delta == "reasoning"
+    assert events[1].thinking_block is not None
+    # Then a single text_delta carrying the full text.
+    text_evs = [e for e in events if e.text_delta]
+    assert len(text_evs) == 1 and text_evs[0].text_delta == "answer"
+    # Then a tool call event, then done.
+    assert any(e.tool_call_delta is not None for e in events)
+    assert events[-1].done and events[-1].usage is not None

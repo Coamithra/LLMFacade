@@ -1,8 +1,10 @@
 from llmfacade import helpers
 from llmfacade._version import __version__
+from llmfacade.cache import ResponseCache
 from llmfacade.conversation import Conversation, Snapshot
 from llmfacade.exceptions import (
     AuthenticationError,
+    CacheMissError,
     ConversationStateError,
     LLMError,
     ModelNotFoundError,
@@ -65,9 +67,12 @@ __all__ = [
     "ToolResultBlock",
     "ThinkingBlock",
     "ToolCall",
+    # Cache
+    "ResponseCache",
     # Exceptions
     "LLMError",
     "AuthenticationError",
+    "CacheMissError",
     "RateLimitError",
     "ProviderError",
     "ModelNotFoundError",

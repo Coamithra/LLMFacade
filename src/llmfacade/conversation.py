@@ -9,7 +9,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from llmfacade._html_log import HtmlLogger
-from llmfacade.exceptions import ConversationStateError, UnsupportedFeature
+from llmfacade.cache import (
+    ResponseCache,
+    fingerprint_request,
+    hash_fingerprint,
+    replay_stream,
+    resolve_cache,
+)
+from llmfacade.exceptions import (
+    CacheMissError,
+    ConversationStateError,
+    UnsupportedFeature,
+)
 from llmfacade.helpers import _abbreviate_text, _dump_message, _dump_usage, _log_default
 from llmfacade.models import (
     ContentBlock,
@@ -142,6 +153,8 @@ class Conversation:
         log_dir: Any | None = None,
         log_path: Any | None = None,
         log_max_message_lines: int | None = None,
+        cache_dir: Any | None = None,
+        cache_mode: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -213,6 +226,14 @@ class Conversation:
         self._turn_boundaries: list[tuple[int, int]] = []
         self._html_logger: HtmlLogger | None = _make_html_logger(
             self._log_path, max_lines=self._log_max_message_lines
+        )
+
+        self._cache_dir_override = cache_dir
+        self._cache_mode_override = cache_mode
+        self._cache: ResponseCache | None = resolve_cache(
+            convo_cache_dir=cache_dir,
+            convo_cache_mode=cache_mode,
+            model=model,
         )
 
         if self._log_path is not None:
@@ -303,11 +324,15 @@ class Conversation:
         log_dir: Any | None = None,
         log_path: Any | None = None,
         log_max_message_lines: int | None = None,
+        cache_dir: Any | None = None,
+        cache_mode: str | None = None,
     ) -> Conversation:
         """Deep-copy history, system blocks, tools, and defaults into a fresh
         conversation. The clone resolves its own log path through the same
         cascade as a fresh ``new_conversation`` call: pass ``log_dir=False``
-        or ``log_path=False`` to disable logging on the clone."""
+        or ``log_path=False`` to disable logging on the clone. The cache
+        cascade is re-resolved the same way; pass ``cache_dir=`` /
+        ``cache_mode=`` to override what was on the source."""
         clone = Conversation.__new__(Conversation)
         clone._model = self._model
         clone.name = name or f"{self.name}-clone"
@@ -337,6 +362,13 @@ class Conversation:
         # logged so the clone's first send shows it under prior_history rather
         # than dumping all of it into new_messages.
         clone._logged_msg_count = len(clone._history)
+        clone._cache_dir_override = cache_dir
+        clone._cache_mode_override = cache_mode
+        clone._cache = resolve_cache(
+            convo_cache_dir=cache_dir,
+            convo_cache_mode=cache_mode,
+            model=self._model,
+        )
         if clone._log_path is not None:
             clone._log_path.parent.mkdir(parents=True, exist_ok=True)
             clone._write_settings_header()
@@ -394,7 +426,16 @@ class Conversation:
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
+
+        cache_key, cache_fp, cached = self._cache_lookup(req)
+        if cached is not None:
+            self._record_turn_boundary(cached.usage, len(req.messages))
+            self._log_response(req, cached)
+            self._history.append(Message(role="assistant", content=list(cached.blocks)))
+            return cached
+
         resp = self._model.provider._complete_raw(req)
+        self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
         self._history.append(Message(role="assistant", content=list(resp.blocks)))
@@ -447,7 +488,16 @@ class Conversation:
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
+
+        cache_key, cache_fp, cached = self._cache_lookup(req)
+        if cached is not None:
+            self._record_turn_boundary(cached.usage, len(req.messages))
+            self._log_response(req, cached)
+            self._history.append(Message(role="assistant", content=list(cached.blocks)))
+            return cached
+
         resp = await self._model.provider._acomplete_raw(req)
+        self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
         self._history.append(Message(role="assistant", content=list(resp.blocks)))
@@ -500,12 +550,22 @@ class Conversation:
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
+        cache_key, cache_fp, cached = self._cache_lookup(req)
+        msg_count_at_send = len(req.messages)
+        if cached is not None:
+            try:
+                yield from replay_stream(cached)
+            finally:
+                self._record_turn_boundary(cached.usage, msg_count_at_send)
+                self._history.append(Message(role="assistant", content=list(cached.blocks)))
+                self._log_response(req, cached)
+            return
+
         text_buf: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
         last_finish_reason: str | None = None
-        msg_count_at_send = len(req.messages)
         # Use try/finally so a consumer that breaks out of the iterator early
         # (break, exception, generator close) still gets the partial assistant
         # turn appended to history. Otherwise the user message recorded above
@@ -526,9 +586,11 @@ class Conversation:
                 yield ev
         finally:
             self._record_turn_boundary(last_usage, msg_count_at_send)
-            self._finalize_stream(
+            resp = self._finalize_stream(
                 req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
             )
+            if resp is not None:
+                self._cache_store(cache_key, cache_fp, resp)
 
     async def astream(
         self,
@@ -577,12 +639,23 @@ class Conversation:
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
+        cache_key, cache_fp, cached = self._cache_lookup(req)
+        msg_count_at_send = len(req.messages)
+        if cached is not None:
+            try:
+                for ev in replay_stream(cached):
+                    yield ev
+            finally:
+                self._record_turn_boundary(cached.usage, msg_count_at_send)
+                self._history.append(Message(role="assistant", content=list(cached.blocks)))
+                self._log_response(req, cached)
+            return
+
         text_buf: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
         last_finish_reason: str | None = None
-        msg_count_at_send = len(req.messages)
         try:
             async for ev in self._model.provider._astream_raw(req):
                 if ev.text_delta:
@@ -598,9 +671,11 @@ class Conversation:
                 yield ev
         finally:
             self._record_turn_boundary(last_usage, msg_count_at_send)
-            self._finalize_stream(
+            resp = self._finalize_stream(
                 req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
             )
+            if resp is not None:
+                self._cache_store(cache_key, cache_fp, resp)
 
     def _finalize_stream(
         self,
@@ -610,7 +685,11 @@ class Conversation:
         tool_calls: list[ToolCall],
         usage: Any,
         finish_reason: str | None,
-    ) -> None:
+    ) -> Response | None:
+        """Assemble a ``Response`` from streaming buffers, append the assistant
+        turn to history, and log it. Returns the assembled ``Response``, or
+        ``None`` if the stream produced no blocks at all (e.g. consumer broke
+        before any deltas arrived) — in which case we leave history alone."""
         # Order matters: Anthropic and Gemini both expect thinking blocks
         # before any text or tool_use in the assistant turn when sent back.
         blocks: list[ContentBlock] = list(thinking_blocks)
@@ -620,7 +699,7 @@ class Conversation:
         for call in tool_calls:
             blocks.append(ToolUseBlock(id=call.id, name=call.name, input=call.input))
         if not blocks:
-            return
+            return None
         self._history.append(Message(role="assistant", content=blocks))
         thinking_text = "".join(b.text for b in thinking_blocks if not b.encrypted) or None
         resp = Response(
@@ -633,6 +712,56 @@ class Conversation:
             model=req.model,
         )
         self._log_response(req, resp)
+        return resp
+
+    # ---- response cache --------------------------------------------------
+
+    def _cache_lookup(
+        self, req: CompletionRequest
+    ) -> tuple[str | None, dict[str, Any] | None, Response | None]:
+        """Resolve the cache key for ``req`` and return any hit.
+
+        Returns ``(key, fingerprint, cached_or_None)``. If the cache is in
+        ``replay_only`` mode and there is no hit, raises ``CacheMissError``
+        — no provider call is made by the caller in that case. If no cache
+        is configured, returns ``(None, None, None)`` and the caller proceeds
+        as normal."""
+        if self._cache is None:
+            return None, None, None
+        provider_name = self._model.provider.NAME
+        fp = fingerprint_request(req, provider_name)
+        key = hash_fingerprint(fp)
+        cached = self._cache.get(provider_name, self._model.model_id, key)
+        if cached is not None:
+            return key, fp, cached
+        if self._cache.mode == "replay_only":
+            raise CacheMissError(
+                f"replay_only cache miss: no entry for hash {key} "
+                f"(provider={provider_name!r}, model={self._model.model_id!r}). "
+                f"Looked under {self._cache.path_for(provider_name, self._model.model_id, key)}."
+            )
+        return key, fp, None
+
+    def _cache_store(
+        self,
+        key: str | None,
+        fingerprint: dict[str, Any] | None,
+        resp: Response,
+    ) -> None:
+        """Write ``resp`` to the cache if one is configured and writes are
+        enabled in the active mode. No-op when ``key`` is ``None`` (no cache
+        configured) or ``fingerprint`` is ``None`` (lookup didn't run, e.g.
+        because the provider call happened on a path that bypassed the
+        cache)."""
+        if self._cache is None or key is None or fingerprint is None:
+            return
+        self._cache.put(
+            self._model.provider.NAME,
+            self._model.model_id,
+            key,
+            resp,
+            fingerprint,
+        )
 
     def _collect_per_call(self, **kwargs: Any) -> dict[str, Any]:
         return _validate_knobs(
@@ -1014,9 +1143,7 @@ def _resolve_log_path(
     return run_dir / f"{convo_name}.jsonl"
 
 
-def _make_html_logger(
-    log_path: Path | None, *, max_lines: int | None = None
-) -> HtmlLogger | None:
+def _make_html_logger(log_path: Path | None, *, max_lines: int | None = None) -> HtmlLogger | None:
     """Pair an HTML log alongside the JSONL log unless the JSONL itself
     already lives at the .html path (in which case writing both would
     clobber the JSONL)."""

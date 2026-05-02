@@ -63,3 +63,11 @@ class ConversationStateError(LLMError):
     Most commonly: the last assistant turn contains tool-use blocks that have
     no matching tool-result blocks, so the wire format is incomplete and the
     next call would be rejected by the provider."""
+
+
+class CacheMissError(LLMError):
+    """Replay-only response cache had no hit for this request.
+
+    Raised by ``Conversation.send`` / ``stream`` (and async variants) when
+    ``cache_mode='replay_only'`` is in effect and the request fingerprint is
+    not present in the cache directory. No provider call is made."""

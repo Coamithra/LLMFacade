@@ -51,7 +51,8 @@ Key files:
 - `src/llmfacade/settings.py` — `RUNTIME_KNOBS` frozenset (the 14 string knob names) plus the value enums `EffortLevel`, `OutputFormat`, `EphemeralCacheTTL` (`FIVE_MINUTES`, `ONE_HOUR`).
 - `src/llmfacade/models.py` — Frozen dataclasses for the wire format: `Message`, `TextBlock`, `ImageBlock`, `ToolUseBlock`, `ToolResultBlock`, `ToolCall`, `Response`, `Usage`, `StreamEvent`. `ImageBlock` has `from_path` / `from_base64`.
 - `src/llmfacade/tools.py` — `@tool` decorator that builds a JSON schema from a function's signature + type hints + docstring. Handles primitives, `Literal`, `Optional`/`Union`, `list[T]`, `dict`.
-- `src/llmfacade/exceptions.py` — Hierarchy rooted at `LLMError`: `AuthenticationError`, `RateLimitError`, `ProviderError`, `ModelNotFoundError`, `ProviderNotInstalledError`, `UnsupportedFeature`, `ToolIterationLimitError`, `ConversationStateError`.
+- `src/llmfacade/exceptions.py` — Hierarchy rooted at `LLMError`: `AuthenticationError`, `RateLimitError`, `ProviderError`, `ModelNotFoundError`, `ProviderNotInstalledError`, `UnsupportedFeature`, `ToolIterationLimitError`, `ConversationStateError`, `CacheMissError`.
+- `src/llmfacade/cache.py` — `ResponseCache` (filesystem backend), `fingerprint_request` / `hash_fingerprint` (canonical hash inputs), `replay_stream` / `areplay_stream` (synthesise a stream from a cached `Response`), and `resolve_cache` (cascade resolver). See the **Response cache** section below for behaviour.
 - `src/llmfacade/providers/__init__.py` — `PROVIDER_REGISTRY` mapping names to `(module_path, class_name)`. `"google"` and `"gemini"` both resolve to `GoogleProvider`.
 - `src/llmfacade/providers/{anthropic,openai,google,ollama}.py` — Provider implementations.
 
@@ -80,6 +81,19 @@ The JSONL log starts with a single `settings` header record listing every effect
 
 `Provider.count_tokens(text, *, model_id=None)` and `Provider.tokenizer_name(model_id=None)` are the public local-tokenizer API. Convenience wrappers `Model.count_tokens(text)` and `Model.tokenizer_name()` bind the model id automatically. Always local — never makes a network call. Install the optional `tokenizers` extra (`pip install llmfacade[tokenizers]`) to enable tiktoken (OpenAI) and sentencepiece (Google). Anthropic and Ollama have no offline tokenizer; they return `chars/4`. For exact Anthropic counts, call `client.messages.count_tokens` via the SDK directly — the facade keeps it out of the logging hot path.
 
+### Response cache (deterministic replay)
+
+Off by default. Set `cache_dir=<path>` at any of provider, model, or conversation scope to enable a filesystem-backed cache of `Response` objects. On a hit, no provider call is made — the stored response is returned (or replayed as a stream). The hash key covers every input that affects output: provider name, model id, system blocks (including `cache=True` markers — flipping caching gets fresh output, by design), the full message list (image bytes hashed via SHA-256), tool schemas in registration order, the merged effective settings (with `Enum`s normalised to `.value`), and the `stop` list. Storage layout: `<cache_dir>/<provider>/<model_id>/<sha256>.json`, where each file holds the canonical fingerprint (for inspection) plus the serialised response.
+
+`cache_dir` cascades convo > model > provider exactly like `log_dir`. Pass `cache_dir=False` at any scope to disable for that scope; a lower scope can re-enable with its own `cache_dir`. `cache_mode` cascades the same way (default `"read_write"`):
+
+- `"read_write"` — read on hit, call provider on miss and write the result.
+- `"read_only"` — read on hit, call provider on miss but do not write.
+- `"record_only"` — always call provider, write the result (overwrites any existing entry).
+- `"replay_only"` — read on hit, raise `CacheMissError` on miss. No provider call. Use this in CI to guarantee no accidental API spend.
+
+Streaming hits are reconstructed by `cache.replay_stream(resp)`: thinking blocks (and their deltas) come first, then a single `text_delta` carrying the full text, then one event per tool call, then a terminal `done` event with the cached `usage` and `finish_reason`. This is enough to drive any consumer that handles real streams; faithful chunk-timing replay is intentionally not attempted. Hits skip `_finalize_stream` entirely so the cached blocks land in history in their original order.
+
 ### Capability gating
 
 Every provider declares `SUPPORTS: frozenset[str]` listing the knob names it accepts. Setting an unsupported knob at any layer raises `UnsupportedFeature`. Use `provider.is_available("temperature")` / `model.is_available(...)` / `convo.is_available(...)` and `get_capabilities()` to query (returns plain string sets). Never catch `UnsupportedFeature` to branch — query first.
@@ -89,7 +103,7 @@ Every provider declares `SUPPORTS: frozenset[str]` listing the knob names it acc
 - Construction: `model.new_conversation(name=..., system_blocks=..., tools=..., log_dir=..., log_path=..., **defaults)`. Everything is set here, immutably. `name` defaults to `convo-<8hex>` and doubles as the log filename.
 - `add_user_message` / `add_assistant_message` / `add_tool_result` mutate history; `send` / `asend` / `stream` / `astream` are strict single round-trips.
 - Tool calls in a response are returned to the caller. Dispatch them yourself (or via `helpers.run_bound_tools`) and append results before the next call.
-- `snapshot()` returns an opaque token capturing history; `rollback(snap)` restores it. `clone(*, name=None, log_dir=None, log_path=None)` deep-copies everything into a fresh conversation that resolves its log path through the same cascade as a fresh `new_conversation`.
+- `snapshot()` returns an opaque token capturing history; `rollback(snap)` restores it. `clone(*, name=None, log_dir=None, log_path=None, cache_dir=None, cache_mode=None)` deep-copies everything into a fresh conversation that resolves its log path and response-cache settings through the same cascade as a fresh `new_conversation`.
 
 ### Provider quirks
 

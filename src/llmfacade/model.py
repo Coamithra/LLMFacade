@@ -25,6 +25,8 @@ class Model:
         model_id: str,
         capability_override: frozenset[str] | None = None,
         log_dir: Any | None = None,
+        cache_dir: Any | None = None,
+        cache_mode: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -45,6 +47,8 @@ class Model:
         self._provider = provider
         self._model_id = model_id
         self._log_dir_override = log_dir
+        self._cache_dir_override = cache_dir
+        self._cache_mode_override = cache_mode
         self._supports: frozenset[str] = (
             capability_override if capability_override is not None else provider.SUPPORTS
         )
@@ -115,6 +119,8 @@ class Model:
         log_dir: Any | None = None,
         log_path: Any | None = None,
         log_max_message_lines: int | None = None,
+        cache_dir: Any | None = None,
+        cache_mode: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -142,6 +148,8 @@ class Model:
             log_dir=log_dir,
             log_path=log_path,
             log_max_message_lines=log_max_message_lines,
+            cache_dir=cache_dir,
+            cache_mode=cache_mode,
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
