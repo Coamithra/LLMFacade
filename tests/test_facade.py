@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from llmfacade import LLM
@@ -60,9 +61,13 @@ def test_ensure_run_dir_materializes_and_prunes(tmp_path):
     old_a = base / "llmfacade20200101-000000"
     old_b = base / "llmfacade20200102-000000"
     old_c = base / "llmfacade20200103-000000"
-    for d in (old_a, old_b, old_c):
+    # Pruning sorts by st_mtime; on Windows three back-to-back mkdirs can share
+    # a tick, leaving the sort order up to iterdir() (B-tree order on NTFS, not
+    # alphabetical). Stamp distinct mtimes so old_c is unambiguously newest.
+    for i, d in enumerate((old_a, old_b, old_c)):
         d.mkdir()
         (d / "marker.txt").write_text("x")
+        os.utime(d, (1_700_000_000 + i, 1_700_000_000 + i))
     llm = LLM(log_dir=base, max_log_folders=2)
     run_dir = llm._ensure_run_dir()
     assert run_dir is not None
