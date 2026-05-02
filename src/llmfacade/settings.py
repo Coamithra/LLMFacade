@@ -38,6 +38,7 @@ RUNTIME_KNOBS: frozenset[str] = frozenset(
         "user_metadata",
         "cache_ttl",
         "auto_cache_last_user",
+        "auto_cache_tools",
         "beta_headers",
         "keep_alive",
         "context_size",

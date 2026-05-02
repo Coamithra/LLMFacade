@@ -68,3 +68,113 @@ def test_auto_cache_last_user_passes_to_provider(mock_model):
     convo.send("hi")
     last = p.calls[-1].req
     assert last.settings.get("auto_cache_last_user") is True
+
+
+def test_auto_cache_tools_passes_to_provider(mock_model):
+    p: MockProvider = mock_model.provider
+    convo = mock_model.new_conversation(auto_cache_tools=True)
+    convo.send("hi")
+    last = p.calls[-1].req
+    assert last.settings.get("auto_cache_tools") is True
+
+
+def test_auto_cache_tools_unsupported_on_non_anthropic_provider():
+    """auto_cache_tools is Anthropic-only. Setting it on a provider that
+    doesn't declare it must raise UnsupportedFeature at the layer it's set."""
+    from llmfacade.provider import Provider
+
+    class NoToolCacheProvider(Provider):
+        NAME = "noopcache"
+        SUPPORTS: frozenset[str] = frozenset({"max_tokens"})
+
+        def _init_client(self):
+            self._client = object()
+
+    p = NoToolCacheProvider()
+    with pytest.raises(UnsupportedFeature):
+        p.new_model("nc", auto_cache_tools=True)
+
+
+def test_anthropic_auto_cache_tools_marks_last_tool_only():
+    """auto_cache_tools=True puts cache_control on the last tools entry only,
+    using the resolved cache_ttl. Earlier entries stay untouched."""
+    from llmfacade import tool
+    from llmfacade.provider import CompletionRequest
+    from llmfacade.providers.anthropic import AnthropicProvider
+    from llmfacade.settings import EphemeralCacheTTL
+
+    @tool
+    def tool_a(x: str) -> str:
+        """First tool."""
+        return x
+
+    @tool
+    def tool_b(y: str) -> str:
+        """Second tool."""
+        return y
+
+    p = object.__new__(AnthropicProvider)
+    req = CompletionRequest(
+        model="claude-sonnet-4-6",
+        messages=[],
+        system_blocks=[],
+        tools=[tool_a, tool_b],
+        stop=None,
+        settings={
+            "auto_cache_tools": True,
+            "cache_ttl": EphemeralCacheTTL.ONE_HOUR,
+            "max_tokens": 1024,
+        },
+    )
+    api_kwargs = p._build_kwargs(req)
+    api_tools = api_kwargs["tools"]
+    assert "cache_control" not in api_tools[0]
+    assert api_tools[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_anthropic_auto_cache_tools_default_ttl_omits_ttl_field():
+    """Without cache_ttl set, cache_control is bare ephemeral (SDK default 5m)."""
+    from llmfacade import tool
+    from llmfacade.provider import CompletionRequest
+    from llmfacade.providers.anthropic import AnthropicProvider
+
+    @tool
+    def only_tool(x: str) -> str:
+        """Sole tool."""
+        return x
+
+    p = object.__new__(AnthropicProvider)
+    req = CompletionRequest(
+        model="claude-sonnet-4-6",
+        messages=[],
+        system_blocks=[],
+        tools=[only_tool],
+        stop=None,
+        settings={"auto_cache_tools": True, "max_tokens": 1024},
+    )
+    api_kwargs = p._build_kwargs(req)
+    assert api_kwargs["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_anthropic_auto_cache_tools_off_leaves_tools_unmarked():
+    """No auto_cache_tools setting => no cache_control on any tool."""
+    from llmfacade import tool
+    from llmfacade.provider import CompletionRequest
+    from llmfacade.providers.anthropic import AnthropicProvider
+
+    @tool
+    def only_tool(x: str) -> str:
+        """Sole tool."""
+        return x
+
+    p = object.__new__(AnthropicProvider)
+    req = CompletionRequest(
+        model="claude-sonnet-4-6",
+        messages=[],
+        system_blocks=[],
+        tools=[only_tool],
+        stop=None,
+        settings={"max_tokens": 1024},
+    )
+    api_kwargs = p._build_kwargs(req)
+    assert all("cache_control" not in t for t in api_kwargs["tools"])

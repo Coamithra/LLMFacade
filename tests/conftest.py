@@ -37,6 +37,7 @@ class MockProvider(Provider):
             "top_p",
             "thinking",
             "auto_cache_last_user",
+            "auto_cache_tools",
             "user_metadata",
             "tools",
             "tool_choice",

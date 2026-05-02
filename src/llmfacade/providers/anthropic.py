@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json as _json
+import warnings
 from collections.abc import AsyncIterator, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,7 @@ _SUPPORTS: frozenset[str] = frozenset(
         "effort",
         "thinking",
         "auto_cache_last_user",
+        "auto_cache_tools",
         "user_metadata",
         "cache_ttl",
         "beta_headers",
@@ -71,10 +73,70 @@ class AnthropicModel(Enum):
         self.capabilities = capabilities
 
 
+_EXACT_COUNT_FALLBACK_WARNED: set[str] = set()
+
+
 class AnthropicProvider(Provider):
     NAME = "anthropic"
     API_KEY_ENV = "ANTHROPIC_API_KEY"
     SUPPORTS: frozenset[str] = _SUPPORTS
+
+    def __init__(self, *, exact_count_tokens: bool = False, **kwargs: Any):
+        """``exact_count_tokens=True`` makes ``count_tokens`` call the
+        Anthropic SDK's free server-side ``messages.count_tokens`` endpoint
+        for exact counts under the model's actual tokenizer. Default is
+        ``False``: the base ``chars/4`` approximation is used and no network
+        call is made. Enable this for callers that need accurate counts
+        (e.g. chunk planning over long inputs); leave it off for strict
+        offline behaviour. Network/SDK errors fall back to ``chars/4`` with
+        a one-time warning per error type."""
+        self._exact_count_tokens = exact_count_tokens
+        super().__init__(**kwargs)
+
+    def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
+        if not self._exact_count_tokens or not text:
+            return super().count_tokens(text, model_id=model_id)
+        if model_id is None:
+            raise ValueError(
+                "AnthropicProvider.count_tokens with exact_count_tokens=True "
+                "requires a model_id; use Model.count_tokens(text) or pass "
+                "model_id= explicitly."
+            )
+        try:
+            result = self._client.messages.count_tokens(
+                model=model_id,
+                messages=[{"role": "user", "content": text}],
+            )
+            return int(result.input_tokens)
+        except self._module.AuthenticationError as e:
+            self._warn_exact_count_fallback("AuthenticationError", e)
+            return super().count_tokens(text, model_id=model_id)
+        except self._module.RateLimitError as e:
+            self._warn_exact_count_fallback("RateLimitError", e)
+            return super().count_tokens(text, model_id=model_id)
+        except self._module.APIError as e:
+            self._warn_exact_count_fallback("APIError", e)
+            return super().count_tokens(text, model_id=model_id)
+        except Exception as e:
+            self._warn_exact_count_fallback(type(e).__name__, e)
+            return super().count_tokens(text, model_id=model_id)
+
+    def tokenizer_name(self, *, model_id: str | None = None) -> str:
+        if self._exact_count_tokens:
+            return "anthropic-server"
+        return super().tokenizer_name(model_id=model_id)
+
+    @staticmethod
+    def _warn_exact_count_fallback(error_type: str, exc: Exception) -> None:
+        if error_type in _EXACT_COUNT_FALLBACK_WARNED:
+            return
+        _EXACT_COUNT_FALLBACK_WARNED.add(error_type)
+        warnings.warn(
+            f"AnthropicProvider.count_tokens server-side call failed "
+            f"({error_type}: {exc}); falling back to chars/4. Subsequent "
+            f"failures of this type will be silent.",
+            stacklevel=3,
+        )
 
     def new_model(
         self,
@@ -92,6 +154,7 @@ class AnthropicProvider(Provider):
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,
         auto_cache_last_user: bool | None = None,
+        auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
         keep_alive: str | int | None = None,
         context_size: int | None = None,
@@ -123,6 +186,7 @@ class AnthropicProvider(Provider):
             user_metadata=user_metadata,
             cache_ttl=cache_ttl,
             auto_cache_last_user=auto_cache_last_user,
+            auto_cache_tools=auto_cache_tools,
             beta_headers=beta_headers,
             keep_alive=keep_alive,
             context_size=context_size,
@@ -176,7 +240,13 @@ class AnthropicProvider(Provider):
             api_kwargs["system"] = sys_blocks
 
         if req.tools:
-            api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
+            api_tools = [self._tool_to_api(t) for t in req.tools]
+            if req.settings.get("auto_cache_tools") and api_tools:
+                cc: dict[str, Any] = {"type": "ephemeral"}
+                if ttl_value:
+                    cc["ttl"] = ttl_value
+                api_tools[-1]["cache_control"] = cc
+            api_kwargs["tools"] = api_tools
             api_kwargs["tool_choice"] = self._tool_choice_to_api(
                 req.settings.get("tool_choice", "auto")
             )

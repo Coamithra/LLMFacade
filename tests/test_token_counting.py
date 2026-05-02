@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from llmfacade import Usage
 
 from .conftest import MockProvider
@@ -45,6 +47,126 @@ def test_subclass_can_override_count_tokens():
     m = p.new_model("m1")
     assert m.count_tokens("abcd") == 2
     assert m.tokenizer_name() == "chars/2"
+
+
+# --- AnthropicProvider exact_count_tokens override ---------------------------
+
+
+class _FakeCountResult:
+    def __init__(self, input_tokens: int):
+        self.input_tokens = input_tokens
+
+
+def _make_anthropic_provider(*, exact: bool):
+    """Build a real AnthropicProvider with a stub _client so no network is hit."""
+    from llmfacade.providers.anthropic import AnthropicProvider
+
+    p = AnthropicProvider(api_key="test-key", exact_count_tokens=exact)
+    return p
+
+
+def test_anthropic_count_tokens_default_uses_chars_over_4():
+    p = _make_anthropic_provider(exact=False)
+    # 16 chars → 4 tokens via chars/4 fallback. tokenizer_name reports "chars/4".
+    assert p.count_tokens("a" * 16) == 4
+    assert p.tokenizer_name() == "chars/4"
+
+
+def test_anthropic_count_tokens_exact_calls_sdk(monkeypatch):
+    p = _make_anthropic_provider(exact=True)
+    captured: dict[str, object] = {}
+
+    def fake_count_tokens(*, model: str, messages: list[dict[str, object]]):
+        captured["model"] = model
+        captured["messages"] = messages
+        return _FakeCountResult(input_tokens=42)
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", fake_count_tokens)
+    n = p.count_tokens("hello there", model_id="claude-haiku-4-5-20251001")
+    assert n == 42
+    assert captured["model"] == "claude-haiku-4-5-20251001"
+    assert captured["messages"] == [{"role": "user", "content": "hello there"}]
+    assert p.tokenizer_name() == "anthropic-server"
+
+
+def test_anthropic_count_tokens_exact_requires_model_id():
+    p = _make_anthropic_provider(exact=True)
+    with pytest.raises(ValueError, match="requires a model_id"):
+        p.count_tokens("hello")
+
+
+def test_anthropic_count_tokens_empty_text_skips_network(monkeypatch):
+    """Empty text must not hit the network even with exact_count_tokens=True."""
+    p = _make_anthropic_provider(exact=True)
+
+    def explode(**_):
+        raise AssertionError("network call should not happen for empty text")
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", explode)
+    # Empty text: chars/4 fallback returns 1 (the min).
+    assert p.count_tokens("", model_id="claude-haiku-4-5-20251001") == 1
+
+
+def test_anthropic_count_tokens_exact_falls_back_on_api_error(monkeypatch):
+    import httpx
+
+    from llmfacade.providers import anthropic as anthropic_module
+
+    p = _make_anthropic_provider(exact=True)
+    # Reset the module-level once-per-error-type warning suppression so the
+    # warning fires for this test regardless of order.
+    anthropic_module._EXACT_COUNT_FALLBACK_WARNED.clear()
+
+    api_error_cls = p._module.APIError
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages/count_tokens")
+
+    def fake_count_tokens(**_):
+        raise api_error_cls("boom", request=req, body=None)
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", fake_count_tokens)
+    with pytest.warns(UserWarning, match="falling back to chars/4"):
+        n = p.count_tokens("a" * 16, model_id="claude-haiku-4-5-20251001")
+    # chars/4 fallback for 16 chars = 4.
+    assert n == 4
+
+
+def test_anthropic_count_tokens_exact_warns_only_once_per_error_type(monkeypatch):
+    import warnings as _w
+
+    from llmfacade.providers import anthropic as anthropic_module
+
+    p = _make_anthropic_provider(exact=True)
+    anthropic_module._EXACT_COUNT_FALLBACK_WARNED.clear()
+
+    def fake_count_tokens(**_):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", fake_count_tokens)
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        p.count_tokens("a" * 16, model_id="claude-haiku-4-5-20251001")
+        p.count_tokens("a" * 16, model_id="claude-haiku-4-5-20251001")
+    # Only the first call emits the warning; the second is suppressed by
+    # _EXACT_COUNT_FALLBACK_WARNED tracking.
+    assert sum("falling back to chars/4" in str(w.message) for w in caught) == 1
+
+
+def test_anthropic_model_count_tokens_passes_model_id(monkeypatch):
+    """Model.count_tokens routes through Provider.count_tokens with the bound
+    model_id, so callers don't have to pass it manually."""
+    p = _make_anthropic_provider(exact=True)
+    seen: dict[str, str] = {}
+
+    def fake(*, model: str, messages):
+        del messages
+        seen["model"] = model
+        return _FakeCountResult(input_tokens=7)
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", fake)
+    m = p.new_model("claude-sonnet-4-6")
+    assert m.count_tokens("hi") == 7
+    assert seen["model"] == "claude-sonnet-4-6"
+    assert m.tokenizer_name() == "anthropic-server"
 
 
 # --- turn-boundary tracking ---------------------------------------------------

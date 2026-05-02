@@ -118,3 +118,8 @@ If your provider needs extra identity args (e.g. `org_id`), add them to a `__ini
 - Full type annotations throughout.
 - src/ layout - imports as `from llmfacade import ...`.
 - Naming: snake_case throughout. Public lifecycle methods (`new_provider`, `new_model`, `new_conversation`, `send`, `stream`, `snapshot`, `rollback`, `clone`, `add_user_message`, etc.) and helper module functions are all snake_case. Class names and dataclass field names follow the usual Python conventions.
+
+## Future work
+
+- **Google `cachedContents` integration.** Gemini supports prompt caching but via a separate resource API: `client.caches.create(...)` returns a named cache handle that subsequent `generate_content` calls reference via `cached_content=<handle>`. This is a caller-managed lifecycle (create/list/delete + TTL) rather than a per-request `cache_control` marker, so the Anthropic-style `auto_cache_tools` / `auto_cache_last_user` knobs don't translate. Designing a facade-level surface for it (probably a `Provider.create_cache(...)` returning a handle, plus a `cached_content=` argument on `Conversation`) is its own piece of work and is deferred. Until it lands, callers running tool-heavy workloads against Gemini cannot get the equivalent of Anthropic's tool-array caching.
+- **OpenAI / Ollama tool caching — intentionally not implemented.** OpenAI auto-caches prompt prefixes above ~1024 tokens transparently (no per-request marker, no knob to flip), and Ollama has no provider-side prompt-cache API at all. Adding `auto_cache_tools` to either would be a misleading no-op. This is documented here so the absence is understood as deliberate, not an oversight.
