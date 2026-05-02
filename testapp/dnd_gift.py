@@ -6,7 +6,8 @@ from typing import cast
 
 from dotenv import load_dotenv
 
-from llmfacade import LLM, SystemBlock
+from llmfacade import LLM, Model, SystemBlock, tool
+from llmfacade.helpers import run_to_completion
 from llmfacade.providers.anthropic import AnthropicModel, AnthropicProvider
 
 sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -364,45 +365,76 @@ When asked to assemble a gift basket or bundle:
 
 
 
+@tool
+def get_weather(location: str) -> str:
+    """Get the current weather for a location."""
+    return f"Weather for {location}: 72F, sunny, light breeze."
+
+
 def banner(label: str) -> None:
     print(f"\n=== {label} ===")
 
 
-def main() -> None:
-    provider = cast(
-        AnthropicProvider,
-        LLM.default().new_provider("anthropic", temperature=0.7),
-    )
-    model = provider.new_model(AnthropicModel.HAIKU_4_5, max_tokens=512)
-    chat = model.new_conversation(
-        name="dnd-gift",
-        system_blocks=[SystemBlock(text=GIFT_ADVISOR_GUIDE, cache=True)],
-        top_k=40,
-        auto_cache_last_user=True,
-    )
+def run_pass(model: Model, tag: str) -> None:
+    can_cache = model.is_available("auto_cache_last_user")
+    convo_kwargs: dict = {
+        "name": f"dnd-gift-{tag}",
+        "system_blocks": [SystemBlock(text=GIFT_ADVISOR_GUIDE, cache=can_cache)],
+        "top_k": 40,
+    }
+    if can_cache:
+        convo_kwargs["auto_cache_last_user"] = True
+    chat = model.new_conversation(**convo_kwargs)
 
-    banner("Turn 1: gift ideas")
+    banner(f"[{tag}] Turn 1: gift ideas")
     print(chat.send("give me 3 ideas for gifts for a D&D nerd").text)
 
-    banner("Turn 2: more on idea #2")
+    banner(f"[{tag}] Turn 2: more on idea #2")
     print(chat.send("that's cool, tell me more about the second idea").text)
 
     snap = chat.snapshot()
 
-    banner("Turn 3a: gift card (first take)")
+    banner(f"[{tag}] Turn 3a: gift card (first take)")
     print(chat.send("can you write a little gift card to go with this").text)
 
-    banner("Side trip: brand new conversation")
+    banner(f"[{tag}] Side trip: brand new conversation")
     side = model.new_conversation(
-        name="side-trip",
+        name=f"side-trip-{tag}",
         system_blocks=["Reply in one short sentence."],
     )
     print(side.send("good morning").text)
 
     chat.rollback(snap)
 
-    banner("Turn 3b: gift card (rolled back, second take)")
+    banner(f"[{tag}] Turn 3b: gift card (rolled back, second take)")
     print(chat.send("can you write a little gift card to go with this").text)
+
+
+def run_weather_pass(model: Model, tag: str) -> None:
+    convo = model.new_conversation(
+        name=f"weather-{tag}",
+        system_blocks=["You can call tools when useful. Be brief."],
+        tools=[get_weather],
+    )
+    banner(f"[{tag}] Tool call: what's the weather in Paris?")
+    final = run_to_completion(convo, "what's the weather in Paris?")
+    print(final.text)
+
+
+def main() -> None:
+    llm = LLM.default()
+
+    banner("== Pass 1: Anthropic Haiku 4.5 ==")
+    anthropic = cast(AnthropicProvider, llm.new_provider("anthropic", temperature=0.7))
+    haiku = anthropic.new_model(AnthropicModel.HAIKU_4_5, max_tokens=512)
+    run_pass(haiku, "anthropic")
+    run_weather_pass(haiku, "anthropic")
+
+    banner("== Pass 2: Ollama llama3.2:3b (local) ==")
+    ollama = llm.new_provider("ollama", temperature=0.7)
+    local = ollama.new_model("llama3.2:3b", max_tokens=512, context_size=16384)
+    run_pass(local, "ollama")
+    run_weather_pass(local, "ollama")
 
 
 if __name__ == "__main__":
