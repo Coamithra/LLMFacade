@@ -120,6 +120,7 @@ class Provider:
         manager: LLM | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
+        log_dir: Any | None = None,
         # Generation defaults (subset of RUNTIME_KNOBS). Each is gated by SUPPORTS.
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -140,6 +141,7 @@ class Provider:
         self._manager = manager
         self._api_key_override = api_key
         self._base_url = base_url
+        self._log_dir_override = log_dir
         self._defaults = _validate_knobs(
             {
                 "temperature": temperature,
@@ -176,6 +178,7 @@ class Provider:
         model_id: str,
         *,
         capability_override: frozenset[str] | None = None,
+        log_dir: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -215,6 +218,7 @@ class Provider:
             provider=self,
             model_id=model_id,
             capability_override=capability_override,
+            log_dir=log_dir,
             **defaults,
         )
 

@@ -133,8 +133,12 @@ class MockProvider(Provider):
 
 @pytest.fixture(autouse=True)
 def _reset_llm_default():
-    """Drop LLM.default() between tests so api_keys mutations don't leak."""
+    """Drop LLM.default() between tests so api_keys mutations don't leak.
+
+    Pre-seed the default with ``log_dir=False`` so any test that touches
+    ``LLM.default()`` doesn't materialise a log directory on disk."""
     LLM.reset_default()
+    LLM._default = LLM(log_dir=False)
     yield
     LLM.reset_default()
 

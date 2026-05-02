@@ -139,7 +139,8 @@ class Conversation:
         name: str | None = None,
         system_blocks: list[SystemBlock | str] | None = None,
         tools: list[Tool] | None = None,
-        log_path: str | Path | None = None,
+        log_dir: Any | None = None,
+        log_path: Any | None = None,
         log_max_message_lines: int | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -194,7 +195,14 @@ class Conversation:
         )
 
         self._history: list[Message] = []
-        self._log_path: Path | None = Path(log_path) if log_path is not None else None
+        self._log_dir_override = log_dir
+        self._log_path_override = log_path
+        self._log_path: Path | None = _resolve_log_path(
+            convo_name=self.name,
+            convo_log_path=log_path,
+            convo_log_dir=log_dir,
+            model=model,
+        )
         self._log_max_message_lines = log_max_message_lines
         self._logged_msg_count: int = 0
         # (msg_count_at_send, total_input_tokens) per completed send/stream.
@@ -288,12 +296,14 @@ class Conversation:
         self,
         *,
         name: str | None = None,
-        log_path: str | Path | None = None,
+        log_dir: Any | None = None,
+        log_path: Any | None = None,
         log_max_message_lines: int | None = None,
     ) -> Conversation:
         """Deep-copy history, system blocks, tools, and defaults into a fresh
-        conversation. The clone may have its own log path; if omitted, the
-        clone has no logging (parent's log isn't shared)."""
+        conversation. The clone resolves its own log path through the same
+        cascade as a fresh ``new_conversation`` call: pass ``log_dir=False``
+        or ``log_path=False`` to disable logging on the clone."""
         clone = Conversation.__new__(Conversation)
         clone._model = self._model
         clone.name = name or f"{self.name}-clone"
@@ -305,7 +315,14 @@ class Conversation:
         # history. Cloning preserves that prefix verbatim, so boundaries stay
         # valid for the clone's first turn.
         clone._turn_boundaries = list(self._turn_boundaries)
-        clone._log_path = Path(log_path) if log_path is not None else None
+        clone._log_dir_override = log_dir
+        clone._log_path_override = log_path
+        clone._log_path = _resolve_log_path(
+            convo_name=clone.name,
+            convo_log_path=log_path,
+            convo_log_dir=log_dir,
+            model=self._model,
+        )
         clone._log_max_message_lines = (
             log_max_message_lines
             if log_max_message_lines is not None
@@ -914,6 +931,44 @@ def _logsafe(v: Any) -> Any:
     if isinstance(v, Enum):
         return v.value
     return v
+
+
+def _resolve_log_path(
+    *,
+    convo_name: str,
+    convo_log_path: Any,
+    convo_log_dir: Any,
+    model: Model,
+) -> Path | None:
+    """Resolve a Conversation's effective JSONL log path from the cascade
+    (convo > model > provider > manager) plus any explicit ``log_path``
+    override on the convo. Any layer can pass ``False`` to disable logging
+    at its scope. Returns ``None`` when logging resolves to disabled."""
+    # Explicit per-convo log_path wins.
+    if convo_log_path is False:
+        return None
+    if convo_log_path is not None and convo_log_path is not True:
+        return Path(convo_log_path)
+
+    # Otherwise resolve a directory from the cascade and compose <dir>/<name>.jsonl.
+    layer_overrides = (
+        convo_log_dir,
+        getattr(model, "_log_dir_override", None),
+        getattr(model.provider, "_log_dir_override", None),
+    )
+    for v in layer_overrides:
+        if v is False:
+            return None
+        if v is not None and v is not True:
+            return Path(v) / f"{convo_name}.jsonl"
+
+    manager = getattr(model.provider, "_manager", None)
+    if manager is None:
+        return None
+    run_dir = manager._ensure_run_dir()
+    if run_dir is None:
+        return None
+    return run_dir / f"{convo_name}.jsonl"
 
 
 def _make_html_logger(log_path: Path | None) -> HtmlLogger | None:

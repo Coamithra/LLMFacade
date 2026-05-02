@@ -397,3 +397,111 @@ def test_anthropic_cache_ttl_via_convo_setting():
     )
     api_kwargs = p._build_kwargs(req)
     assert api_kwargs["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_log_dir_cascade_uses_manager_run_dir(tmp_path):
+    """A convo built via LLM(log_dir=...).new_provider().new_model().new_conversation()
+    auto-logs to ``<run_dir>/<convo.name>.jsonl`` with no per-convo log_path."""
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=tmp_path)
+    p = MockProvider(manager=llm)
+    convo = p.new_model("mock-model").new_conversation(name="hello")
+    convo.send("hi")
+    assert llm.run_dir is not None
+    expected = llm.run_dir / "hello.jsonl"
+    assert expected.exists()
+    assert expected.read_text(encoding="utf-8")  # non-empty
+
+
+def test_log_dir_default_name_is_convo_hash(tmp_path):
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=tmp_path)
+    p = MockProvider(manager=llm)
+    convo = p.new_model("mock-model").new_conversation()
+    convo.send("hi")
+    assert llm.run_dir is not None
+    expected = llm.run_dir / f"{convo.name}.jsonl"
+    assert expected.exists()
+    assert convo.name.startswith("convo-")
+
+
+def test_log_dir_provider_override_redirects(tmp_path):
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=tmp_path / "default")
+    elsewhere = tmp_path / "elsewhere"
+    p = MockProvider(manager=llm, log_dir=elsewhere)
+    convo = p.new_model("mock-model").new_conversation(name="x")
+    convo.send("hi")
+    assert (elsewhere / "x.jsonl").exists()
+    # Manager run_dir was never materialised because provider redirected.
+    assert llm.run_dir is not None and not llm.run_dir.exists()
+
+
+def test_log_dir_model_override_redirects(tmp_path):
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=tmp_path / "default")
+    p = MockProvider(manager=llm)
+    model_dir = tmp_path / "modeldir"
+    convo = p.new_model("mock-model", log_dir=model_dir).new_conversation(name="m")
+    convo.send("hi")
+    assert (model_dir / "m.jsonl").exists()
+
+
+def test_log_dir_convo_override_redirects(tmp_path):
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=tmp_path / "default")
+    p = MockProvider(manager=llm)
+    convo_dir = tmp_path / "convodir"
+    convo = p.new_model("mock-model").new_conversation(name="c", log_dir=convo_dir)
+    convo.send("hi")
+    assert (convo_dir / "c.jsonl").exists()
+
+
+def test_log_dir_false_at_convo_disables(tmp_path):
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=tmp_path)
+    p = MockProvider(manager=llm)
+    convo = p.new_model("mock-model").new_conversation(name="off", log_path=False)
+    convo.send("hi")
+    assert llm.run_dir is not None
+    assert not (llm.run_dir / "off.jsonl").exists()
+
+
+def test_log_dir_false_at_provider_disables(tmp_path):
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=tmp_path)
+    p = MockProvider(manager=llm, log_dir=False)
+    convo = p.new_model("mock-model").new_conversation(name="off")
+    convo.send("hi")
+    assert llm.run_dir is not None
+    assert not (llm.run_dir / "off.jsonl").exists()
+
+
+def test_log_dir_false_at_manager_disables_but_lower_can_reenable(tmp_path):
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=False)
+    p = MockProvider(manager=llm, log_dir=tmp_path / "p")
+    convo = p.new_model("mock-model").new_conversation(name="r")
+    convo.send("hi")
+    assert (tmp_path / "p" / "r.jsonl").exists()
+
+
+def test_explicit_log_path_still_overrides_cascade(tmp_path):
+    from llmfacade import LLM
+
+    llm = LLM(log_dir=tmp_path / "default")
+    p = MockProvider(manager=llm)
+    explicit = tmp_path / "explicit" / "log.jsonl"
+    convo = p.new_model("mock-model").new_conversation(name="ignored", log_path=explicit)
+    convo.send("hi")
+    assert explicit.exists()
+    # The convo's name file under the manager dir should NOT exist.
+    assert llm.run_dir is not None and not (llm.run_dir / "ignored.jsonl").exists()

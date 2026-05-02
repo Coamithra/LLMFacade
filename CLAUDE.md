@@ -39,7 +39,7 @@ LLM            manager: shared api_keys; LLM.default() is a process-wide singlet
      -> Conversation   stateful session: history, system blocks, tools, convo-level defaults
 ```
 
-**Configuration is constructor-only.** Identity (api_key, base_url, model_id, system_blocks, tools, log_path) is supplied at construction and never changes. Generation knobs (temperature, max_tokens, etc.) are accepted as kwargs at every layer and form a cascade (`provider < model < convo < per_call`); they are also immutable post-construction. There is no `Start()` step — conversations are usable immediately after construction.
+**Configuration is constructor-only.** Identity (api_key, base_url, model_id, system_blocks, tools, log_dir, log_path) is supplied at construction and never changes. Generation knobs (temperature, max_tokens, etc.) are accepted as kwargs at every layer and form a cascade (`provider < model < convo < per_call`); they are also immutable post-construction. There is no `Start()` step — conversations are usable immediately after construction.
 
 Key files:
 
@@ -68,7 +68,11 @@ Precedence on read is `provider < model < convo < per_call` (later wins). Unknow
 
 ### Logging
 
-When `log_path=` is passed at convo construction, the JSONL log starts with a single `settings` header record listing every effective knob, its value, and which scope (`provider`/`model`/`convo`) supplied it — plus the system blocks and tool names. Subsequent entries are tight: `request` records carry only `overrides` (per-call kwargs) and `new_messages` (delta since last log), and `response` records carry the assistant content and a `cache_summary` block.
+Logging is **on by default**. `LLM(log_dir=..., max_log_folders=10)` configures the manager-level root and retention. Each `LLM` instance reserves a session-stamped subfolder `<log_dir>/llmfacade<YYYYMMDD-HHMMSS>/` (default base: `<cwd>/logs`). On first write, the manager prunes older sibling `llmfacade*` directories down to `max_log_folders` and materialises the new one. Each `Conversation`'s log file is `<run_dir>/<convo.name>.jsonl` with an HTML sibling. The convo's `name` is auto-generated (`convo-<8hex>`) unless you pass `name=` to `new_conversation`.
+
+`log_dir` cascades: convo > model > provider > manager. Any layer can pass `log_dir=False` to disable logging for its scope; a lower layer can re-enable by supplying its own `log_dir`. `Conversation(log_path=Path(...))` is an explicit-file override that bypasses the cascade entirely; `log_path=False` disables logging for that one convo.
+
+The JSONL log starts with a single `settings` header record listing every effective knob, its value, and which scope (`provider`/`model`/`convo`) supplied it — plus the system blocks and tool names. Subsequent entries are tight: `request` records carry only `overrides` (per-call kwargs) and `new_messages` (delta since last log), and `response` records carry the assistant content and a `cache_summary` block.
 
 `cache_summary.approximate_messages_cached` maps `cache_read_tokens` back to a message index. The lookup uses **turn-boundary tracking**: each successful send/stream records `(msg_count_at_send, total_input_tokens)` from `usage`, and a later turn's `cache_read_tokens` is matched exactly against that list (cache markers always sit at turn boundaries, so a hit typically equals some prior turn's recorded total). When matched, `tokenizer` reports `"exact (turn-boundary)"`. If no recorded boundary matches (first-turn caching, system-block-only markers, mid-prefix divergence after rollback), it falls back to a per-message walk via `Provider.count_tokens` — exact for OpenAI (tiktoken) and Google (sentencepiece via `google-genai[local-tokenizer]`), `chars/4` for Anthropic and Ollama.
 
@@ -82,10 +86,10 @@ Every provider declares `SUPPORTS: frozenset[str]` listing the knob names it acc
 
 ### Conversation lifecycle
 
-- Construction: `model.new_conversation(system_blocks=..., tools=..., log_path=..., **defaults)`. Everything is set here, immutably.
+- Construction: `model.new_conversation(name=..., system_blocks=..., tools=..., log_dir=..., log_path=..., **defaults)`. Everything is set here, immutably. `name` defaults to `convo-<8hex>` and doubles as the log filename.
 - `add_user_message` / `add_assistant_message` / `add_tool_result` mutate history; `send` / `asend` / `stream` / `astream` are strict single round-trips.
 - Tool calls in a response are returned to the caller. Dispatch them yourself (or via `helpers.run_bound_tools`) and append results before the next call.
-- `snapshot()` returns an opaque token capturing history; `rollback(snap)` restores it. `clone(*, name=None, log_path=None)` deep-copies everything into a fresh conversation that may have its own log path.
+- `snapshot()` returns an opaque token capturing history; `rollback(snap)` restores it. `clone(*, name=None, log_dir=None, log_path=None)` deep-copies everything into a fresh conversation that resolves its log path through the same cascade as a fresh `new_conversation`.
 
 ### Provider quirks
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import datetime as _dt
 import importlib
+import shutil
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from llmfacade.exceptions import LLMError, ProviderNotInstalledError
@@ -11,7 +14,22 @@ if TYPE_CHECKING:
 
 
 class LLM:
-    """Cross-provider manager. Holds shared API keys; spawns Providers."""
+    """Cross-provider manager. Holds shared API keys and the logging root;
+    spawns Providers.
+
+    Logging is on by default. Each LLM instance reserves a session-stamped
+    directory ``<log_dir>/llmfacade<YYYYMMDD-HHMMSS>/`` into which every
+    Conversation's JSONL/HTML log is written using the convo's ``name`` as
+    the filename. The directory is materialised lazily on first write, so
+    constructing an ``LLM`` is filesystem-free.
+
+    - ``log_dir=None`` (default): write under ``<cwd>/logs``.
+    - ``log_dir=Path | str``: write under that base.
+    - ``log_dir=False``: disable logging at the manager level. Lower layers
+      (provider/model/convo) can re-enable by supplying their own ``log_dir``.
+
+    ``max_log_folders`` caps how many ``llmfacade*`` session folders are kept
+    inside ``log_dir``. Older ones are deleted on first write."""
 
     _default: LLM | None = None
 
@@ -19,8 +37,55 @@ class LLM:
         self,
         *,
         api_keys: dict[str, str] | None = None,
+        log_dir: Path | str | bool | None = None,
+        max_log_folders: int = 10,
     ):
         self.api_keys: dict[str, str] = dict(api_keys or {})
+        self._max_log_folders = max(0, int(max_log_folders))
+        self._run_dir_materialized = False
+        if log_dir is False:
+            self._log_dir_base: Path | None = None
+            self._run_dir: Path | None = None
+        else:
+            base = Path.cwd() / "logs" if log_dir is None or log_dir is True else Path(log_dir)
+            self._log_dir_base = base
+            stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            self._run_dir = base / f"llmfacade{stamp}"
+
+    @property
+    def run_dir(self) -> Path | None:
+        """Planned per-session log directory, or ``None`` if logging is
+        disabled. Reading this does not create the directory."""
+        return self._run_dir
+
+    def _ensure_run_dir(self) -> Path | None:
+        """Materialise the session log directory, pruning older sibling
+        ``llmfacade*`` folders down to ``max_log_folders``. Idempotent."""
+        if self._run_dir is None or self._log_dir_base is None:
+            return None
+        if not self._run_dir_materialized:
+            self._run_dir_materialized = True
+            self._prune_old_run_dirs()
+            self._run_dir.mkdir(parents=True, exist_ok=True)
+        return self._run_dir
+
+    def _prune_old_run_dirs(self) -> None:
+        if self._log_dir_base is None or not self._log_dir_base.exists():
+            return
+        existing = sorted(
+            (
+                p
+                for p in self._log_dir_base.iterdir()
+                if p.is_dir() and p.name.startswith("llmfacade") and p != self._run_dir
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        # Keep the newest (max_log_folders - 1) so that, with the new run added,
+        # the total stays at max_log_folders.
+        to_keep = max(0, self._max_log_folders - 1)
+        for old in existing[to_keep:]:
+            shutil.rmtree(old, ignore_errors=True)
 
     @classmethod
     def default(cls) -> LLM:

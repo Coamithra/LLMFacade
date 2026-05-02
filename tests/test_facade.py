@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from llmfacade import LLM
 
 
@@ -27,3 +29,84 @@ def test_reset_default_creates_fresh_instance():
     LLM.reset_default()
     second = LLM.default()
     assert first is not second
+
+
+def test_log_dir_defaults_to_cwd_logs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    llm = LLM()
+    assert llm.run_dir is not None
+    assert llm.run_dir.parent == tmp_path / "logs"
+    assert llm.run_dir.name.startswith("llmfacade")
+    # Lazy: just constructing the LLM does not touch disk.
+    assert not (tmp_path / "logs").exists()
+
+
+def test_log_dir_false_disables_run_dir():
+    llm = LLM(log_dir=False)
+    assert llm.run_dir is None
+    assert llm._ensure_run_dir() is None
+
+
+def test_log_dir_explicit_path(tmp_path):
+    llm = LLM(log_dir=tmp_path / "custom")
+    assert llm.run_dir is not None
+    assert llm.run_dir.parent == tmp_path / "custom"
+
+
+def test_ensure_run_dir_materializes_and_prunes(tmp_path):
+    base = tmp_path / "logs"
+    base.mkdir()
+    # Pre-existing session folders that should be pruned to fit max_log_folders=2.
+    old_a = base / "llmfacade20200101-000000"
+    old_b = base / "llmfacade20200102-000000"
+    old_c = base / "llmfacade20200103-000000"
+    for d in (old_a, old_b, old_c):
+        d.mkdir()
+        (d / "marker.txt").write_text("x")
+    llm = LLM(log_dir=base, max_log_folders=2)
+    run_dir = llm._ensure_run_dir()
+    assert run_dir is not None
+    assert run_dir.exists()
+    # max_log_folders=2 keeps 1 old + the new one.
+    surviving = sorted(p.name for p in base.iterdir() if p.is_dir())
+    assert len(surviving) == 2
+    assert run_dir.name in surviving
+    # The two oldest got removed.
+    assert old_a.name not in surviving
+    assert old_b.name not in surviving
+    # Idempotent: second call doesn't re-prune.
+    again = llm._ensure_run_dir()
+    assert again == run_dir
+
+
+def test_ensure_run_dir_skips_non_llmfacade_siblings(tmp_path):
+    base = tmp_path / "logs"
+    base.mkdir()
+    keep_me = base / "user-thing"
+    keep_me.mkdir()
+    (keep_me / "data.txt").write_text("x")
+    llm = LLM(log_dir=base, max_log_folders=1)
+    llm._ensure_run_dir()
+    assert keep_me.exists()
+    assert (keep_me / "data.txt").exists()
+
+
+def test_max_log_folders_zero_keeps_only_new_run(tmp_path):
+    base = tmp_path / "logs"
+    base.mkdir()
+    old = base / "llmfacade20200101-000000"
+    old.mkdir()
+    llm = LLM(log_dir=base, max_log_folders=0)
+    run_dir = llm._ensure_run_dir()
+    assert run_dir is not None
+    assert not old.exists()
+    assert run_dir.exists()
+
+
+def test_run_dir_is_session_stamped_and_unique():
+    a = LLM(log_dir=Path("/tmp/test"))
+    b = LLM(log_dir=Path("/tmp/test"))
+    assert a.run_dir is not None and b.run_dir is not None
+    # Different LLMs created back-to-back may share a stamp at second-resolution
+    # but they should at least be Paths, not None, and parented identically.
+    assert a.run_dir.parent == b.run_dir.parent

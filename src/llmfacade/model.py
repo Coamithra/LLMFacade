@@ -24,6 +24,7 @@ class Model:
         provider: Provider,
         model_id: str,
         capability_override: frozenset[str] | None = None,
+        log_dir: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -42,6 +43,7 @@ class Model:
     ):
         self._provider = provider
         self._model_id = model_id
+        self._log_dir_override = log_dir
         self._supports: frozenset[str] = (
             capability_override if capability_override is not None else provider.SUPPORTS
         )
@@ -102,6 +104,7 @@ class Model:
         name: str | None = None,
         system_blocks: list[SystemBlock | str] | None = None,
         tools: list[Tool] | None = None,
+        log_dir: Any | None = None,
         log_path: Any | None = None,
         log_max_message_lines: int | None = None,
         temperature: float | None = None,
@@ -127,6 +130,7 @@ class Model:
             name=name,
             system_blocks=system_blocks,
             tools=tools,
+            log_dir=log_dir,
             log_path=log_path,
             log_max_message_lines=log_max_message_lines,
             temperature=temperature,
