@@ -503,19 +503,25 @@ class Conversation:
         tool_calls: list[ToolCall] = []
         last_usage = None
         msg_count_at_send = len(req.messages)
-        for ev in self._model.provider._stream_raw(req):
-            if ev.text_delta:
-                text_buf.append(ev.text_delta)
-            if ev.thinking_block is not None:
-                thinking_blocks.append(ev.thinking_block)
-            if ev.tool_call_delta:
-                tool_calls.append(ev.tool_call_delta)
-            if ev.usage is not None:
-                last_usage = ev.usage
-            yield ev
-
-        self._record_turn_boundary(last_usage, msg_count_at_send)
-        self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
+        # Use try/finally so a consumer that breaks out of the iterator early
+        # (break, exception, generator close) still gets the partial assistant
+        # turn appended to history. Otherwise the user message recorded above
+        # would be left dangling with no reply, breaking strict role
+        # alternation on the next call.
+        try:
+            for ev in self._model.provider._stream_raw(req):
+                if ev.text_delta:
+                    text_buf.append(ev.text_delta)
+                if ev.thinking_block is not None:
+                    thinking_blocks.append(ev.thinking_block)
+                if ev.tool_call_delta:
+                    tool_calls.append(ev.tool_call_delta)
+                if ev.usage is not None:
+                    last_usage = ev.usage
+                yield ev
+        finally:
+            self._record_turn_boundary(last_usage, msg_count_at_send)
+            self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
 
     async def astream(
         self,
@@ -569,19 +575,20 @@ class Conversation:
         tool_calls: list[ToolCall] = []
         last_usage = None
         msg_count_at_send = len(req.messages)
-        async for ev in self._model.provider._astream_raw(req):
-            if ev.text_delta:
-                text_buf.append(ev.text_delta)
-            if ev.thinking_block is not None:
-                thinking_blocks.append(ev.thinking_block)
-            if ev.tool_call_delta:
-                tool_calls.append(ev.tool_call_delta)
-            if ev.usage is not None:
-                last_usage = ev.usage
-            yield ev
-
-        self._record_turn_boundary(last_usage, msg_count_at_send)
-        self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
+        try:
+            async for ev in self._model.provider._astream_raw(req):
+                if ev.text_delta:
+                    text_buf.append(ev.text_delta)
+                if ev.thinking_block is not None:
+                    thinking_blocks.append(ev.thinking_block)
+                if ev.tool_call_delta:
+                    tool_calls.append(ev.tool_call_delta)
+                if ev.usage is not None:
+                    last_usage = ev.usage
+                yield ev
+        finally:
+            self._record_turn_boundary(last_usage, msg_count_at_send)
+            self._finalize_stream(text_buf, thinking_blocks, tool_calls, last_usage)
 
     def _finalize_stream(
         self,
