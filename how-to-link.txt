@@ -1,0 +1,85 @@
+How to use llmfacade in another project
+========================================
+
+Repo: https://github.com/Coamithra/LLMFacade.git
+Pinned ref: @main (change to a tag like @v0.1.0 once you start tagging)
+
+
+1. Add the dependency
+---------------------
+
+In requirements.txt:
+
+    llmfacade @ git+https://github.com/Coamithra/LLMFacade.git@main
+
+Or in pyproject.toml:
+
+    [project]
+    dependencies = [
+        "llmfacade @ git+https://github.com/Coamithra/LLMFacade.git@main",
+    ]
+
+With provider extras (pulls the SDKs you actually need):
+
+    llmfacade[anthropic,openai] @ git+https://github.com/Coamithra/LLMFacade.git@main
+
+Available extras: anthropic, openai, google, ollama, tokenizers, all
+
+
+2. Install
+----------
+
+    pip install -r requirements.txt
+
+or if using pyproject.toml directly:
+
+    pip install -e .
+
+
+3. Use it
+---------
+
+    from llmfacade import LLM
+
+    llm = LLM.default()
+    provider = llm.new_provider("anthropic")
+    model = provider.new_model("claude-haiku-4-5")
+    convo = model.new_conversation()
+    print(convo.send("hello").text)
+
+API keys are read from env vars by default:
+    ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY
+
+
+4. Pulling updates
+------------------
+
+pip caches the git checkout, so new commits on main do NOT auto-install.
+To refresh:
+
+    pip install --upgrade --force-reinstall "llmfacade @ git+https://github.com/Coamithra/LLMFacade.git@main"
+
+Or pin to a specific commit / tag for reproducibility:
+
+    llmfacade @ git+https://github.com/Coamithra/LLMFacade.git@<sha>
+    llmfacade @ git+https://github.com/Coamithra/LLMFacade.git@v0.1.0
+
+
+5. Local dev workflow (optional)
+--------------------------------
+
+If you want live edits to LLMFacade to show up immediately in this project
+(no reinstall needed), use an editable install pointed at the local checkout:
+
+    pip install -e C:\Programming\LLMFacade
+
+Keep the git URL in requirements.txt anyway — that's what CI and collaborators
+will use. The local -e install just shadows it on your machine.
+
+
+6. Windows / Python notes
+-------------------------
+
+- Use `python` (not `python3`) on Windows.
+- If you hit UnicodeEncodeError when printing model output, set:
+      PYTHONIOENCODING=utf-8
