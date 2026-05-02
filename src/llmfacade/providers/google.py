@@ -84,14 +84,23 @@ class GoogleProvider(Provider):
         self._local_tokenizer_cache[target] = tok
         return tok
 
-    def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
+    def count_tokens(
+        self,
+        text: str,
+        *,
+        system: str | None = None,
+        model_id: str | None = None,
+    ) -> int:
         tok = self._get_local_tokenizer(model_id)
         if tok is None:
-            return super().count_tokens(text, model_id=model_id)
+            return super().count_tokens(text, system=system, model_id=model_id)
         try:
-            return int(tok.count_tokens(text).total_tokens)
+            n = int(tok.count_tokens(text).total_tokens)
+            if system:
+                n += int(tok.count_tokens(system).total_tokens)
+            return n
         except Exception:
-            return super().count_tokens(text, model_id=model_id)
+            return super().count_tokens(text, system=system, model_id=model_id)
 
     def tokenizer_name(self, *, model_id: str | None = None) -> str:
         if self._get_local_tokenizer(model_id) is None:

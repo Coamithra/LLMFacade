@@ -93,33 +93,42 @@ class AnthropicProvider(Provider):
         self._exact_count_tokens = exact_count_tokens
         super().__init__(**kwargs)
 
-    def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
-        if not self._exact_count_tokens or not text:
-            return super().count_tokens(text, model_id=model_id)
+    def count_tokens(
+        self,
+        text: str,
+        *,
+        system: str | None = None,
+        model_id: str | None = None,
+    ) -> int:
+        if not self._exact_count_tokens or (not text and not system):
+            return super().count_tokens(text, system=system, model_id=model_id)
         if model_id is None:
             raise ValueError(
                 "AnthropicProvider.count_tokens with exact_count_tokens=True "
                 "requires a model_id; use Model.count_tokens(text) or pass "
                 "model_id= explicitly."
             )
+        api_kwargs: dict[str, Any] = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": text}],
+        }
+        if system:
+            api_kwargs["system"] = system
         try:
-            result = self._client.messages.count_tokens(
-                model=model_id,
-                messages=[{"role": "user", "content": text}],
-            )
+            result = self._client.messages.count_tokens(**api_kwargs)
             return int(result.input_tokens)
         except self._module.AuthenticationError as e:
             self._warn_exact_count_fallback("AuthenticationError", e)
-            return super().count_tokens(text, model_id=model_id)
+            return super().count_tokens(text, system=system, model_id=model_id)
         except self._module.RateLimitError as e:
             self._warn_exact_count_fallback("RateLimitError", e)
-            return super().count_tokens(text, model_id=model_id)
+            return super().count_tokens(text, system=system, model_id=model_id)
         except self._module.APIError as e:
             self._warn_exact_count_fallback("APIError", e)
-            return super().count_tokens(text, model_id=model_id)
+            return super().count_tokens(text, system=system, model_id=model_id)
         except Exception as e:
             self._warn_exact_count_fallback(type(e).__name__, e)
-            return super().count_tokens(text, model_id=model_id)
+            return super().count_tokens(text, system=system, model_id=model_id)
 
     def tokenizer_name(self, *, model_id: str | None = None) -> str:
         if self._exact_count_tokens:
@@ -258,7 +267,10 @@ class AnthropicProvider(Provider):
 
         effort = req.settings.get("effort")
         if effort is not None:
-            api_kwargs["effort"] = effort.value if isinstance(effort, EffortLevel) else effort
+            value = effort.value if isinstance(effort, EffortLevel) else effort
+            # Anthropic SDK rejects a top-level effort= kwarg; the API expects
+            # output_config={"effort": "..."} on messages.create.
+            api_kwargs["output_config"] = {"effort": value}
 
         for key in ("top_p", "top_k"):
             value = req.settings.get(key)
@@ -307,7 +319,11 @@ class AnthropicProvider(Provider):
                 for event in stream:
                     if getattr(event, "type", None) == "message_stop":
                         msg = stream.get_final_message()
-                        yield StreamEvent(done=True, usage=self._usage_from(msg))
+                        yield StreamEvent(
+                            done=True,
+                            usage=self._usage_from(msg),
+                            finish_reason=getattr(msg, "stop_reason", None),
+                        )
                     else:
                         yield from self._chunk_to_events(event, state)
         except self._module.AuthenticationError as e:
@@ -325,7 +341,11 @@ class AnthropicProvider(Provider):
                 async for event in stream:
                     if getattr(event, "type", None) == "message_stop":
                         msg = await stream.get_final_message()
-                        yield StreamEvent(done=True, usage=self._usage_from(msg))
+                        yield StreamEvent(
+                            done=True,
+                            usage=self._usage_from(msg),
+                            finish_reason=getattr(msg, "stop_reason", None),
+                        )
                     else:
                         for ev in self._chunk_to_events(event, state):
                             yield ev

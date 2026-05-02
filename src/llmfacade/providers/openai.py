@@ -77,11 +77,17 @@ class OpenAIProvider(Provider):
 
     _tiktoken_cache: dict[str, Any] = {}
 
-    def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
+    def count_tokens(
+        self,
+        text: str,
+        *,
+        system: str | None = None,
+        model_id: str | None = None,
+    ) -> int:
         try:
             import tiktoken
         except ImportError:
-            return super().count_tokens(text, model_id=model_id)
+            return super().count_tokens(text, system=system, model_id=model_id)
         key = model_id or "__default__"
         enc = self._tiktoken_cache.get(key)
         if enc is None:
@@ -93,7 +99,10 @@ class OpenAIProvider(Provider):
             else:
                 enc = tiktoken.get_encoding("o200k_base")
             self._tiktoken_cache[key] = enc
-        return len(enc.encode(text))
+        n = len(enc.encode(text))
+        if system:
+            n += len(enc.encode(system))
+        return n
 
     def tokenizer_name(self, *, model_id: str | None = None) -> str:
         del model_id
@@ -174,8 +183,9 @@ class OpenAIProvider(Provider):
         try:
             stream = self._client.chat.completions.create(**api_kwargs)
             tool_buf: dict[int, dict[str, Any]] = {}
+            state: dict[str, Any] = {"finish_reason": None}
             for chunk in stream:
-                yield from self._chunk_to_events(chunk, tool_buf)
+                yield from self._chunk_to_events(chunk, tool_buf, state)
         except self._module.AuthenticationError as e:
             raise AuthenticationError(str(e)) from e
         except self._module.RateLimitError as e:
@@ -190,8 +200,9 @@ class OpenAIProvider(Provider):
         try:
             stream = await self._aclient.chat.completions.create(**api_kwargs)
             tool_buf: dict[int, dict[str, Any]] = {}
+            state: dict[str, Any] = {"finish_reason": None}
             async for chunk in stream:
-                for ev in self._chunk_to_events(chunk, tool_buf):
+                for ev in self._chunk_to_events(chunk, tool_buf, state):
                     yield ev
         except self._module.AuthenticationError as e:
             raise AuthenticationError(str(e)) from e
@@ -201,7 +212,10 @@ class OpenAIProvider(Provider):
             raise ProviderError(str(e), original=e) from e
 
     def _chunk_to_events(
-        self, chunk: Any, tool_buf: dict[int, dict[str, Any]]
+        self,
+        chunk: Any,
+        tool_buf: dict[int, dict[str, Any]],
+        state: dict[str, Any],
     ) -> Iterator[StreamEvent]:
         for choice in getattr(chunk, "choices", []) or []:
             delta = getattr(choice, "delta", None)
@@ -221,7 +235,9 @@ class OpenAIProvider(Provider):
                         slot["name"] = fn.name
                     if getattr(fn, "arguments", None):
                         slot["args"] += fn.arguments
-            if getattr(choice, "finish_reason", None) is not None:
+            choice_finish = getattr(choice, "finish_reason", None)
+            if choice_finish is not None:
+                state["finish_reason"] = choice_finish
                 for slot in tool_buf.values():
                     if slot["id"] is None:
                         continue
@@ -245,6 +261,7 @@ class OpenAIProvider(Provider):
                     total_tokens=getattr(usage, "total_tokens", 0) or 0,
                     cache_read_tokens=_openai_cached_tokens(usage),
                 ),
+                finish_reason=state.get("finish_reason"),
             )
 
     def _message_to_api(self, m: Message) -> list[dict[str, Any]]:

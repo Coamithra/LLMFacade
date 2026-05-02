@@ -181,7 +181,12 @@ class OllamaProvider(Provider):
                     )
                 )
         if final:
-            yield StreamEvent(done=True, usage=self._usage_from(chunk, ctx))
+            reason = getattr(chunk, "done_reason", None) or "stop"
+            yield StreamEvent(
+                done=True,
+                usage=self._usage_from(chunk, ctx),
+                finish_reason=reason,
+            )
 
     def _message_to_api(self, m: Message) -> list[dict[str, Any]]:
         if m.role == "tool":
@@ -268,7 +273,7 @@ class OllamaProvider(Provider):
             tool_calls=tool_calls,
             thinking=None,
             usage=self._usage_from(raw, ctx),
-            finish_reason="stop",
+            finish_reason=getattr(raw, "done_reason", None) or "stop",
             model=getattr(raw, "model", ""),
             raw=raw,
         )

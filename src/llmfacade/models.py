@@ -139,3 +139,4 @@ class StreamEvent:
     thinking_block: ThinkingBlock | None = None
     done: bool = False
     usage: Usage | None = None
+    finish_reason: str | None = None

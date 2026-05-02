@@ -34,9 +34,16 @@ def test_subclass_can_override_count_tokens():
     class TwoCharProvider(MockProvider):
         NAME = "twochar"
 
-        def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
+        def count_tokens(
+            self,
+            text: str,
+            *,
+            system: str | None = None,
+            model_id: str | None = None,
+        ) -> int:
             del model_id
-            return max(1, len(text) // 2)
+            combined = len(text) + (len(system) if system else 0)
+            return max(1, combined // 2)
 
         def tokenizer_name(self, *, model_id: str | None = None) -> str:
             del model_id
@@ -149,6 +156,84 @@ def test_anthropic_count_tokens_exact_warns_only_once_per_error_type(monkeypatch
     # Only the first call emits the warning; the second is suppressed by
     # _EXACT_COUNT_FALLBACK_WARNED tracking.
     assert sum("falling back to chars/4" in str(w.message) for w in caught) == 1
+
+
+def test_anthropic_count_tokens_forwards_system_kwarg(monkeypatch):
+    """system= is forwarded to the SDK so role-overhead matches the real send."""
+    p = _make_anthropic_provider(exact=True)
+    captured: dict[str, object] = {}
+
+    def fake_count_tokens(**kwargs: object):
+        captured.update(kwargs)
+        return _FakeCountResult(input_tokens=99)
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", fake_count_tokens)
+    n = p.count_tokens(
+        "user content",
+        system="you are a helpful assistant",
+        model_id="claude-haiku-4-5-20251001",
+    )
+    assert n == 99
+    assert captured["system"] == "you are a helpful assistant"
+    assert captured["messages"] == [{"role": "user", "content": "user content"}]
+
+
+def test_anthropic_count_tokens_no_system_omits_kwarg(monkeypatch):
+    """When system=None we must not pass `system=None` to the SDK."""
+    p = _make_anthropic_provider(exact=True)
+    captured: dict[str, object] = {}
+
+    def fake_count_tokens(**kwargs: object):
+        captured.update(kwargs)
+        return _FakeCountResult(input_tokens=5)
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", fake_count_tokens)
+    p.count_tokens("hi", model_id="claude-haiku-4-5-20251001")
+    assert "system" not in captured
+
+
+def test_anthropic_count_tokens_system_only_still_calls_sdk(monkeypatch):
+    """Even with empty text but non-empty system, hit the SDK so the count
+    reflects system role overhead."""
+    p = _make_anthropic_provider(exact=True)
+    captured: dict[str, object] = {}
+
+    def fake_count_tokens(**kwargs: object):
+        captured.update(kwargs)
+        return _FakeCountResult(input_tokens=12)
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", fake_count_tokens)
+    n = p.count_tokens("", system="be brief.", model_id="claude-haiku-4-5-20251001")
+    assert n == 12
+    assert captured["system"] == "be brief."
+
+
+def test_base_count_tokens_includes_system_in_chars_over_4(mock_provider):
+    """Base chars/4 sums system + text lengths."""
+    # 8 + 8 = 16 chars -> 4 tokens.
+    assert mock_provider.count_tokens("a" * 8, system="b" * 8) == 4
+    # system alone, empty text: 8 chars -> 2 tokens.
+    assert mock_provider.count_tokens("", system="b" * 8) == 2
+    # both empty -> still min 1.
+    assert mock_provider.count_tokens("", system="") == 1
+
+
+def test_model_count_tokens_threads_system_through(monkeypatch):
+    """Model.count_tokens forwards system= to the underlying provider."""
+    p = _make_anthropic_provider(exact=True)
+    captured: dict[str, object] = {}
+
+    def fake(**kwargs: object):
+        captured.update(kwargs)
+        return _FakeCountResult(input_tokens=42)
+
+    monkeypatch.setattr(p._client.messages, "count_tokens", fake)
+    m = p.new_model("claude-sonnet-4-6")
+    n = m.count_tokens("user blob", system="sys prompt")
+    assert n == 42
+    assert captured["system"] == "sys prompt"
+    assert captured["model"] == "claude-sonnet-4-6"
+    assert captured["messages"] == [{"role": "user", "content": "user blob"}]
 
 
 def test_anthropic_model_count_tokens_passes_model_id(monkeypatch):

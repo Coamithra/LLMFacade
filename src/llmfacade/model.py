@@ -90,11 +90,17 @@ class Model:
     def get_capabilities(self) -> set[str]:
         return set(self._supports)
 
-    def count_tokens(self, text: str) -> int:
+    def count_tokens(self, text: str, *, system: str | None = None) -> int:
         """Count tokens in ``text`` using the provider's local tokenizer for
         this model. Convenience wrapper around ``provider.count_tokens(text,
-        model_id=self.model_id)``."""
-        return self._provider.count_tokens(text, model_id=self._model_id)
+        system=..., model_id=self.model_id)``.
+
+        Pass ``system=`` to count a system prompt alongside ``text`` (the
+        Anthropic provider with ``exact_count_tokens=True`` forwards it as
+        the SDK's ``system=`` kwarg so role overhead matches the actual
+        generation call; other providers add the local count of ``system``
+        to ``text``)."""
+        return self._provider.count_tokens(text, system=system, model_id=self._model_id)
 
     def tokenizer_name(self) -> str:
         """Label of the tokenizer ``count_tokens`` will use for this model."""

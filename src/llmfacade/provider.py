@@ -257,18 +257,32 @@ class Provider:
     def _init_client(self) -> None:
         """Subclasses override to construct their SDK client."""
 
-    def count_tokens(self, text: str, *, model_id: str | None = None) -> int:
+    def count_tokens(
+        self,
+        text: str,
+        *,
+        system: str | None = None,
+        model_id: str | None = None,
+    ) -> int:
         """Count tokens in ``text`` using the provider's best available local
         tokenizer. Default base implementation is ``chars / 4`` (coarse,
         English-biased). Subclasses override with a real local tokenizer where
         one is available — see ``OpenAIProvider`` (tiktoken) and
         ``GoogleProvider`` (sentencepiece via ``google-genai[local-tokenizer]``).
 
-        Always local — never makes a network call. For exact counts on
-        providers without a local tokenizer (e.g. Anthropic), call the SDK's
-        ``count_tokens`` endpoint directly."""
+        ``system`` is an optional system-prompt string that will be counted
+        alongside ``text`` so callers can size budgets without concatenating
+        the system prompt into the user message themselves. Providers that
+        forward to a server-side counter (Anthropic) pass it through with
+        proper role overhead; providers with local tokenizers add it to the
+        local token count. The base ``chars/4`` implementation simply sums
+        the character lengths.
+
+        Always local — never makes a network call (except Anthropic with
+        ``exact_count_tokens=True``)."""
         del model_id
-        return max(1, len(text) // 4)
+        combined_len = len(text) + (len(system) if system else 0)
+        return max(1, combined_len // 4)
 
     def tokenizer_name(self, *, model_id: str | None = None) -> str:
         """Human-readable label for the tokenizer ``count_tokens`` will use.
