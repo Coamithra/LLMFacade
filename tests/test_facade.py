@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from llmfacade import LLM
@@ -30,6 +31,42 @@ def test_reset_default_creates_fresh_instance():
     LLM.reset_default()
     second = LLM.default()
     assert first is not second
+
+
+def test_default_is_thread_safe_under_concurrent_first_call():
+    """Concurrent first-touch callers must all receive the same instance and
+    LLM.__init__ must run exactly once."""
+    LLM.reset_default()
+
+    init_count = 0
+    original_init = LLM.__init__
+
+    def counting_init(self, *args, **kwargs):
+        nonlocal init_count
+        init_count += 1
+        original_init(self, *args, **kwargs)
+
+    LLM.__init__ = counting_init
+    try:
+        n = 50
+        barrier = threading.Barrier(n)
+        results: list[LLM] = [None] * n  # type: ignore[list-item]
+
+        def worker(i: int) -> None:
+            barrier.wait()
+            results[i] = LLM.default()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        LLM.__init__ = original_init
+
+    assert init_count == 1
+    first = results[0]
+    assert all(r is first for r in results)
 
 
 def test_log_dir_defaults_to_cwd_logs(tmp_path, monkeypatch):

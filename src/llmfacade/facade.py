@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as _dt
 import importlib
 import shutil
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,7 @@ class LLM:
     inside ``log_dir``. Older ones are deleted on first write."""
 
     _default: LLM | None = None
+    _default_lock: threading.Lock = threading.Lock()
 
     def __init__(
         self,
@@ -90,7 +92,9 @@ class LLM:
     @classmethod
     def default(cls) -> LLM:
         if cls._default is None:
-            cls._default = cls()
+            with cls._default_lock:
+                if cls._default is None:
+                    cls._default = cls()
         return cls._default
 
     @classmethod
