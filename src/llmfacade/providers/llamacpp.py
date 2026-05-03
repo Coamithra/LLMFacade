@@ -4,6 +4,7 @@ import json as _json
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote as _urlquote
 
 from llmfacade.exceptions import (
     ProviderError,
@@ -694,62 +695,182 @@ class LlamaCppServerProvider(Provider):
 
     # ---- introspection ----------------------------------------------------
 
-    def health(self) -> dict[str, Any]:
-        """``GET /health``. Returns the parsed JSON body. Raises
-        ``ProviderError`` on a 4xx or 5xx response."""
-        self._ensure_supervised()
-        return self._http_get("/health")
+    def _resolve_introspection_target(self, model: str | None) -> str:
+        """Return the path prefix to prepend to a llama-server-native endpoint.
 
-    async def ahealth(self) -> dict[str, Any]:
-        self._ensure_supervised()
-        return await self._ahttp_get("/health")
+        External mode: returns ``""`` and silently ignores ``model`` (bare
+        llama-server has no model routing; passing ``model=`` against external
+        mode is documented-harmless and parallel to how
+        ``count_tokens(model_id=...)`` is ignored in external mode — keeps
+        ``Model``-bound mirrors working uniformly across modes).
 
-    def slots(self) -> list[dict[str, Any]]:
+        Managed mode: returns ``"/upstream/<urlquoted-model>"``. An explicit
+        ``model`` is passed through verbatim without checking the supervisor's
+        registered entries — llama-swap loads on demand and the user may
+        legitimately reference an entry from a hand-edited ``swap.yaml`` that
+        ``-watch-config`` picked up. Resolves ``None`` by inferring iff
+        exactly one entry is registered, else raises ``ValueError`` listing
+        the registered ids."""
+        if not self._managed:
+            return ""
+        if model is None:
+            # Hold the supervisor's lock for the read so a concurrent
+            # register() can't make the "exactly one" check stale by the time
+            # we pick the inferred id. The lock is reentrant.
+            if self._supervisor is None:
+                entries: list[_LaunchEntry] = []
+            else:
+                with self._supervisor._lock:
+                    entries = list(self._supervisor._entries)
+            if not entries:
+                raise ValueError(
+                    "managed-mode introspection requires a model=<id> argument; "
+                    "no models are registered on this provider yet."
+                )
+            if len(entries) > 1:
+                names = [e.model_id for e in entries]
+                raise ValueError(
+                    "managed-mode introspection on a multi-model provider "
+                    f"requires model=<id>; registered: {names!r}"
+                )
+            model = entries[0].model_id
+        # safe="" so author/model-style ids get %2F-escaped and llama-swap
+        # parses the slash inside the model id, not as another path segment.
+        return f"/upstream/{_urlquote(model, safe='')}"
+
+    def health(self, *, model: str | None = None) -> dict[str, Any]:
+        """``GET /health``.
+
+        With no ``model`` arg in managed mode, hits llama-swap's own
+        ``/health`` (returns plain text ``"OK"``) and normalises the result to
+        ``{"status": "ok"}``. With a ``model`` arg (or via ``Model.health()``),
+        forwards through ``/upstream/<model>/health`` and returns the
+        backend's JSON body. In external mode hits the bare server's
+        ``/health`` directly."""
+        self._ensure_supervised()
+        if self._managed and model is None:
+            return self._swap_root_health_sync()
+        prefix = self._resolve_introspection_target(model)
+        return self._http_get(f"{prefix}/health")
+
+    async def ahealth(self, *, model: str | None = None) -> dict[str, Any]:
+        self._ensure_supervised()
+        if self._managed and model is None:
+            return await self._swap_root_health_async()
+        prefix = self._resolve_introspection_target(model)
+        return await self._ahttp_get(f"{prefix}/health")
+
+    def _swap_root_health_sync(self) -> dict[str, Any]:
+        # llama-swap's own /health returns plain text "OK", not JSON. Don't
+        # route through _http_get (which insists on JSON) — handle it inline.
+        if self._http is None:
+            raise ProviderError(
+                "HTTP client not initialised (managed-mode supervisor not started yet)"
+            )
+        try:
+            resp = self._http.get("/health")
+        except Exception as e:
+            raise ProviderError(f"GET /health failed: {e}", original=e) from e
+        return self._normalise_swap_health(resp)
+
+    async def _swap_root_health_async(self) -> dict[str, Any]:
+        if self._ahttp is None:
+            raise ProviderError(
+                "HTTP client not initialised (managed-mode supervisor not started yet)"
+            )
+        try:
+            resp = await self._ahttp.get("/health")
+        except Exception as e:
+            raise ProviderError(f"GET /health failed: {e}", original=e) from e
+        return self._normalise_swap_health(resp)
+
+    def _normalise_swap_health(self, resp: Any) -> dict[str, Any]:
+        import contextlib
+
+        status = getattr(resp, "status_code", None)
+        if status is None or status >= 400:
+            body = ""
+            with contextlib.suppress(Exception):
+                body = resp.text
+            raise ProviderError(f"GET /health returned status {status}: {body}")
+        body = getattr(resp, "text", "") or ""
+        # httpx.Response.text is always str, but be defensive — a streaming
+        # response that hasn't been .read() can yield bytes through .content
+        # paths and a fake might too; equality against "OK" silently fails on
+        # bytes and would leak `{"status": b"OK"}` to the caller.
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", errors="replace")
+        body = body.strip()
+        return {"status": "ok"} if body.upper() == "OK" else {"status": body}
+
+    def slots(self, *, model: str | None = None) -> list[dict[str, Any]]:
         """``GET /slots``. Per-slot processing state, sampling params, token
-        counts, and generation speed."""
+        counts, and generation speed. In managed mode pass ``model=`` (or use
+        ``Model.slots()``) to pick the backend."""
         self._ensure_supervised()
-        data = self._http_get("/slots")
+        prefix = self._resolve_introspection_target(model)
+        data = self._http_get(f"{prefix}/slots")
         return data if isinstance(data, list) else []
 
-    async def aslots(self) -> list[dict[str, Any]]:
+    async def aslots(self, *, model: str | None = None) -> list[dict[str, Any]]:
         self._ensure_supervised()
-        data = await self._ahttp_get("/slots")
+        prefix = self._resolve_introspection_target(model)
+        data = await self._ahttp_get(f"{prefix}/slots")
         return data if isinstance(data, list) else []
 
-    def save_slot(self, id_slot: int, filename: str) -> dict[str, Any]:
+    def save_slot(
+        self, id_slot: int, filename: str, *, model: str | None = None
+    ) -> dict[str, Any]:
         """``POST /slots/{id_slot}?action=save`` body ``{"filename": filename}``.
-        ``filename`` is interpreted relative to the server's
-        ``--slot-save-path`` directory."""
+        ``filename`` is interpreted relative to that backend's
+        ``--slot-save-path`` directory (which differs across registered
+        managed-mode models)."""
         self._ensure_supervised()
+        prefix = self._resolve_introspection_target(model)
         return self._http_post(
-            f"/slots/{id_slot}", params={"action": "save"}, json={"filename": filename}
+            f"{prefix}/slots/{id_slot}", params={"action": "save"}, json={"filename": filename}
         )
 
-    async def asave_slot(self, id_slot: int, filename: str) -> dict[str, Any]:
+    async def asave_slot(
+        self, id_slot: int, filename: str, *, model: str | None = None
+    ) -> dict[str, Any]:
         self._ensure_supervised()
+        prefix = self._resolve_introspection_target(model)
         return await self._ahttp_post(
-            f"/slots/{id_slot}", params={"action": "save"}, json={"filename": filename}
+            f"{prefix}/slots/{id_slot}", params={"action": "save"}, json={"filename": filename}
         )
 
-    def restore_slot(self, id_slot: int, filename: str) -> dict[str, Any]:
+    def restore_slot(
+        self, id_slot: int, filename: str, *, model: str | None = None
+    ) -> dict[str, Any]:
         self._ensure_supervised()
+        prefix = self._resolve_introspection_target(model)
         return self._http_post(
-            f"/slots/{id_slot}", params={"action": "restore"}, json={"filename": filename}
+            f"{prefix}/slots/{id_slot}",
+            params={"action": "restore"},
+            json={"filename": filename},
         )
 
-    async def arestore_slot(self, id_slot: int, filename: str) -> dict[str, Any]:
+    async def arestore_slot(
+        self, id_slot: int, filename: str, *, model: str | None = None
+    ) -> dict[str, Any]:
         self._ensure_supervised()
+        prefix = self._resolve_introspection_target(model)
         return await self._ahttp_post(
-            f"/slots/{id_slot}", params={"action": "restore"}, json={"filename": filename}
+            f"{prefix}/slots/{id_slot}",
+            params={"action": "restore"},
+            json={"filename": filename},
         )
 
-    def erase_slot(self, id_slot: int) -> dict[str, Any]:
+    def erase_slot(self, id_slot: int, *, model: str | None = None) -> dict[str, Any]:
         self._ensure_supervised()
-        return self._http_post(f"/slots/{id_slot}", params={"action": "erase"})
+        prefix = self._resolve_introspection_target(model)
+        return self._http_post(f"{prefix}/slots/{id_slot}", params={"action": "erase"})
 
-    async def aerase_slot(self, id_slot: int) -> dict[str, Any]:
+    async def aerase_slot(self, id_slot: int, *, model: str | None = None) -> dict[str, Any]:
         self._ensure_supervised()
-        return await self._ahttp_post(f"/slots/{id_slot}", params={"action": "erase"})
+        prefix = self._resolve_introspection_target(model)
+        return await self._ahttp_post(f"{prefix}/slots/{id_slot}", params={"action": "erase"})
 
     # ---- llama-swap-native introspection ---------------------------------
 
@@ -860,18 +981,15 @@ class LlamaCppServerProvider(Provider):
         model_id: str | None = None,
     ) -> int:
         """Count tokens by calling the running llama-server's ``/tokenize``
-        endpoint. Falls back to ``chars/4`` if the server is unreachable so
-        logging never blocks on a transient network error.
-
-        Note: in managed mode this routes through llama-swap, which may forward
-        ``/tokenize`` to the active backend or 404 — either way the fall-back
-        keeps logging working."""
-        del model_id
+        endpoint. Falls back to ``chars/4`` if the server is unreachable, the
+        endpoint 404s, or (in managed mode) no model is registered/specified
+        so the routing helper raises — logging never blocks on these."""
         combined = text + (system or "")
         if self._http is None:
             return super().count_tokens(text, system=system)
         try:
-            resp = self._http.post("/tokenize", json={"content": combined})
+            prefix = self._resolve_introspection_target(model_id)
+            resp = self._http.post(f"{prefix}/tokenize", json={"content": combined})
             resp.raise_for_status()
             data = resp.json()
         except Exception:

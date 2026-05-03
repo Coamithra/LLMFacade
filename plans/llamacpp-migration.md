@@ -310,11 +310,9 @@ In **managed** mode they hit the supervised llama-swap directly. In **external**
 
 ### Introspection routing (`slots`, `save_slot`, etc.)
 
-Existing Phase 1 introspection methods route to `self._http_base`. In managed mode that's llama-swap's port. **Whether llama-swap proxies non-OpenAI paths to the active backend is unverified.**
+**Resolved.** Verified against a live `llama-swap` (see `testapp/probe_swap_introspection.py`): llama-swap does **not** proxy `/health` (returns its own plain-text "OK"), `/slots`, `/tokenize`, or `/slots/{id}?action=*` via the bare URL — all 404. **However**, llama-swap exposes `/upstream/<model_id>/<arbitrary-path>` which forwards to the named backend with on-demand load. The neither-mode-works-the-same outcome is therefore avoidable: we route managed-mode per-backend introspection through `/upstream/`, leaving external mode unchanged.
 
-Plan: keep `_http_base` routing, observe behaviour in the first integration test. Two outcomes:
-- **llama-swap forwards**: introspection works in both modes; no code change.
-- **llama-swap 404s**: document "introspection methods only work in external mode" as a known limitation. We do **not** preemptively add an `introspection_base_url=` kwarg; revisit if it turns out to be a real ergonomic problem.
+Implementation lives in the follow-up plan (`~/.claude/plans/starry-leaping-liskov.md`): adds `model: str | None = None` kwarg to provider introspection methods, mirrors them on `Model` (auto-binding the id, like `Model.count_tokens`), special-cases `provider.health()` no-arg to return the swap's own health normalized to `{"status": "ok"}`, and fixes `count_tokens` to actually use `model_id` in managed mode (was silently degrading to chars/4).
 
 ### Logging
 

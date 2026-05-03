@@ -497,3 +497,401 @@ def test_managed_mode_shutdown_no_op_when_never_started(tmp_path: Path) -> None:
 def test_external_mode_shutdown_no_op() -> None:
     p = LlamaCppServerProvider(base_url="http://x:0/v1")
     p.shutdown()  # supervisor is None; should just no-op
+
+
+# ---- managed-mode introspection routing ----------------------------------
+#
+# These verify that managed-mode wrappers prepend ``/upstream/<model>/...``
+# and that the model resolver picks the right entry. We populate
+# ``_supervisor._entries`` directly (bypassing ``new_model``'s file checks)
+# and inject a fake httpx client so nothing actually spawns.
+
+
+class _CapturingHttp:
+    """Records the most recent .get/.post call without doing any I/O."""
+
+    def __init__(self, response: _FakeHttpResponse | None = None) -> None:
+        self.response = response or _FakeHttpResponse(json_body={"ok": True})
+        self.calls: list[dict[str, Any]] = []
+
+    def get(self, path: str) -> _FakeHttpResponse:
+        self.calls.append({"method": "GET", "path": path})
+        return self.response
+
+    def post(self, path: str, *, params: Any = None, json: Any = None) -> _FakeHttpResponse:
+        self.calls.append({"method": "POST", "path": path, "params": params, "json": json})
+        return self.response
+
+
+def _managed_provider_with_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *names: str
+) -> LlamaCppServerProvider:
+    """Build a managed-mode provider with the named launch entries already
+    registered, with `_ensure_supervised` neutralised. Caller still needs to
+    set `_http`/`_ahttp` to a fake."""
+    from llmfacade.providers._launch import _LaunchEntry
+
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    for n in names:
+        gguf = tmp_path / f"{n}.gguf"
+        gguf.write_bytes(b"x")
+        # Go through the public register() API rather than poking _entries
+        # directly so tests catch any future validation/side-effect added to
+        # registration.
+        p._supervisor.register(_LaunchEntry(model_id=n, gguf=str(gguf)))  # type: ignore[union-attr]
+    # Neutralise the lazy-spawn so introspection methods don't try to start
+    # llama-swap. The wrappers all call self._ensure_supervised() first.
+    monkeypatch.setattr(p, "_ensure_supervised", lambda: None)
+    return p
+
+
+def test_managed_resolve_zero_entries_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="no models are registered"):
+        p._resolve_introspection_target(None)
+
+
+def test_managed_resolve_single_entry_inferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "qwen-fast")
+    assert p._resolve_introspection_target(None) == "/upstream/qwen-fast"
+
+
+def test_managed_resolve_multi_entry_requires_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "fast", "quality")
+    with pytest.raises(ValueError, match="requires model="):
+        p._resolve_introspection_target(None)
+
+
+def test_managed_resolve_explicit_model_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "fast", "quality")
+    # Even with multiple entries, an explicit model just gets used as-is.
+    assert p._resolve_introspection_target("explicit") == "/upstream/explicit"
+
+
+def test_managed_resolve_url_quotes_slash_in_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    # Don't register the entry — pass model= explicitly. urlquote should
+    # escape the slash so llama-swap parses the slash as part of the model id
+    # rather than as a path separator.
+    assert p._resolve_introspection_target("Qwen/Qwen2.5-3B") == "/upstream/Qwen%2FQwen2.5-3B"
+
+
+def test_external_resolve_returns_empty_prefix() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    # External mode silently ignores the model arg.
+    assert p._resolve_introspection_target(None) == ""
+    assert p._resolve_introspection_target("anything") == ""
+
+
+def test_managed_slots_routes_through_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "qwen-fast")
+    fake = [{"id": 0, "is_processing": False}]
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body=fake))
+    out = p.slots()
+    assert out == fake
+    assert p._http.calls == [{"method": "GET", "path": "/upstream/qwen-fast/slots"}]
+
+
+def test_managed_slots_explicit_model_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "a", "b")
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body=[]))
+    p.slots(model="b")
+    assert p._http.calls == [{"method": "GET", "path": "/upstream/b/slots"}]
+
+
+def test_managed_slots_zero_entries_no_model_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp()
+    with pytest.raises(ValueError):
+        p.slots()
+
+
+def test_managed_health_no_model_normalises_swap_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "anything")
+    # llama-swap's own /health returns the literal text "OK".
+    p._http = _CapturingHttp(_FakeHttpResponse(text="OK\n"))
+    assert p.health() == {"status": "ok"}
+    # No /upstream/ prefix when probing swap-root health.
+    assert p._http.calls == [{"method": "GET", "path": "/health"}]
+
+
+def test_managed_health_no_model_handles_bytes_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defensive: if a fake or weird httpx state yields bytes for `.text`,
+    `_normalise_swap_health` decodes before comparing."""
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "anything")
+    p._http = _CapturingHttp(_FakeHttpResponse(text=b"OK"))  # type: ignore[arg-type]
+    assert p.health() == {"status": "ok"}
+
+
+def test_managed_health_with_model_routes_through_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"status": "ok"}))
+    out = p.health(model="qwen-fast")
+    assert out == {"status": "ok"}
+    assert p._http.calls == [{"method": "GET", "path": "/upstream/qwen-fast/health"}]
+
+
+def test_managed_save_slot_routes_through_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "m")
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    p.save_slot(0, "warmup.bin")
+    assert p._http.calls == [
+        {
+            "method": "POST",
+            "path": "/upstream/m/slots/0",
+            "params": {"action": "save"},
+            "json": {"filename": "warmup.bin"},
+        }
+    ]
+
+
+def test_managed_erase_slot_no_body(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "m")
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    p.erase_slot(0)
+    assert p._http.calls[0]["json"] is None
+    assert p._http.calls[0]["path"] == "/upstream/m/slots/0"
+    assert p._http.calls[0]["params"] == {"action": "erase"}
+
+
+def test_managed_count_tokens_uses_upstream_tokenize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "m")
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"tokens": [1, 2, 3]}))
+    assert p.count_tokens("hello world") == 3
+    assert p._http.calls[0]["path"] == "/upstream/m/tokenize"
+    assert p._http.calls[0]["json"] == {"content": "hello world"}
+
+
+def test_managed_count_tokens_no_entries_falls_back_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp()
+    # Resolver raises because there are no entries; the wrapper swallows it
+    # and returns chars/4 (11 // 4 == 2). No HTTP call should be made.
+    assert p.count_tokens("hello world") == 2
+    assert p._http.calls == []
+
+
+def test_managed_count_tokens_with_explicit_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "a", "b")
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"tokens": [9, 9]}))
+    assert p.count_tokens("xy", model_id="b") == 2
+    assert p._http.calls[0]["path"] == "/upstream/b/tokenize"
+
+
+# ---- Model-bound mirrors --------------------------------------------------
+
+
+def test_model_slots_passes_model_id_to_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "qwen-fast")
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body=[{"id": 0}]))
+    # Use the entries we registered. Build a Model object the way new_model
+    # would, but skip the launch validation by going through the constructor
+    # (the entry already exists).
+    from llmfacade.model import Model
+
+    m = Model(provider=p, model_id="qwen-fast")
+    assert m.slots() == [{"id": 0}]
+    assert p._http.calls[0]["path"] == "/upstream/qwen-fast/slots"
+
+
+def test_model_health_passes_model_id_to_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"status": "ok"}))
+    from llmfacade.model import Model
+
+    m = Model(provider=p, model_id="anything")
+    m.health()
+    # Should hit /upstream/, not the swap-root /health.
+    assert p._http.calls[0]["path"] == "/upstream/anything/health"
+
+
+def test_model_save_slot_forwards_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    from llmfacade.model import Model
+
+    m = Model(provider=p, model_id="qwen-fast")
+    m.save_slot(2, "snap.bin")
+    call = p._http.calls[0]
+    assert call["path"] == "/upstream/qwen-fast/slots/2"
+    assert call["json"] == {"filename": "snap.bin"}
+    assert call["params"] == {"action": "save"}
+
+
+def test_model_count_tokens_already_passes_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing precedent (Model.count_tokens binds self._model_id) — verify
+    it still routes correctly through the new managed-mode prefix."""
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"tokens": [1, 2, 3, 4]}))
+    from llmfacade.model import Model
+
+    m = Model(provider=p, model_id="some-model")
+    assert m.count_tokens("hello") == 4
+    assert p._http.calls[0]["path"] == "/upstream/some-model/tokenize"
+
+
+def test_model_health_against_non_llamacpp_provider_raises_unsupported() -> None:
+    """Calling Model.health() when the provider doesn't expose health()
+    should raise UnsupportedFeature (codebase convention for capability
+    gaps), not AttributeError."""
+    from types import SimpleNamespace
+
+    from llmfacade.exceptions import UnsupportedFeature
+    from llmfacade.model import Model
+
+    # Model.__init__ reads .NAME and .SUPPORTS off the provider; need both.
+    fake_provider = SimpleNamespace(NAME="madeup", SUPPORTS=frozenset())
+    m = Model(provider=fake_provider, model_id="x")  # type: ignore[arg-type]
+    with pytest.raises(UnsupportedFeature, match="health"):
+        m.health()
+
+
+# ---- async coverage of the new introspection paths ----------------------
+#
+# The sync wrappers above all have async siblings (`ahealth`, `aslots`,
+# `asave_slot`, `arestore_slot`, `aerase_slot`, plus
+# `_swap_root_health_async` and the Model mirrors `aslots`/`ahealth`/etc.).
+# These exercise the async branch end-to-end, including the bytes-safe
+# normalisation path and the `/upstream/` prefix for both the provider
+# methods and the Model mirrors.
+
+
+class _AsyncCapturingHttp:
+    """Async sibling of `_CapturingHttp`. Mirrors the same attributes so the
+    same assertion helpers work."""
+
+    def __init__(self, response: _FakeHttpResponse | None = None) -> None:
+        self.response = response or _FakeHttpResponse(json_body={"ok": True})
+        self.calls: list[dict[str, Any]] = []
+
+    async def get(self, path: str) -> _FakeHttpResponse:
+        self.calls.append({"method": "GET", "path": path})
+        return self.response
+
+    async def post(self, path: str, *, params: Any = None, json: Any = None) -> _FakeHttpResponse:
+        self.calls.append({"method": "POST", "path": path, "params": params, "json": json})
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_managed_aslots_routes_through_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "qwen-fast")
+    fake = [{"id": 0}]
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body=fake))
+    out = await p.aslots()
+    assert out == fake
+    assert p._ahttp.calls == [{"method": "GET", "path": "/upstream/qwen-fast/slots"}]
+
+
+@pytest.mark.asyncio
+async def test_managed_ahealth_no_model_normalises_swap_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "anything")
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(text="OK"))
+    assert (await p.ahealth()) == {"status": "ok"}
+    assert p._ahttp.calls == [{"method": "GET", "path": "/health"}]
+
+
+@pytest.mark.asyncio
+async def test_managed_ahealth_with_model_routes_through_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body={"status": "ok"}))
+    assert (await p.ahealth(model="x")) == {"status": "ok"}
+    assert p._ahttp.calls == [{"method": "GET", "path": "/upstream/x/health"}]
+
+
+@pytest.mark.asyncio
+async def test_managed_aerase_slot_no_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "m")
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    await p.aerase_slot(0)
+    call = p._ahttp.calls[0]
+    assert call["json"] is None
+    assert call["path"] == "/upstream/m/slots/0"
+    assert call["params"] == {"action": "erase"}
+
+
+@pytest.mark.asyncio
+async def test_managed_asave_slot_routes_through_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "m")
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    await p.asave_slot(0, "warmup.bin")
+    assert p._ahttp.calls == [
+        {
+            "method": "POST",
+            "path": "/upstream/m/slots/0",
+            "params": {"action": "save"},
+            "json": {"filename": "warmup.bin"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_aslots_passes_model_id_to_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "qwen-fast")
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body=[{"id": 0}]))
+    from llmfacade.model import Model
+
+    m = Model(provider=p, model_id="qwen-fast")
+    assert (await m.aslots()) == [{"id": 0}]
+    assert p._ahttp.calls[0]["path"] == "/upstream/qwen-fast/slots"
+
+
+@pytest.mark.asyncio
+async def test_model_ahealth_against_non_llamacpp_provider_raises_unsupported() -> None:
+    from types import SimpleNamespace
+
+    from llmfacade.exceptions import UnsupportedFeature
+    from llmfacade.model import Model
+
+    fake_provider = SimpleNamespace(NAME="madeup", SUPPORTS=frozenset())
+    m = Model(provider=fake_provider, model_id="x")  # type: ignore[arg-type]
+    with pytest.raises(UnsupportedFeature, match="ahealth"):
+        await m.ahealth()

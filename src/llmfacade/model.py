@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from llmfacade.exceptions import UnsupportedFeature
 from llmfacade.provider import _validate_knobs
 
 if TYPE_CHECKING:
@@ -107,6 +108,60 @@ class Model:
     def tokenizer_name(self) -> str:
         """Label of the tokenizer ``count_tokens`` will use for this model."""
         return self._provider.tokenizer_name(model_id=self._model_id)
+
+    # ---- llamacpp-only introspection passthroughs --------------------------
+    # Each binds self._model_id and forwards to the provider, mirroring the
+    # count_tokens pattern above. The provider must expose the corresponding
+    # method (only LlamaCppServerProvider does today); duck-typed via
+    # _require_provider_method to avoid the circular import that an isinstance
+    # check would need, and surfaces UnsupportedFeature on miss to match the
+    # codebase's cross-provider capability-gating idiom.
+
+    def _require_provider_method(self, name: str) -> Any:
+        method = getattr(self._provider, name, None)
+        if method is None:
+            raise UnsupportedFeature(name, self._provider.NAME, self._model_id)
+        return method
+
+    def health(self) -> dict[str, Any]:
+        """Backend health for this specific model. llamacpp-only."""
+        return self._require_provider_method("health")(model=self._model_id)
+
+    async def ahealth(self) -> dict[str, Any]:
+        return await self._require_provider_method("ahealth")(model=self._model_id)
+
+    def slots(self) -> list[dict[str, Any]]:
+        """Per-slot processing state for this model's backend. llamacpp-only."""
+        return self._require_provider_method("slots")(model=self._model_id)
+
+    async def aslots(self) -> list[dict[str, Any]]:
+        return await self._require_provider_method("aslots")(model=self._model_id)
+
+    def save_slot(self, id_slot: int, filename: str) -> dict[str, Any]:
+        """Save the KV cache for ``id_slot`` to ``filename`` (relative to
+        this model's ``--slot-save-path``). llamacpp-only."""
+        return self._require_provider_method("save_slot")(id_slot, filename, model=self._model_id)
+
+    async def asave_slot(self, id_slot: int, filename: str) -> dict[str, Any]:
+        return await self._require_provider_method("asave_slot")(
+            id_slot, filename, model=self._model_id
+        )
+
+    def restore_slot(self, id_slot: int, filename: str) -> dict[str, Any]:
+        return self._require_provider_method("restore_slot")(
+            id_slot, filename, model=self._model_id
+        )
+
+    async def arestore_slot(self, id_slot: int, filename: str) -> dict[str, Any]:
+        return await self._require_provider_method("arestore_slot")(
+            id_slot, filename, model=self._model_id
+        )
+
+    def erase_slot(self, id_slot: int) -> dict[str, Any]:
+        return self._require_provider_method("erase_slot")(id_slot, model=self._model_id)
+
+    async def aerase_slot(self, id_slot: int) -> dict[str, Any]:
+        return await self._require_provider_method("aerase_slot")(id_slot, model=self._model_id)
 
     def new_conversation(
         self,
