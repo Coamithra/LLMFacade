@@ -52,10 +52,10 @@ def google_api_key() -> None:
 
 
 @pytest.fixture
-def ollama_host() -> str:
-    return os.getenv("OLLAMA_HOST", "http://localhost:11434")
+def llamacpp_host() -> str:
+    return os.getenv("LLAMACPP_HOST", "http://localhost:8080")
 
 
 @pytest.fixture
-def ollama_model() -> str:
-    return os.getenv("OLLAMA_TEST_MODEL", "qwen3.5:4b")
+def llamacpp_model() -> str:
+    return os.getenv("LLAMACPP_MODEL", "qwen2.5-3b-instruct-q4_k_m")

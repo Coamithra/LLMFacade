@@ -32,7 +32,6 @@ class GoogleProvider(Provider):
     API_KEY_ENV = "GOOGLE_API_KEY"
     SUPPORTS: frozenset[str] = frozenset(
         {
-            "context_size",
             "max_tokens",
             "temperature",
             "top_p",

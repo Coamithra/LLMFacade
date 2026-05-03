@@ -128,6 +128,7 @@ class Provider:
         max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
         thinking: int | None = None,
@@ -137,8 +138,6 @@ class Provider:
         auto_cache_last_user: bool | None = None,
         auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
-        keep_alive: str | int | None = None,
-        context_size: int | None = None,
         tool_choice: str | None = None,
     ):
         self._manager = manager
@@ -153,6 +152,7 @@ class Provider:
                 "max_tokens": max_tokens,
                 "top_p": top_p,
                 "top_k": top_k,
+                "min_p": min_p,
                 "repeat_penalty": repeat_penalty,
                 "effort": effort,
                 "thinking": thinking,
@@ -162,8 +162,6 @@ class Provider:
                 "auto_cache_last_user": auto_cache_last_user,
                 "auto_cache_tools": auto_cache_tools,
                 "beta_headers": beta_headers,
-                "keep_alive": keep_alive,
-                "context_size": context_size,
                 "tool_choice": tool_choice,
             },
             self.SUPPORTS,
@@ -191,6 +189,7 @@ class Provider:
         max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
         thinking: int | None = None,
@@ -200,8 +199,6 @@ class Provider:
         auto_cache_last_user: bool | None = None,
         auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
-        keep_alive: str | int | None = None,
-        context_size: int | None = None,
         tool_choice: str | None = None,
     ) -> Model:
         from llmfacade.model import Model
@@ -211,6 +208,7 @@ class Provider:
             "max_tokens": max_tokens,
             "top_p": top_p,
             "top_k": top_k,
+            "min_p": min_p,
             "repeat_penalty": repeat_penalty,
             "effort": effort,
             "thinking": thinking,
@@ -220,8 +218,6 @@ class Provider:
             "auto_cache_last_user": auto_cache_last_user,
             "auto_cache_tools": auto_cache_tools,
             "beta_headers": beta_headers,
-            "keep_alive": keep_alive,
-            "context_size": context_size,
             "tool_choice": tool_choice,
         }
         return Model(

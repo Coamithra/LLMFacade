@@ -2,10 +2,9 @@
 
 Drives a `CompletionRequest` through each provider's `_build_kwargs` and
 asserts the SDK-shaped `tool_choice` it produces. Covers all four call-site
-values (`"auto"`, `"required"`, `"none"`, named tool) for the providers that
-support forced selection (Anthropic, OpenAI, Google), the gating rule that
-`tool_choice` config is only emitted when `req.tools` is non-empty, and the
-cascade-level rejection for Ollama (which has no forced-selection API)."""
+values (`"auto"`, `"required"`, `"none"`, named tool) for every provider
+(Anthropic, OpenAI, Google, llamacpp), and the gating rule that
+`tool_choice` config is only emitted when `req.tools` is non-empty."""
 
 from __future__ import annotations
 
@@ -16,7 +15,7 @@ from llmfacade.exceptions import UnsupportedFeature
 from llmfacade.provider import CompletionRequest
 from llmfacade.providers.anthropic import AnthropicProvider
 from llmfacade.providers.google import GoogleProvider
-from llmfacade.providers.ollama import OllamaProvider
+from llmfacade.providers.llamacpp import LlamaCppServerProvider
 from llmfacade.providers.openai import OpenAIProvider
 
 
@@ -59,10 +58,11 @@ def google_provider() -> GoogleProvider:
 
 
 @pytest.fixture
-def ollama_provider() -> OllamaProvider:
-    # Ollama doesn't take an api_key, but constructor still requires init; use
-    # a fake host to avoid hitting a real server.
-    return OllamaProvider(base_url="http://invalid.local:0")
+def llamacpp_provider() -> LlamaCppServerProvider:
+    # llama-server doesn't take an api_key, but constructor still creates
+    # the OpenAI client + httpx clients; a fake base_url is fine since
+    # _build_kwargs doesn't actually fire any requests.
+    return LlamaCppServerProvider(base_url="http://invalid.local:0/v1")
 
 
 # --- Anthropic ---
@@ -179,34 +179,52 @@ def test_google_tool_choice_omitted_without_tools(google_provider: GoogleProvide
     assert "tool_config" not in kwargs["config"]
 
 
-# --- Ollama: cascade rejects tool_choice entirely ---
+# --- llamacpp: tool_choice flows through the same as the OpenAI provider ---
 
 
-def test_ollama_does_not_advertise_tool_choice():
-    assert "tool_choice" not in OllamaProvider.SUPPORTS
-    # but it does advertise basic tool calling
-    assert "tools" in OllamaProvider.SUPPORTS
+def test_llamacpp_advertises_tool_choice():
+    assert "tool_choice" in LlamaCppServerProvider.SUPPORTS
+    assert "tools" in LlamaCppServerProvider.SUPPORTS
 
 
-def test_ollama_tool_choice_at_provider_raises():
-    # Setting tool_choice at any layer raises at that layer because the knob
-    # isn't in Ollama's SUPPORTS — same mechanism as e.g. `thinking` on Ollama.
-    with pytest.raises(UnsupportedFeature):
-        OllamaProvider(base_url="http://invalid.local:0", tool_choice="required")
+def test_llamacpp_tool_choice_auto(llamacpp_provider: LlamaCppServerProvider):
+    kwargs = llamacpp_provider._build_kwargs(_req("auto"))
+    assert kwargs["tool_choice"] == "auto"
 
 
-@pytest.mark.parametrize("value", ["auto", "required", "none", "forge_item"])
-def test_ollama_tool_choice_at_model_raises(value: str):
-    provider = OllamaProvider(base_url="http://invalid.local:0")
-    with pytest.raises(UnsupportedFeature):
-        provider.new_model("llama3", tool_choice=value)
+def test_llamacpp_tool_choice_default_is_auto(llamacpp_provider: LlamaCppServerProvider):
+    kwargs = llamacpp_provider._build_kwargs(_req(None))
+    assert kwargs["tool_choice"] == "auto"
 
 
-def test_ollama_tools_can_be_disabled_per_model():
+def test_llamacpp_tool_choice_required(llamacpp_provider: LlamaCppServerProvider):
+    kwargs = llamacpp_provider._build_kwargs(_req("required"))
+    assert kwargs["tool_choice"] == "required"
+
+
+def test_llamacpp_tool_choice_none(llamacpp_provider: LlamaCppServerProvider):
+    kwargs = llamacpp_provider._build_kwargs(_req("none"))
+    assert kwargs["tool_choice"] == "none"
+
+
+def test_llamacpp_tool_choice_named_tool(llamacpp_provider: LlamaCppServerProvider):
+    kwargs = llamacpp_provider._build_kwargs(_req("forge_item"))
+    assert kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "forge_item"},
+    }
+
+
+def test_llamacpp_tool_choice_omitted_without_tools(llamacpp_provider: LlamaCppServerProvider):
+    kwargs = llamacpp_provider._build_kwargs(_req("forge_item", with_tool=False))
+    assert "tool_choice" not in kwargs
+
+
+def test_llamacpp_tools_can_be_disabled_per_model():
     # Models that don't support tool calling at all use capability_override
     # to drop "tools" from their effective SUPPORTS.
-    provider = OllamaProvider(base_url="http://invalid.local:0")
-    narrow_model = provider.new_model("llama2", capability_override=provider.SUPPORTS - {"tools"})
+    provider = LlamaCppServerProvider(base_url="http://invalid.local:0/v1")
+    narrow_model = provider.new_model("qwen2.5", capability_override=provider.SUPPORTS - {"tools"})
     assert "tools" not in narrow_model.get_capabilities()
 
 
@@ -234,8 +252,8 @@ def test_conversation_forced_choice_requires_tools():
 
 def test_conversation_tools_unsupported_raises_at_construction():
     """Convo construction blocks tools=[...] when the model can't do tool calling."""
-    provider = OllamaProvider(base_url="http://invalid.local:0")
-    narrow_model = provider.new_model("llama2", capability_override=provider.SUPPORTS - {"tools"})
+    provider = LlamaCppServerProvider(base_url="http://invalid.local:0/v1")
+    narrow_model = provider.new_model("qwen2.5", capability_override=provider.SUPPORTS - {"tools"})
     with pytest.raises(UnsupportedFeature):
         narrow_model.new_conversation(tools=[forge_item])
 

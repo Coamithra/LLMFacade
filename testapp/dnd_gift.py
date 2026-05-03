@@ -430,11 +430,13 @@ def main() -> None:
     run_pass(haiku, "anthropic")
     run_weather_pass(haiku, "anthropic")
 
-    banner("== Pass 2: Ollama llama3.2:3b (local) ==")
-    ollama = llm.new_provider("ollama", temperature=0.7)
-    local = ollama.new_model("llama3.2:3b", max_tokens=512, context_size=16384)
-    run_pass(local, "ollama")
-    run_weather_pass(local, "ollama")
+    banner("== Pass 2: llama.cpp qwen2.5-3b (local) ==")
+    llamacpp = llm.new_provider(
+        "llamacpp", base_url="http://localhost:8080/v1", temperature=0.7
+    )
+    local = llamacpp.new_model("qwen2.5-3b-instruct-q4_k_m", max_tokens=512)
+    run_pass(local, "llamacpp")
+    run_weather_pass(local, "llamacpp")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ RUNTIME_KNOBS: frozenset[str] = frozenset(
         "max_tokens",
         "top_p",
         "top_k",
+        "min_p",
         "repeat_penalty",
         "effort",
         "thinking",
@@ -40,9 +41,28 @@ RUNTIME_KNOBS: frozenset[str] = frozenset(
         "auto_cache_last_user",
         "auto_cache_tools",
         "beta_headers",
-        "keep_alive",
-        "context_size",
         "tool_choice",
+    }
+)
+
+
+# Server-launch knobs consumed by the llamacpp provider's managed mode (the
+# llama-swap-supervised lifecycle). Valid only at provider/model scope on
+# providers that opt in — never per-call, never on Conversation. Other
+# providers' constructors don't accept these and so reject them via TypeError
+# on unknown kwarg, the same mechanism used today for unrecognised RUNTIME
+# knob names.
+LAUNCH_KNOBS: frozenset[str] = frozenset(
+    {
+        "gguf",
+        "context_size",
+        "cache_type_k",
+        "cache_type_v",
+        "n_gpu_layers",
+        "parallel",
+        "slot_save_path",
+        "ttl",
+        "extra_args",
     }
 )
 
@@ -52,4 +72,5 @@ __all__ = [
     "OutputFormat",
     "EphemeralCacheTTL",
     "RUNTIME_KNOBS",
+    "LAUNCH_KNOBS",
 ]

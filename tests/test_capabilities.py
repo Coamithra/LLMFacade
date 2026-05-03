@@ -11,7 +11,7 @@ from .conftest import MockProvider
 
 def test_provider_capabilities_query():
     p = MockProvider()
-    assert p.is_available("context_size")
+    assert p.is_available("temperature")
     assert "output_format" not in p.get_capabilities()
 
 
@@ -31,7 +31,7 @@ def test_provider_default_propagates_to_request(mock_provider):
 
 
 def test_model_inherits_provider_capabilities(mock_provider, mock_model):
-    assert mock_model.is_available("context_size")
+    assert mock_model.is_available("thinking")
     assert mock_model.get_capabilities() == mock_provider.get_capabilities()
 
 

@@ -159,6 +159,7 @@ class Conversation:
         max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
         thinking: int | None = None,
@@ -168,8 +169,6 @@ class Conversation:
         auto_cache_last_user: bool | None = None,
         auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
-        keep_alive: str | int | None = None,
-        context_size: int | None = None,
         tool_choice: str | None = None,
     ):
         self._model = model
@@ -191,6 +190,7 @@ class Conversation:
                 "max_tokens": max_tokens,
                 "top_p": top_p,
                 "top_k": top_k,
+                "min_p": min_p,
                 "repeat_penalty": repeat_penalty,
                 "effort": effort,
                 "thinking": thinking,
@@ -200,8 +200,6 @@ class Conversation:
                 "auto_cache_last_user": auto_cache_last_user,
                 "auto_cache_tools": auto_cache_tools,
                 "beta_headers": beta_headers,
-                "keep_alive": keep_alive,
-                "context_size": context_size,
                 "tool_choice": tool_choice,
             },
             model._supports,
@@ -384,6 +382,7 @@ class Conversation:
         max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
         thinking: int | None = None,
@@ -393,8 +392,6 @@ class Conversation:
         auto_cache_last_user: bool | None = None,
         auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
-        keep_alive: str | int | None = None,
-        context_size: int | None = None,
     ) -> Response:
         """Send one request to the model and return the response.
 
@@ -407,6 +404,7 @@ class Conversation:
             max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repeat_penalty=repeat_penalty,
             effort=effort,
             thinking=thinking,
@@ -416,8 +414,6 @@ class Conversation:
             auto_cache_last_user=auto_cache_last_user,
             auto_cache_tools=auto_cache_tools,
             beta_headers=beta_headers,
-            keep_alive=keep_alive,
-            context_size=context_size,
             tool_choice=tool_choice,
         )
         self._check_no_dangling_tool_use()
@@ -451,6 +447,7 @@ class Conversation:
         max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
         thinking: int | None = None,
@@ -460,8 +457,6 @@ class Conversation:
         auto_cache_last_user: bool | None = None,
         auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
-        keep_alive: str | int | None = None,
-        context_size: int | None = None,
     ) -> Response:
         """Async equivalent of ``send``."""
         per_call = self._collect_per_call(
@@ -469,6 +464,7 @@ class Conversation:
             max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repeat_penalty=repeat_penalty,
             effort=effort,
             thinking=thinking,
@@ -478,8 +474,6 @@ class Conversation:
             auto_cache_last_user=auto_cache_last_user,
             auto_cache_tools=auto_cache_tools,
             beta_headers=beta_headers,
-            keep_alive=keep_alive,
-            context_size=context_size,
             tool_choice=tool_choice,
         )
         self._check_no_dangling_tool_use()
@@ -513,6 +507,7 @@ class Conversation:
         max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
         thinking: int | None = None,
@@ -522,14 +517,13 @@ class Conversation:
         auto_cache_last_user: bool | None = None,
         auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
-        keep_alive: str | int | None = None,
-        context_size: int | None = None,
     ) -> Iterator[StreamEvent]:
         per_call = self._collect_per_call(
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repeat_penalty=repeat_penalty,
             effort=effort,
             thinking=thinking,
@@ -539,8 +533,6 @@ class Conversation:
             auto_cache_last_user=auto_cache_last_user,
             auto_cache_tools=auto_cache_tools,
             beta_headers=beta_headers,
-            keep_alive=keep_alive,
-            context_size=context_size,
             tool_choice=tool_choice,
         )
         self._check_no_dangling_tool_use()
@@ -602,6 +594,7 @@ class Conversation:
         max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
         thinking: int | None = None,
@@ -611,14 +604,13 @@ class Conversation:
         auto_cache_last_user: bool | None = None,
         auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
-        keep_alive: str | int | None = None,
-        context_size: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         per_call = self._collect_per_call(
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repeat_penalty=repeat_penalty,
             effort=effort,
             thinking=thinking,
@@ -628,8 +620,6 @@ class Conversation:
             auto_cache_last_user=auto_cache_last_user,
             auto_cache_tools=auto_cache_tools,
             beta_headers=beta_headers,
-            keep_alive=keep_alive,
-            context_size=context_size,
             tool_choice=tool_choice,
         )
         self._check_no_dangling_tool_use()

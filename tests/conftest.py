@@ -31,7 +31,6 @@ class MockProvider(Provider):
     NAME = "mock"
     SUPPORTS: frozenset[str] = frozenset(
         {
-            "context_size",
             "max_tokens",
             "temperature",
             "top_p",

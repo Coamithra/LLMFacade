@@ -43,7 +43,6 @@ class OpenAIProvider(Provider):
     API_KEY_ENV = "OPENAI_API_KEY"
     SUPPORTS: frozenset[str] = frozenset(
         {
-            "context_size",
             "max_tokens",
             "temperature",
             "top_p",

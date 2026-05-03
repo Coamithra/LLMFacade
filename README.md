@@ -1,6 +1,6 @@
 # llmfacade
 
-A lean, unified Python interface to multiple LLM providers (Anthropic, OpenAI, Google Gemini, Ollama).
+A lean, unified Python interface to multiple LLM providers (Anthropic, OpenAI, Google Gemini, llama.cpp).
 
 - **Zero required runtime dependencies.** Provider SDKs are lazy-loaded only when used.
 - **Capability-aware settings.** Each provider/model declares what it supports; unsupported knobs raise a clear error instead of being silently dropped.
@@ -54,7 +54,7 @@ Every level exposes `is_available(knob)` and `get_capabilities()` so you can bra
 
 ## Settings cascade
 
-All generation knobs are plain string kwargs (`temperature`, `max_tokens`, `top_p`, `top_k`, `effort`, `thinking`, `output_format`, `auto_cache_last_user`, `cache_ttl`, `user_metadata`, `beta_headers`, `keep_alive`, `context_size`, `repeat_penalty`). Set defaults at any of four scopes:
+All generation knobs are plain string kwargs (`temperature`, `max_tokens`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `effort`, `thinking`, `output_format`, `auto_cache_last_user`, `cache_ttl`, `user_metadata`, `beta_headers`, `tool_choice`). Set defaults at any of four scopes:
 
 ```python
 provider = mgr.new_provider("anthropic", temperature=0.7)        # provider-wide default
@@ -160,7 +160,68 @@ chat = model.new_conversation(log_path="./logs/session.jsonl")
 | Anthropic | `[anthropic]` | `ANTHROPIC_API_KEY` | Extended thinking, prompt caching, system blocks with `cache=True`, `cache_ttl`. Exports `AnthropicModel` enum (`OPUS_4_7`, `SONNET_4_6`, `HAIKU_4_5`) — passing a member to `new_model` auto-applies model id and capability metadata. |
 | OpenAI    | `[openai]`    | `OPENAI_API_KEY`    | `output_format` (JSON mode); `org_id` constructor arg. |
 | Google Gemini | `[google]` | `GOOGLE_API_KEY`   | Registered as both `"google"` and `"gemini"`. |
-| Ollama    | `[ollama]`    | (none)              | `base_url` for remote hosts; `context_size` → `num_ctx`; `max_tokens` → `num_predict`; warns on silent context truncation. |
+| llama.cpp | `[llamacpp]`  | (none)              | Two modes. **External**: `base_url=` points at a `llama-server` (or `llama-swap`) you run yourself — ctx-size, KV quantization, slot-save dir are server-launch flags. **Managed**: omit `base_url=` and the provider owns a `llama-swap` subprocess; pass launch knobs (`gguf=`, `context_size=`, `cache_type_k=`, etc.) at `new_model` and the YAML is generated for you. First-class `min_p`; `top_k`/`min_p`/`repeat_penalty` ride the SDK's `extra_body=`. Introspection: `health()`, `slots()`, `save_slot()`, `restore_slot()`, `erase_slot()`. Managed-mode-only: `running()`, `unload()`, `unload_all()`, `shutdown()`. `count_tokens()` calls the server's `/tokenize`. |
+
+### Installing the binaries
+
+The `llamacpp` provider needs `llama-server` (always) and `llama-swap` (only for managed mode) on `PATH`. They are not pulled in by `pip install llmfacade[llamacpp]`, since they are native binaries.
+
+- **`llama-server`** ships in the [llama.cpp release ZIPs](https://github.com/ggml-org/llama.cpp/releases). Pick the build matching your hardware:
+  - NVIDIA → `llama-*-bin-win-cuda-13.1-x64.zip` plus the matching `cudart-llama-bin-win-cuda-13.1-x64.zip` (extract both into the same folder so the CUDA runtime DLLs sit next to `llama-server.exe`).
+  - AMD / Intel / iGPU / cross-vendor → `llama-*-bin-win-vulkan-x64.zip`. On Windows, `winget install llama.cpp` ships the Vulkan build.
+  - macOS → `brew install llama.cpp`.
+  - Linux → build from source or use a distro package.
+- **`llama-swap`** ships in the [llama-swap release ZIPs](https://github.com/mostlygeek/llama-swap/releases) (one binary per platform). Or `go install github.com/mostlygeek/llama-swap@latest` if you have Go.
+
+Verify with `llama-server --version` and `llama-swap --version`. On the CUDA build the version banner will list the detected GPU; if you see `CPU` instead, the cudart DLLs aren't being found.
+
+### Running llama-server (external mode)
+
+The `llamacpp` provider works against a `llama-server` (from llama.cpp) that you run yourself. A canonical invocation:
+
+```
+llama-server -m models/qwen2.5-3b-q4.gguf --host 0.0.0.0 --port 8080 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --slot-save-path ./slot_cache --metrics
+```
+
+```python
+provider = llm.new_provider("llamacpp", base_url="http://localhost:8080/v1")
+model = provider.new_model("qwen2.5-3b-instruct-q4_k_m", max_tokens=512)
+```
+
+Knobs that affect the loaded model — context size, KV-cache quantization, GPU offload — live on the `llama-server` CLI, not in the LLMFacade settings cascade. To run multiple configurations side-by-side, launch one `llama-server` per config on different ports and instantiate one `LlamaCppServerProvider` per port.
+
+### Managed mode (zero-YAML llama-swap supervision)
+
+Omit `base_url=` and the provider owns a `llama-swap` subprocess that supervises one or more `llama-server` instances on demand. You never edit YAML — pass launch knobs at `new_model` and the supervisor materialises everything on the first `convo.send()`.
+
+```python
+provider = llm.new_provider(
+    "llamacpp",
+    n_gpu_layers=32,                     # provider-level launch default
+)
+fast    = provider.new_model(name="fast",    gguf="models/qwen-3b-q4.gguf",
+                             context_size=8192,  cache_type_k="f16")
+quality = provider.new_model(name="quality", gguf="models/qwen-3b-q4.gguf",
+                             context_size=32768, cache_type_k="q8_0")
+
+convo = quality.new_conversation()
+print(convo.send("Hello").text)          # ← spawns llama-swap, loads `quality`
+
+provider.running()                        # native llama-swap endpoint
+provider.unload("quality")                # ditto
+provider.shutdown()                       # explicit teardown (atexit also wired)
+```
+
+Prerequisites: both `llama-swap` and `llama-server` on `PATH` (see [Installing the binaries](#installing-the-binaries) above).
+
+Lifecycle:
+
+* The supervisor lives under `<llmfacade_dir>/` (default `./.llmfacade/`). It contains `swap.yaml`, `swap.pid`, and `logs/llamacpp-swap.log`.
+* First `send()` triggers a lazy spawn; subsequent `new_model` calls rewrite `swap.yaml` and llama-swap's `-watch-config` picks them up.
+* Shutdown defense in depth: OS-level kill-on-parent-death (Windows Job Object / Linux `prctl(PR_SET_PDEATHSIG)`), Python `atexit` + `SIGINT`/`SIGTERM` handlers, and a PID-file sweep on the next start that reaps any orphan that survived a hard kill.
+* macOS has no kernel-level kill-on-death, so a hard-killed Python may leave llama-swap alive briefly; the next `new_provider("llamacpp")` cleans it up via the PID-file sweep.
 
 ## Exceptions
 

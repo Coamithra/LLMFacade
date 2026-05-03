@@ -49,5 +49,8 @@ logs/
 .env.*
 !.env.example
 
+# llamacpp managed-mode runtime dir
+.llmfacade/
+
 # Claude Code local settings
 .claude/settings.local.json

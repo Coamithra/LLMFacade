@@ -23,7 +23,7 @@ With provider extras (pulls the SDKs you actually need):
 
     llmfacade[anthropic,openai] @ git+https://github.com/Coamithra/LLMFacade.git@main
 
-Available extras: anthropic, openai, google, ollama, tokenizers, all
+Available extras: anthropic, openai, google, llamacpp, tokenizers, all
 
 
 2. Install

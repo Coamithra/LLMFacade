@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
 _SUPPORTS: frozenset[str] = frozenset(
     {
-        "context_size",
         "max_tokens",
         "temperature",
         "top_p",
@@ -159,6 +158,7 @@ class AnthropicProvider(Provider):
         max_tokens: int | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
         thinking: int | None = None,
@@ -168,8 +168,6 @@ class AnthropicProvider(Provider):
         auto_cache_last_user: bool | None = None,
         auto_cache_tools: bool | None = None,
         beta_headers: list[str] | None = None,
-        keep_alive: str | int | None = None,
-        context_size: int | None = None,
         tool_choice: str | None = None,
     ) -> Model:
         """Bind a model id (or `AnthropicModel` member) to this provider.
@@ -194,6 +192,7 @@ class AnthropicProvider(Provider):
             max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
+            min_p=min_p,
             repeat_penalty=repeat_penalty,
             effort=effort,
             thinking=thinking,
@@ -203,8 +202,6 @@ class AnthropicProvider(Provider):
             auto_cache_last_user=auto_cache_last_user,
             auto_cache_tools=auto_cache_tools,
             beta_headers=beta_headers,
-            keep_alive=keep_alive,
-            context_size=context_size,
             tool_choice=tool_choice,
         )
 

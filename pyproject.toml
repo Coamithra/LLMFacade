@@ -27,12 +27,13 @@ dependencies = []
 anthropic = ["anthropic>=0.97"]
 openai = ["openai>=2.32"]
 google = ["google-genai>=1.73"]
-ollama = ["ollama>=0.6"]
-all = ["anthropic>=0.97", "openai>=2.32", "google-genai>=1.73", "ollama>=0.6"]
+llamacpp = ["openai>=2.32", "pyyaml>=6.0"]
+all = ["anthropic>=0.97", "openai>=2.32", "google-genai>=1.73", "pyyaml>=6.0"]
 # Local tokenizers used by Provider.count_tokens / Model.count_tokens and
 # the cache_summary boundary fallback. tiktoken covers OpenAI; sentencepiece
-# (via google-genai's [local-tokenizer]) covers Gemini 2.0+. Anthropic and
-# Ollama have no offline tokenizer and stay on chars/4.
+# (via google-genai's [local-tokenizer]) covers Gemini 2.0+. Anthropic has
+# no offline tokenizer and stays on chars/4; llamacpp uses the running
+# server's /tokenize endpoint.
 tokenizers = [
     "tiktoken>=0.7",
     "google-genai[local-tokenizer]>=1.73",
