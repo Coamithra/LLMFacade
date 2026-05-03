@@ -2,13 +2,11 @@
 
 import sys
 from pathlib import Path
-from typing import cast
 
 from dotenv import load_dotenv
 
 from llmfacade import LLM, Model, SystemBlock, tool
 from llmfacade.helpers import run_to_completion
-from llmfacade.providers.anthropic import AnthropicModel, AnthropicProvider
 
 sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -424,19 +422,19 @@ def run_weather_pass(model: Model, tag: str) -> None:
 def main() -> None:
     llm = LLM.default()
 
-    banner("== Pass 1: Anthropic Haiku 4.5 ==")
-    anthropic = cast(AnthropicProvider, llm.new_provider("anthropic", temperature=0.7))
-    haiku = anthropic.new_model(AnthropicModel.HAIKU_4_5, max_tokens=512)
-    run_pass(haiku, "anthropic")
-    run_weather_pass(haiku, "anthropic")
-
-    banner("== Pass 2: llama.cpp qwen2.5-3b (local) ==")
-    llamacpp = llm.new_provider(
-        "llamacpp", base_url="http://localhost:8080/v1", temperature=0.7
+    banner("== llama.cpp qwen2.5-3b (managed mode) ==")
+    llamacpp = llm.new_provider("llamacpp", temperature=0.7)
+    local = llamacpp.new_model(
+        name="qwen2.5-3b",
+        gguf=r"C:\Models\qwen2.5-3b.gguf",
+        n_gpu_layers=999,
+        max_tokens=512,
     )
-    local = llamacpp.new_model("qwen2.5-3b-instruct-q4_k_m", max_tokens=512)
-    run_pass(local, "llamacpp")
-    run_weather_pass(local, "llamacpp")
+    try:
+        run_pass(local, "llamacpp")
+        run_weather_pass(local, "llamacpp")
+    finally:
+        llamacpp.shutdown()
 
 
 if __name__ == "__main__":

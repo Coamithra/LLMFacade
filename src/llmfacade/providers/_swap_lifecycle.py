@@ -70,13 +70,26 @@ def _build_llama_server_cmd(entry: _LaunchEntry) -> str:
     quoted: list[str] = []
     for p in parts:
         # Leave the literal ${PORT} placeholder unquoted so llama-swap sees
-        # it as a bare token. Quote everything else if it has shell-meaningful
-        # characters; shlex.quote is conservative so plain paths stay readable.
-        if p == "${PORT}":
+        # it as a bare token. Otherwise quote only when there's whitespace or
+        # a shell metacharacter — shlex.quote() wraps anything containing a
+        # backslash in POSIX single quotes, which on Windows means every
+        # absolute path. llama-swap then forwards the quoted token to
+        # llama-server, which sees the literal single quotes as part of the
+        # path and exits 1 on the first arg that's a path.
+        if p == "${PORT}" or not _needs_quoting(p):
             quoted.append(p)
         else:
             quoted.append(shlex.quote(p))
     return " ".join(quoted)
+
+
+_SHELL_METACHARS = frozenset(" \t\n\"'`$&|;<>()*?[]{}#!~")
+
+
+def _needs_quoting(token: str) -> bool:
+    if not token:
+        return True
+    return any(c in _SHELL_METACHARS for c in token)
 
 
 def _render_swap_yaml(
@@ -466,6 +479,12 @@ class _LlamaSwapSupervisor:
 
         self.llmfacade_dir.mkdir(parents=True, exist_ok=True)
         (self.llmfacade_dir / "logs").mkdir(parents=True, exist_ok=True)
+        # llama-server validates --slot-save-path as an existing directory at
+        # parse time and exits 1 if it's missing. Pre-create every referenced
+        # slot dir before spawning so that doesn't kill the upstream.
+        for entry in self._entries:
+            if entry.slot_save_path:
+                Path(entry.slot_save_path).mkdir(parents=True, exist_ok=True)
         _pid_file_sweep(self.pid_file, expected_name=self.binary)
 
         self._write_yaml()
