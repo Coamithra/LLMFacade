@@ -243,5 +243,4 @@ def test_derive_model_id_changes_with_flash_attn() -> None:
     a = derive_model_id(base, name=None)
     b = derive_model_id({**base, "flash_attn": "on"}, name=None)
     c = derive_model_id({**base, "flash_attn": "off"}, name=None)
-    assert a != b != c
-    assert a != c
+    assert len({a, b, c}) == 3

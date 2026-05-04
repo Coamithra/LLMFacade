@@ -124,7 +124,6 @@ class LlamaCppServerProvider(Provider):
     ) -> None:
         # Mode is decided here and never changes.
         self._managed = base_url is None
-        flash_attn = validate_flash_attn(flash_attn)
 
         # Session dir is needed in managed mode for slot_save_path default,
         # YAML / pidfile / log location. Resolve eagerly so a later cwd change
@@ -169,6 +168,7 @@ class LlamaCppServerProvider(Provider):
             self._launch_defaults: dict[str, Any] = {}
             self._supervisor: _LlamaSwapSupervisor | None = None
         else:
+            validate_flash_attn(flash_attn)
             merged = dict(baseline)
             for k, v in explicit_launch.items():
                 if v is not None:
@@ -319,8 +319,6 @@ class LlamaCppServerProvider(Provider):
     ) -> Model:
         from llmfacade.model import Model
 
-        flash_attn = validate_flash_attn(flash_attn)
-
         # Build the per-model launch overrides dict from explicit kwargs only.
         explicit_launch: dict[str, Any] = {
             "gguf": gguf,
@@ -384,6 +382,7 @@ class LlamaCppServerProvider(Provider):
             )
 
         # Managed mode: cascade provider-level launch defaults < model overrides.
+        validate_flash_attn(flash_attn)
         merged = dict(self._launch_defaults)
         for k, v in explicit_launch.items():
             if v is not None:
