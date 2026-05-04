@@ -416,10 +416,10 @@ class LlamaCppServerProvider(Provider):
 
         mmproj_value = merged.get("mmproj_path")
         if mmproj_value is not None:
-            mmproj_resolved = Path(mmproj_value)
-            if not mmproj_resolved.exists():
-                raise FileNotFoundError(f"mmproj_path not found: {mmproj_resolved}")
-            mmproj_value = str(mmproj_resolved)
+            mmproj_p = Path(mmproj_value)
+            if not mmproj_p.exists():
+                raise FileNotFoundError(f"mmproj_path not found: {mmproj_p}")
+            mmproj_value = str(mmproj_p)
 
         derived = derive_model_id(merged, name)
         fit_target = merged.get("fit_target")

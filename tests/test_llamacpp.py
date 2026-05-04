@@ -1356,11 +1356,9 @@ def test_managed_mode_new_model_missing_mmproj_path_raises(tmp_path: Path) -> No
 def test_new_model_forwards_mmproj_path_to_fit_params(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`mmproj_path` IS forwarded to llama-fit-params: the multimodal projector
-    is loaded into VRAM alongside the main model, so a fit estimate that
-    ignores it will under-count VRAM use. If a future fit-params build doesn't
-    accept --mmproj it'll exit non-zero and we'll silently lose that one
-    estimate, same as for any other forwarded flag."""
+    """mmproj_path IS forwarded to llama-fit-params. The multimodal projector
+    occupies VRAM alongside the main model, so an estimate that ignores it
+    would under-count VRAM use."""
     gguf = tmp_path / "qwen.gguf"
     gguf.write_bytes(b"fake")
     mmproj = tmp_path / "mmproj.gguf"
@@ -1417,3 +1415,21 @@ def test_message_to_api_routes_image_block_as_openai_image_url(
     image_parts = [p for p in parts if p.get("type") == "image_url"]
     assert len(image_parts) == 1
     assert image_parts[0]["image_url"] == {"url": expected_url}
+
+
+def test_message_to_api_drops_image_block_on_assistant_role(
+    provider: LlamaCppServerProvider,
+) -> None:
+    """Assistant messages are flattened to text-only on the way out — the
+    OpenAI-compat surface has no role for an assistant-emitted image, and
+    propagating one would hand the model a malformed message on the next
+    turn. Locks the drop behaviour against accidental refactor."""
+    from llmfacade import Message
+    from llmfacade.models import ImageBlock, TextBlock
+
+    img = ImageBlock(data=b"\x89PNG\r\n\x1a\nignored", media_type="image/png")
+    msg = Message(role="assistant", content=[TextBlock("here you go"), img])
+    api = provider._message_to_api(msg)
+    assert len(api) == 1
+    assert api[0]["content"] == "here you go"
+    assert "image_url" not in str(api[0])
