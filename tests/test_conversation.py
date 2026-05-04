@@ -169,6 +169,37 @@ def test_log_starts_with_settings_header(mock_model, tmp_path):
     assert "settings" not in req
 
 
+def test_settings_header_includes_provider_log_metadata(tmp_path):
+    """Provider.log_metadata() returns extras that get merged into the
+    settings header as siblings of `settings`. Lets the llamacpp provider
+    surface a `fit_estimate` block without conversation.py needing to know
+    about fit semantics."""
+
+    class _ExtraProvider(MockProvider):
+        def log_metadata(self, *, model_id):
+            del model_id
+            return {"fit_estimate": {"context_size": 4096, "n_gpu_layers": 32}}
+
+    p = _ExtraProvider()
+    log = tmp_path / "log.jsonl"
+    p.new_model("mock-model").new_conversation(name="t", log_path=log)
+    [header] = _settings_records(log)
+    assert header["fit_estimate"] == {"context_size": 4096, "n_gpu_layers": 32}
+    html = (tmp_path / "log.html").read_text(encoding="utf-8")
+    assert "Fit estimate" in html
+    assert "context_size" in html and "4096" in html
+
+
+def test_settings_header_omits_extras_when_provider_returns_none(tmp_path):
+    """A provider that doesn't override log_metadata mustn't add any keys."""
+    p = MockProvider()  # base log_metadata returns None
+    log = tmp_path / "log.jsonl"
+    p.new_model("mock-model").new_conversation(name="t", log_path=log)
+    [header] = _settings_records(log)
+    expected = {"type", "convo", "provider", "model", "system_blocks", "tools", "settings"}
+    assert set(header) == expected
+
+
 def test_log_first_turn_has_no_prior(mock_model, tmp_path):
     log = tmp_path / "log.jsonl"
     convo = mock_model.new_conversation(name="t", log_path=log)

@@ -66,6 +66,14 @@ def _build_llama_server_cmd(entry: _LaunchEntry) -> str:
         parts += ["--parallel", str(entry.parallel)]
     if entry.slot_save_path is not None:
         parts += ["--slot-save-path", entry.slot_save_path]
+    if entry.fit is True:
+        parts += ["--fit", "on"]
+    elif entry.fit is False:
+        parts += ["--fit", "off"]
+    if entry.fit_target is not None:
+        parts += ["--fit-target", ",".join(str(v) for v in entry.fit_target)]
+    if entry.fit_ctx is not None:
+        parts += ["--fit-ctx", str(entry.fit_ctx)]
     parts.extend(entry.extra_args)
 
     quoted: list[str] = []

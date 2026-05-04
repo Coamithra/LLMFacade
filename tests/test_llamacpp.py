@@ -499,6 +499,169 @@ def test_external_mode_shutdown_no_op() -> None:
     p.shutdown()  # supervisor is None; should just no-op
 
 
+# ---- fit-params estimation + log_metadata --------------------------------
+
+
+def test_log_metadata_external_mode_returns_none() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    assert p.log_metadata(model_id="anything") is None
+
+
+def test_log_metadata_returns_none_when_no_estimate(tmp_path: Path) -> None:
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    assert p.log_metadata(model_id="never-registered") is None
+
+
+def test_log_metadata_returns_fit_estimate_when_cached(tmp_path: Path) -> None:
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p._fit_estimates["m"] = {"context_size": 4096, "n_gpu_layers": 32}
+    assert p.log_metadata(model_id="m") == {
+        "fit_estimate": {"context_size": 4096, "n_gpu_layers": 32}
+    }
+
+
+def test_log_metadata_returns_copy_not_aliased(tmp_path: Path) -> None:
+    """Caller mutating the returned dict mustn't alter our cached estimate."""
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p._fit_estimates["m"] = {"context_size": 4096}
+    out = p.log_metadata(model_id="m")
+    assert out is not None
+    out["fit_estimate"]["context_size"] = 99999
+    assert p._fit_estimates["m"] == {"context_size": 4096}
+
+
+def test_new_model_silently_skips_when_fit_params_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    import shutil as _shutil
+
+    monkeypatch.setattr(_shutil, "which", lambda _b: None)
+    model = p.new_model(gguf=str(gguf), name="m")
+    assert p._fit_estimates[model.model_id] is None
+    assert p.log_metadata(model_id=model.model_id) is None
+
+
+def test_new_model_skips_estimate_when_fit_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    called: dict[str, Any] = {}
+
+    def boom(*_a: Any, **_kw: Any) -> Any:  # pragma: no cover - must not run
+        called["ran"] = True
+        raise AssertionError("subprocess.run should not run when fit=False")
+
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_subprocess, "run", boom)
+    model = p.new_model(gguf=str(gguf), name="m", fit=False)
+    assert "ran" not in called
+    assert p._fit_estimates[model.model_id] is None
+
+
+def test_new_model_runs_fit_params_and_stores_estimate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    seen_argv: dict[str, Any] = {}
+
+    class _FakeCompleted:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.stdout = "-c 8192 -ngl 32 -ts 1\n"
+            self.stderr = (
+                "fit_params: projected memory use [MiB]:\n"
+                "fit_params:   - GPU0: 32 layers,  8192 MiB used,  1024 MiB free\n"
+            )
+
+    def fake_run(argv: list[str], **kw: Any) -> _FakeCompleted:
+        seen_argv["argv"] = argv
+        seen_argv["kw"] = kw
+        return _FakeCompleted()
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    model = p.new_model(gguf=str(gguf), name="m", parallel=2, fit_target=(1024,))
+    est = p._fit_estimates[model.model_id]
+    assert est == {
+        "context_size": 8192,
+        "n_gpu_layers": 32,
+        "est_vram_mib": 8192,
+        "parallel": 2,
+    }
+    # Sanity-check the spawned argv shape.
+    argv = seen_argv["argv"]
+    assert argv[0].endswith("llama-fit-params")
+    assert "--model" in argv and str(gguf) in argv
+    assert "--parallel" in argv and "2" in argv
+    assert "--fit-target" in argv and "1024" in argv
+
+
+def test_new_model_handles_fit_params_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    class _FakeFailed:
+        returncode = 2
+        stdout = ""
+        stderr = "boom"
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _FakeFailed())
+    model = p.new_model(gguf=str(gguf), name="m")
+    assert p._fit_estimates[model.model_id] is None
+
+
+def test_new_model_handles_fit_params_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+
+    def fake_run(*_a: Any, **_kw: Any) -> Any:
+        raise _subprocess.TimeoutExpired(cmd="llama-fit-params", timeout=60.0)
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    model = p.new_model(gguf=str(gguf), name="m")
+    assert p._fit_estimates[model.model_id] is None
+
+
+def test_external_mode_rejects_fit_target_in_init() -> None:
+    with pytest.raises(UnsupportedFeature, match="launch knobs"):
+        LlamaCppServerProvider(base_url="http://x:0/v1", fit_target=(512,))
+
+
+def test_external_mode_rejects_fit_in_new_model() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    with pytest.raises(UnsupportedFeature, match="launch knobs"):
+        p.new_model("qwen", fit=False)
+
+
 # ---- managed-mode introspection routing ----------------------------------
 #
 # These verify that managed-mode wrappers prepend ``/upstream/<model>/...``

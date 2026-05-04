@@ -31,6 +31,7 @@ from llmfacade.providers._launch import (
     _LaunchEntry,
     default_provider_launch_defaults,
     derive_model_id,
+    parse_fit_print,
 )
 from llmfacade.providers._swap_lifecycle import _LlamaSwapSupervisor
 from llmfacade.settings import OutputFormat
@@ -95,6 +96,9 @@ class LlamaCppServerProvider(Provider):
         slot_save_path: str | None = None,
         ttl: int | None = None,
         extra_args: list[str] | tuple[str, ...] | None = None,
+        fit: bool | None = None,
+        fit_target: list[int] | tuple[int, ...] | None = None,
+        fit_ctx: int | None = None,
         # RUNTIME_KNOBS passthrough
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -121,6 +125,12 @@ class LlamaCppServerProvider(Provider):
         sess_dir = (Path(llmfacade_dir) if llmfacade_dir else Path.cwd() / ".llmfacade").resolve()
         self._llmfacade_dir = sess_dir
 
+        # Best-effort estimates from `llama-fit-params`, populated lazily from
+        # `new_model()`. Keyed by model_id; `None` means we tried and failed
+        # (binary missing, non-zero exit, unparseable output) — surfacing the
+        # absence is intentional and lets `log_metadata` skip the field.
+        self._fit_estimates: dict[str, dict[str, Any] | None] = {}
+
         # Merge provider-level launch defaults: hardcoded < explicit kwargs.
         # Only non-None explicit values override the defaults.
         baseline = default_provider_launch_defaults(sess_dir)
@@ -134,6 +144,9 @@ class LlamaCppServerProvider(Provider):
             "slot_save_path": slot_save_path,
             "ttl": ttl,
             "extra_args": tuple(extra_args) if extra_args is not None else None,
+            "fit": fit,
+            "fit_target": tuple(fit_target) if fit_target is not None else None,
+            "fit_ctx": fit_ctx,
         }
         if not self._managed:
             # External mode: launch knobs are nonsensical (the server is
@@ -271,6 +284,9 @@ class LlamaCppServerProvider(Provider):
         slot_save_path: str | None = None,
         ttl: int | None = None,
         extra_args: list[str] | tuple[str, ...] | None = None,
+        fit: bool | None = None,
+        fit_target: list[int] | tuple[int, ...] | None = None,
+        fit_ctx: int | None = None,
         # Existing args (subset of base Provider.new_model)
         capability_override: frozenset[str] | None = None,
         log_dir: Any | None = None,
@@ -305,6 +321,9 @@ class LlamaCppServerProvider(Provider):
             "slot_save_path": slot_save_path,
             "ttl": ttl,
             "extra_args": tuple(extra_args) if extra_args is not None else None,
+            "fit": fit,
+            "fit_target": tuple(fit_target) if fit_target is not None else None,
+            "fit_ctx": fit_ctx,
         }
         nonnull_launch_keys = sorted(k for k, v in explicit_launch.items() if v is not None)
 
@@ -377,6 +396,8 @@ class LlamaCppServerProvider(Provider):
             raise FileNotFoundError(f"gguf not found: {gguf_path}")
 
         derived = derive_model_id(merged, name)
+        merged_fit = merged.get("fit")
+        merged_fit_target = merged.get("fit_target")
         entry = _LaunchEntry(
             model_id=derived,
             gguf=str(gguf_path),
@@ -388,9 +409,13 @@ class LlamaCppServerProvider(Provider):
             slot_save_path=merged.get("slot_save_path"),
             ttl=merged.get("ttl"),
             extra_args=tuple(merged.get("extra_args") or ()),
+            fit=bool(merged_fit) if merged_fit is not None else True,
+            fit_target=tuple(merged_fit_target) if merged_fit_target is not None else None,
+            fit_ctx=merged.get("fit_ctx"),
         )
         assert self._supervisor is not None
         self._supervisor.register(entry)
+        self._maybe_estimate_fit(entry)
 
         return Model(
             provider=self,
@@ -970,6 +995,77 @@ class LlamaCppServerProvider(Provider):
         callers that don't want to wait for process exit."""
         if self._supervisor is not None:
             self._supervisor.shutdown()
+
+    # ---- fit estimation + metadata ---------------------------------------
+
+    _FIT_PARAMS_TIMEOUT_SECONDS: float = 60.0
+
+    def _maybe_estimate_fit(self, entry: _LaunchEntry) -> None:
+        """Best-effort: spawn `llama-fit-params` with this entry's launch flags
+        and stash the parsed estimate keyed by `entry.model_id`. Records `None`
+        on any failure (binary missing, non-zero exit, timeout, unparseable
+        output) so `log_metadata` can skip the field for that model. Never
+        raises — `new_model()` must not be blocked on a side-channel probe."""
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        if not entry.fit:
+            self._fit_estimates[entry.model_id] = None
+            return
+        binary = _shutil.which("llama-fit-params")
+        if binary is None:
+            self._fit_estimates[entry.model_id] = None
+            return
+
+        argv: list[str] = [binary, "--model", entry.gguf]
+        if entry.context_size is not None:
+            argv += ["--ctx-size", str(entry.context_size)]
+        if entry.cache_type_k is not None:
+            argv += ["--cache-type-k", entry.cache_type_k]
+        if entry.cache_type_v is not None:
+            argv += ["--cache-type-v", entry.cache_type_v]
+        if entry.n_gpu_layers is not None:
+            argv += ["--n-gpu-layers", str(entry.n_gpu_layers)]
+        if entry.parallel is not None:
+            argv += ["--parallel", str(entry.parallel)]
+        if entry.fit_target is not None:
+            argv += ["--fit-target", ",".join(str(v) for v in entry.fit_target)]
+        if entry.fit_ctx is not None:
+            argv += ["--fit-ctx", str(entry.fit_ctx)]
+        argv.extend(entry.extra_args)
+
+        try:
+            result = _subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=self._FIT_PARAMS_TIMEOUT_SECONDS,
+                check=False,
+                text=True,
+            )
+        except (OSError, _subprocess.SubprocessError):
+            self._fit_estimates[entry.model_id] = None
+            return
+        if result.returncode != 0:
+            self._fit_estimates[entry.model_id] = None
+            return
+        parsed = parse_fit_print(result.stdout or "", result.stderr or "")
+        if parsed is None:
+            self._fit_estimates[entry.model_id] = None
+            return
+        if entry.parallel is not None:
+            parsed.setdefault("parallel", entry.parallel)
+        self._fit_estimates[entry.model_id] = parsed
+
+    def log_metadata(self, *, model_id: str) -> dict[str, Any] | None:
+        """Surface the cached `fit_estimate` for `model_id` so the conversation
+        log header can record it. External mode and entries without a cached
+        estimate return `None`."""
+        if not self._managed:
+            return None
+        est = self._fit_estimates.get(model_id)
+        if est is None:
+            return None
+        return {"fit_estimate": dict(est)}
 
     # ---- token counting ---------------------------------------------------
 

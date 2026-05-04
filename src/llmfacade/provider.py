@@ -295,6 +295,14 @@ class Provider:
         del model_id
         return "chars/4"
 
+    def log_metadata(self, *, model_id: str) -> dict[str, Any] | None:
+        """Optional per-provider extras to merge into the conversation's JSONL
+        settings header (and HTML log) as siblings of `settings`. Default
+        returns `None`; subclasses override to surface things like a fit
+        estimate or backend version."""
+        del model_id
+        return None
+
     def _complete_raw(self, req: CompletionRequest) -> Response:
         raise NotImplementedError
 

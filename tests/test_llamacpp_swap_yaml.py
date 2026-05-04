@@ -12,7 +12,11 @@ import pytest
 # missing so a plain `pip install -e .[dev]` still has a green test suite.
 yaml = pytest.importorskip("yaml")
 
-from llmfacade.providers._launch import _LaunchEntry, derive_model_id  # noqa: E402
+from llmfacade.providers._launch import (  # noqa: E402
+    _LaunchEntry,
+    derive_model_id,
+    parse_fit_print,
+)
 from llmfacade.providers._swap_lifecycle import _render_swap_yaml  # noqa: E402
 
 
@@ -135,3 +139,59 @@ def test_derive_model_id_changes_with_launch_config() -> None:
     a = derive_model_id({"gguf": "models/qwen.gguf", "context_size": 8192}, name=None)
     b = derive_model_id({"gguf": "models/qwen.gguf", "context_size": 4096}, name=None)
     assert a != b
+
+
+def test_render_default_includes_fit_on() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf")  # default fit=True
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--fit on" in cmd
+
+
+def test_render_fit_off_explicit() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf", fit=False)
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--fit off" in cmd
+    assert "--fit on" not in cmd
+
+
+def test_render_fit_target_and_ctx() -> None:
+    entry = _LaunchEntry(
+        model_id="m",
+        gguf="x.gguf",
+        fit_target=(1024, 2048),
+        fit_ctx=4096,
+    )
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--fit-target 1024,2048" in cmd
+    assert "--fit-ctx 4096" in cmd
+
+
+def test_parse_fit_print_extracts_args_from_stdout() -> None:
+    out = parse_fit_print("-c 8192 -ngl 32 -ts 1\n", "")
+    assert out == {"context_size": 8192, "n_gpu_layers": 32}
+
+
+def test_parse_fit_print_sums_per_device_mib_used() -> None:
+    stderr = (
+        "fit_params: id=0, target=1024 MiB\n"
+        "fit_params:   - GPU0: 32 layers,  4096 MiB used,  1024 MiB free\n"
+        "fit_params:   - GPU1: 16 layers,  2048 MiB used,   512 MiB free\n"
+    )
+    out = parse_fit_print("-c 4096 -ngl 48", stderr)
+    assert out is not None
+    assert out["est_vram_mib"] == 4096 + 2048
+
+
+def test_parse_fit_print_handles_negative_ngl() -> None:
+    """`-ngl -1` is a valid sentinel meaning "all layers"; the regex must not
+    drop the leading `-`."""
+    out = parse_fit_print("-c 2048 -ngl -1", "")
+    assert out == {"context_size": 2048, "n_gpu_layers": -1}
+
+
+def test_parse_fit_print_returns_none_for_empty_inputs() -> None:
+    assert parse_fit_print("", "") is None
+
+
+def test_parse_fit_print_returns_none_for_unrecognised_output() -> None:
+    assert parse_fit_print("hello world\n", "nothing here\n") is None

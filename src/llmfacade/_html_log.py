@@ -272,6 +272,7 @@ class HtmlLogger:
         system_blocks: list[Any],
         tools: list[str],
         settings: dict[str, dict[str, Any]],
+        extra: dict[str, Any] | None = None,
     ) -> None:
         title = f"{convo_name} · {provider}:{model_id}"
         started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -301,6 +302,18 @@ class HtmlLogger:
             src_html = f" <small>({_escape(src)})</small>" if src else ""
             out.append(f"  <dt>{_escape(k)}{src_html}</dt><dd>{_escape(_repr_value(v))}</dd>\n")
         out.append("</dl></details>\n")
+
+        if extra and isinstance(extra.get("fit_estimate"), dict):
+            est = extra["fit_estimate"]
+            out.append(
+                "<details open><summary>Fit estimate "
+                "<small>(llama-fit-params; re-fit at spawn)</small></summary>\n"
+                '<dl class="kv">\n'
+            )
+            for k in ("context_size", "n_gpu_layers", "parallel", "est_vram_mib"):
+                if k in est:
+                    out.append(f"  <dt>{_escape(k)}</dt><dd>{_escape(_repr_value(est[k]))}</dd>\n")
+            out.append("</dl></details>\n")
 
         if system_blocks:
             out.append(f"<details><summary>System blocks ({len(system_blocks)})</summary>\n")
