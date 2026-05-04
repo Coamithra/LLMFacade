@@ -6,6 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 LLMFacade is a Python library providing a unified interface to multiple LLM providers (Anthropic, OpenAI, Google Gemini, llama.cpp via `llama-server`). Zero required runtime dependencies - provider SDKs are lazy-loaded only when used. Python 3.10+.
 
+## Project tracker
+
+Trello board: **LLMFacade** — https://trello.com/b/WIanVfPx (board id `69f86428`). Manage from the CLI with `trello --board 69f86428 ...` or `trello use 69f86428` to make it active.
+
+`plans/*.md` files are the long-form source of truth for open work; each file has a corresponding Trello card whose description points back to it. When a card's work is completed (and merged), delete the matching `plans/<file>.md` and archive (or move to `Done`) the card. The convention is: a card with no `plans/` file behind it is either already done or hasn't been spec'd yet.
+
+**Picking up a new card:** read `CONTRIBUTING.md` first — it covers the dev-loop expectations (style, tests, integration-test gating, commit/PR conventions) that every card depends on.
+
 ## Commands
 
 ```bash
