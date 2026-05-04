@@ -245,6 +245,9 @@ class LlamaCppServerProvider(Provider):
         # against concurrent slot mutations; see `slot_lock` / `aslot_lock`.
         # The two locks do not synchronise against each other — a process
         # mixing sync and async slot ops on the same provider is not safe.
+        # `asyncio.Lock()` is built here without a running loop on purpose:
+        # Python 3.10+ lazy-binds the loop on first acquire, so this is
+        # safe as long as a single event loop owns the provider.
         self._slot_lock = _threading.Lock()
         self._slot_alock = _asyncio.Lock()
 

@@ -333,3 +333,27 @@ def test_slot_lock_serialises_concurrent_holders(
     t1.join()
     t2.join()
     assert overlapped[0] is False
+
+
+def test_aslot_lock_serialises_concurrent_coroutines(
+    llama_provider: LlamaCppServerProvider,
+) -> None:
+    """Two coroutines racing on ``aslot_lock`` observe mutual exclusion."""
+    lock = llama_provider.aslot_lock()
+    state = {"held": False, "overlapped": False}
+
+    async def critical() -> None:
+        async with lock:
+            if state["held"]:
+                state["overlapped"] = True
+            state["held"] = True
+            # Yield to the event loop so the other coro gets a chance to
+            # try acquire while we're inside the section.
+            await asyncio.sleep(0)
+            state["held"] = False
+
+    async def driver() -> None:
+        await asyncio.gather(critical(), critical())
+
+    asyncio.run(driver())
+    assert state["overlapped"] is False

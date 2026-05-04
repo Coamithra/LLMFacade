@@ -685,7 +685,9 @@ class Conversation:
         ``filename`` is interpreted relative to llama-server's
         ``--slot-save-path`` directory; the server must have been launched
         with that flag. Allowed characters: ``[a-zA-Z0-9._-]``; no path
-        separators, no ``..`` segments. ``Conversation.save_slot``,
+        separators, no leading ``.``, no ``..`` substring (stricter than
+        "no ``..`` segments" — any pair of dots anywhere is rejected).
+        ``Conversation.save_slot``,
         ``restore_slot``, and ``erase_slot`` operate on slot ``0`` (the only
         slot under ``--parallel 1``); multi-slot selection is out of scope
         for v1.
