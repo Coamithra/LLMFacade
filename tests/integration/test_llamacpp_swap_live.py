@@ -122,3 +122,37 @@ def test_managed_mode_two_models_swap_and_introspection(session_dir: Path) -> No
     )
     # PID file removed too.
     assert not provider._supervisor.pid_file.exists()  # type: ignore[union-attr]
+
+
+def test_register_after_send_does_not_400(session_dir: Path) -> None:
+    """Mirrors `plans/llmfacade-multi-variant-bug.md`: register model A, send to
+    it, *then* register model B and send to it immediately. Without the
+    `_wait_for_model_visible` step in `register()`, B's send would race
+    llama-swap's 2s `-watch-config` poll and return HTTP 400 'could not find
+    suitable inference handler'."""
+    gguf_a, gguf_b = _require_swap_and_gguf()
+
+    llm = LLM(log_dir=False)
+    provider: LlamaCppServerProvider = llm.new_provider("llamacpp", llmfacade_dir=session_dir)  # type: ignore[assignment]
+
+    model_a = provider.new_model(name="bench-a", gguf=gguf_a, context_size=2048, max_tokens=4)
+    convo_a = model_a.new_conversation(log_dir=False)
+    try:
+        resp_a = convo_a.send("hi")
+        assert resp_a.text is not None
+
+        model_b = provider.new_model(
+            name="bench-b",
+            gguf=gguf_b,
+            # Differentiate from A by context_size so we get a fresh YAML entry
+            # even when LLAMACPP_GGUF_B is unset and falls back to gguf_a.
+            context_size=4096 if gguf_a == gguf_b else 2048,
+            max_tokens=4,
+        )
+        convo_b = model_b.new_conversation(log_dir=False)
+        # No sleep — exercises the post-spawn registration path. Without the
+        # fix this returns ProviderError wrapping a 400.
+        resp_b = convo_b.send("hi")
+        assert resp_b.text is not None
+    finally:
+        provider.shutdown()

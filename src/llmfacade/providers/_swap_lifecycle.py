@@ -41,6 +41,7 @@ __all__ = [
     "_pid_file_sweep",
     "_render_swap_yaml",
     "_pid_alive_and_named",
+    "_signal_reload",
 ]
 
 
@@ -344,6 +345,24 @@ def _try_kill(pid: int, expected_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Reload signalling
+# ---------------------------------------------------------------------------
+
+
+def _signal_reload(pid: int) -> bool:
+    """SIGHUP ``pid`` to ask llama-swap to reload its config now, instead of
+    waiting up to 2s for the next ``-watch-config`` poll. Returns True if the
+    signal was sent, False on Windows (no SIGHUP) or if the kill failed."""
+    if sys.platform == "win32" or not hasattr(signal, "SIGHUP"):
+        return False
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Supervisor — owns one llama-swap subprocess
 # ---------------------------------------------------------------------------
 
@@ -439,7 +458,15 @@ class _LlamaSwapSupervisor:
     def register(self, entry: _LaunchEntry) -> None:
         """Append an entry. If two registrations have the same `model_id` but
         different launch knobs, raise — name aliasing would silently route to
-        the wrong backend."""
+        the wrong backend.
+
+        When the supervisor is already running, rewrite the YAML, nudge
+        llama-swap with SIGHUP (POSIX) and then block on `/v1/models` until the
+        new entry is visible. Without the wait, an immediate ``send()`` races
+        the 2s ``-watch-config`` poll and gets a 400 'could not find suitable
+        inference handler'."""
+        port_for_wait: int | None = None
+        pid_for_signal: int | None = None
         with self._lock:
             for existing in self._entries:
                 if existing.model_id == entry.model_id:
@@ -452,6 +479,12 @@ class _LlamaSwapSupervisor:
             self._entries.append(entry)
             if self.is_started:
                 self._write_yaml()
+                port_for_wait = self._port
+                pid_for_signal = self._proc.pid if self._proc is not None else None
+        if port_for_wait is not None:
+            if pid_for_signal is not None:
+                _signal_reload(pid_for_signal)
+            self._wait_for_model_visible(port_for_wait, entry.model_id)
 
     # --- lazy startup ------------------------------------------------------
 
@@ -557,6 +590,56 @@ class _LlamaSwapSupervisor:
         raise ProviderError(
             f"llama-swap did not become healthy within {self.HEALTH_TIMEOUT_SECONDS}s "
             f"(last error: {last_error}). log tail:\n{tail}"
+        )
+
+    MODEL_VISIBLE_TIMEOUT_SECONDS: float = 10.0
+
+    def _wait_for_model_visible(self, port: int, model_id: str) -> None:
+        """Block until ``model_id`` appears in ``GET /v1/models``. Used after
+        rewriting the YAML on a running supervisor: llama-swap's watcher polls
+        every 2s, so a request fired immediately after ``register()`` would
+        otherwise race the watcher and return 400 'could not find suitable
+        inference handler'."""
+        deadline = time.monotonic() + self.MODEL_VISIBLE_TIMEOUT_SECONDS
+        last_error: Exception | None = None
+        last_body: str | None = None
+        try:
+            import httpx as _httpx
+        except ImportError as e:
+            raise ProviderNotInstalledError(
+                "httpx not installed (required for the llamacpp provider). "
+                "Run: pip install llmfacade[llamacpp]"
+            ) from e
+
+        while time.monotonic() < deadline:
+            if self._proc is None or self._proc.poll() is not None:
+                tail = self._tail_log()
+                raise ProviderError(
+                    f"llama-swap exited before model {model_id!r} became visible. "
+                    f"log tail:\n{tail}"
+                )
+            try:
+                resp = _httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=2.0)
+                if resp.status_code < 400:
+                    last_body = resp.text
+                    try:
+                        data = resp.json()
+                    except ValueError as e:
+                        last_error = e
+                    else:
+                        ids = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
+                        if model_id in ids:
+                            return
+                else:
+                    last_error = ProviderError(f"/v1/models returned {resp.status_code}")
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+            time.sleep(0.1)
+        tail = self._tail_log()
+        raise ProviderError(
+            f"llama-swap did not register model {model_id!r} within "
+            f"{self.MODEL_VISIBLE_TIMEOUT_SECONDS}s (last error: {last_error}, "
+            f"last body: {last_body!r}). log tail:\n{tail}"
         )
 
     def _cleanup_after_failure(self) -> None:

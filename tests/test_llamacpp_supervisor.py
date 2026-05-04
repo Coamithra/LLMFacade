@@ -75,6 +75,187 @@ def test_register_same_id_different_config_raises(
         fake_supervisor.register(_LaunchEntry(model_id="m", gguf="b.gguf"))
 
 
+# ---- post-spawn registration: SIGHUP + /v1/models polling -----------------
+
+
+class _SequencedHttpx:
+    """Stub httpx that routes /health to a static 200 and routes /v1/models
+    through a caller-provided sequence of payloads (last one repeats forever).
+    Each call records (url, payload_returned) so tests can assert the poll
+    cadence and request URL."""
+
+    def __init__(self, models_sequence: list[dict]) -> None:
+        self._models_sequence = list(models_sequence)
+        self.calls: list[tuple[str, dict | None]] = []
+
+    def get(self, url: str, timeout: float):
+        if url.endswith("/health"):
+            self.calls.append((url, None))
+            return _SimpleResp(200, b"OK")
+        if url.endswith("/v1/models"):
+            idx = min(
+                sum(1 for u, _ in self.calls if u.endswith("/v1/models")),
+                len(self._models_sequence) - 1,
+            )
+            payload = self._models_sequence[idx]
+            self.calls.append((url, payload))
+            import json as _json
+
+            return _SimpleResp(200, _json.dumps(payload).encode("utf-8"))
+        raise RuntimeError(f"unexpected url {url!r}")
+
+
+class _SimpleResp:
+    def __init__(self, status_code: int, body: bytes) -> None:
+        self.status_code = status_code
+        self._body = body
+
+    @property
+    def text(self) -> str:
+        return self._body.decode("utf-8")
+
+    def json(self):
+        import json as _json
+
+        return _json.loads(self._body)
+
+
+def _start_with_fake(
+    monkeypatch: pytest.MonkeyPatch,
+    supervisor: ls._LlamaSwapSupervisor,
+    fake_httpx,
+    *,
+    proc: _FakeProc,
+    port: int = 5559,
+) -> None:
+    """Spin the supervisor up to the running state with the given httpx stub
+    in place. Used by tests that exercise behaviour AFTER startup."""
+    import sys
+
+    monkeypatch.setattr(ls.shutil, "which", lambda b: f"/usr/bin/{b}")
+    monkeypatch.setattr(ls, "_pick_free_localhost_port", lambda: port)
+    monkeypatch.setattr(ls, "_spawn_with_pdeathsig", lambda cmd, **kw: (proc, None))
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    supervisor.register(_LaunchEntry(model_id="first", gguf="x.gguf"))
+    supervisor.ensure_started()
+
+
+def test_register_after_start_blocks_until_model_visible(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    proc = _FakeProc(pid=4242)
+    # /v1/models returns empty for the first two polls, then includes "second".
+    fake = _SequencedHttpx(
+        models_sequence=[
+            {"data": [{"id": "first"}]},
+            {"data": [{"id": "first"}]},
+            {"data": [{"id": "first"}, {"id": "second"}]},
+        ]
+    )
+    _start_with_fake(monkeypatch, fake_supervisor, fake, proc=proc, port=5559)
+
+    sigs: list[tuple[int, int]] = []
+    monkeypatch.setattr(ls.os, "kill", lambda pid, sig: sigs.append((pid, sig)))
+    monkeypatch.setattr(ls.time, "sleep", lambda _t: None)  # don't slow the test
+
+    fake_supervisor.register(_LaunchEntry(model_id="second", gguf="y.gguf"))
+
+    # Three /v1/models calls: two empty, then the one that includes "second".
+    model_calls = [c for c in fake.calls if c[0].endswith("/v1/models")]
+    assert len(model_calls) == 3
+    assert model_calls[-1][1] == {"data": [{"id": "first"}, {"id": "second"}]}
+
+    # On POSIX a SIGHUP was sent before polling. On Windows os.kill is still
+    # patched but _signal_reload returns False without calling it.
+    import sys
+
+    sighup = getattr(signal, "SIGHUP", None)
+    if sys.platform != "win32" and sighup is not None:
+        assert sigs == [(4242, sighup)]
+    else:
+        assert sigs == []
+
+
+def test_register_after_start_times_out_when_model_never_appears(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    proc = _FakeProc(pid=4242)
+    fake = _SequencedHttpx(models_sequence=[{"data": [{"id": "first"}]}])
+    _start_with_fake(monkeypatch, fake_supervisor, fake, proc=proc, port=5560)
+
+    monkeypatch.setattr(ls.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(ls.time, "sleep", lambda _t: None)
+    monkeypatch.setattr(fake_supervisor, "MODEL_VISIBLE_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(ProviderError, match="did not register model 'second'"):
+        fake_supervisor.register(_LaunchEntry(model_id="second", gguf="y.gguf"))
+
+
+def test_wait_for_model_visible_raises_when_proc_dies(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    """Direct unit test: ``_wait_for_model_visible`` exits early when the
+    supervised process is dead. Hard to trigger via ``register()`` without a
+    race because ``is_started`` short-circuits on a dead proc."""
+    import sys
+
+    fake_supervisor._proc = _FakeProc(alive=False)  # type: ignore[assignment]
+    monkeypatch.setitem(sys.modules, "httpx", _SequencedHttpx([{"data": []}]))
+    monkeypatch.setattr(ls.time, "sleep", lambda _t: None)
+
+    with pytest.raises(ProviderError, match="exited before model 'lonely' became visible"):
+        fake_supervisor._wait_for_model_visible(5562, "lonely")
+
+
+def test_register_before_start_does_not_poll(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    """When the supervisor isn't running yet, register() must not poll —
+    there's nothing to poll, and `_start_locked` writes the full YAML at spawn
+    time anyway."""
+    import sys
+
+    class _ExplodingHttpx:
+        @staticmethod
+        def get(url, timeout):
+            raise AssertionError("must not poll before supervisor is started")
+
+    monkeypatch.setitem(sys.modules, "httpx", _ExplodingHttpx)
+    fake_supervisor.register(_LaunchEntry(model_id="m", gguf="x.gguf"))
+    assert fake_supervisor.entries == [_LaunchEntry(model_id="m", gguf="x.gguf")]
+
+
+def test_signal_reload_windows_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ls.sys, "platform", "win32")
+    called: list[int] = []
+    monkeypatch.setattr(ls.os, "kill", lambda pid, sig: called.append(pid))
+    assert ls._signal_reload(4242) is False
+    assert called == []
+
+
+def test_signal_reload_posix_sends_sighup(monkeypatch: pytest.MonkeyPatch) -> None:
+    sighup = getattr(signal, "SIGHUP", None)
+    if sighup is None:
+        pytest.skip("SIGHUP not available on this platform")
+    monkeypatch.setattr(ls.sys, "platform", "linux")
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(ls.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    assert ls._signal_reload(4242) is True
+    assert sent == [(4242, sighup)]
+
+
+def test_signal_reload_swallows_process_lookup_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not hasattr(signal, "SIGHUP"):
+        pytest.skip("SIGHUP not available on this platform")
+    monkeypatch.setattr(ls.sys, "platform", "linux")
+
+    def boom(pid, sig):
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(ls.os, "kill", boom)
+    assert ls._signal_reload(4242) is False
+
+
 # ---- lazy startup ---------------------------------------------------------
 
 
