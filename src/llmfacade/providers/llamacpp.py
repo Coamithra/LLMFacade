@@ -236,9 +236,17 @@ class LlamaCppServerProvider(Provider):
         self._http_base: str | None = None
         # Serialises the build-clients step in `_ensure_supervised` so two
         # concurrent first-calls don't race and stomp each other's clients.
+        import asyncio as _asyncio
         import threading as _threading
 
         self._client_lock = _threading.Lock()
+        # Per-provider slot locks. Used by callers that want to make a
+        # restore + send pair (or warm_and_save's send + save pair) atomic
+        # against concurrent slot mutations; see `slot_lock` / `aslot_lock`.
+        # The two locks do not synchronise against each other — a process
+        # mixing sync and async slot ops on the same provider is not safe.
+        self._slot_lock = _threading.Lock()
+        self._slot_alock = _asyncio.Lock()
 
         if not self._managed:
             self._build_clients(self._base_url or "http://localhost:8080/v1")
@@ -870,6 +878,26 @@ class LlamaCppServerProvider(Provider):
         prefix = self._resolve_introspection_target(model)
         data = await self._ahttp_get(f"{prefix}/slots")
         return data if isinstance(data, list) else []
+
+    def slot_lock(self) -> Any:
+        """Per-provider ``threading.Lock`` for span-locking sync slot ops.
+
+        Use as ``with provider.slot_lock(): convo.restore_slot(...); convo.send(...)``
+        to make a restore + send pair atomic against concurrent slot
+        mutations on the same provider. Returns the underlying Lock so the
+        caller can ``with``-acquire it; non-reentrant. The conversation-level
+        slot methods do NOT acquire this lock internally — that would deadlock
+        any caller already holding it. Pair only with the sync API; sync and
+        async locks do not synchronise against each other."""
+        return self._slot_lock
+
+    def aslot_lock(self) -> Any:
+        """Per-provider ``asyncio.Lock`` for span-locking async slot ops.
+
+        Use as ``async with provider.aslot_lock(): await convo.arestore_slot(...);
+        await convo.asend(...)`` to make a restore + send pair atomic. See
+        ``slot_lock`` for the contract; pair only with the async API."""
+        return self._slot_alock
 
     def save_slot(
         self, id_slot: int, filename: str, *, model: str | None = None

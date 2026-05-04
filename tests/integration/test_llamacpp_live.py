@@ -100,3 +100,38 @@ def test_llamacpp_save_restore_erase_roundtrip(llamacpp_host: str, llamacpp_mode
 
     erase = provider.erase_slot(0)
     assert isinstance(erase, dict)
+
+
+def test_llamacpp_conversation_warm_restore_send(llamacpp_host: str, llamacpp_model: str) -> None:
+    """Exercise the high-level ``Conversation`` slot API end-to-end:
+    ``warm_and_save`` materialises the static system-prefix KV, then
+    ``restore_slot`` loads it back into a fresh conversation and a normal
+    ``send`` runs against the restored slot. Skips on servers without
+    ``--slot-save-path`` (the wrapped error mentions the flag)."""
+    if not _server_reachable(llamacpp_host):
+        pytest.skip(f"llama-server not reachable at {llamacpp_host}")
+
+    llm = LLM()
+    provider: LlamaCppServerProvider = llm.new_provider(
+        "llamacpp", base_url=_base_url_for(llamacpp_host)
+    )  # type: ignore[assignment]
+    model = provider.new_model(llamacpp_model, max_tokens=32)
+    static_prompt = "You are a terse town guard. Answer in five words or fewer."
+
+    filename = f"convo-warm-{uuid.uuid4().hex[:8]}.bin"
+    warmer = model.new_conversation(system_blocks=[static_prompt])
+    try:
+        warmer.warm_and_save(filename)
+    except ProviderError as e:
+        if "--slot-save-path" in str(e):
+            pytest.skip(f"server launched without --slot-save-path: {e}")
+        raise
+    # warm_and_save rolls history back so the warmer is reusable.
+    assert warmer.history == []
+
+    chat = model.new_conversation(system_blocks=[static_prompt])
+    chat.restore_slot(filename)
+    resp = chat.send("Halt who goes there?")
+    assert resp.text.strip()
+
+    chat.erase_slot()

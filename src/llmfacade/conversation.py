@@ -19,6 +19,7 @@ from llmfacade.cache import (
 from llmfacade.exceptions import (
     CacheMissError,
     ConversationStateError,
+    ProviderError,
     UnsupportedFeature,
 )
 from llmfacade.helpers import _abbreviate_text, _dump_message, _dump_usage, _log_default
@@ -667,6 +668,173 @@ class Conversation:
             if resp is not None:
                 self._cache_store(cache_key, cache_fp, resp)
 
+    # ---- llama-server slot save/restore (external mode only) -------------
+
+    def _slot_provider(self) -> Any:
+        """Capability-check + return ``self._model.provider`` typed as ``Any``.
+        Slot methods (``save_slot``, ``arestore_slot``, …) live only on
+        ``LlamaCppServerProvider``; the ``Any`` cast lets the slot wrappers
+        below call them without Pyright complaining about the absent
+        attributes on the base ``Provider``."""
+        self._check_slot_capable()
+        return self._model.provider
+
+    def save_slot(self, filename: str) -> dict[str, Any]:
+        """Persist the current slot's KV state to disk under ``filename``.
+
+        ``filename`` is interpreted relative to llama-server's
+        ``--slot-save-path`` directory; the server must have been launched
+        with that flag. Allowed characters: ``[a-zA-Z0-9._-]``; no path
+        separators, no ``..`` segments. ``Conversation.save_slot``,
+        ``restore_slot``, and ``erase_slot`` operate on slot ``0`` (the only
+        slot under ``--parallel 1``); multi-slot selection is out of scope
+        for v1.
+
+        For atomicity against concurrent slot mutations, wrap a save +
+        restore + send sequence in ``with provider.slot_lock(): ...`` —
+        these methods do not acquire the lock internally so the caller can
+        compose them.
+
+        Raises:
+            UnsupportedFeature: if the conversation's provider is not
+                ``llamacpp``.
+            NotImplementedError: in llamacpp managed mode (deferred to v2;
+                slot routing across llama-swap model loads is undefined).
+            ValueError: if ``filename`` is not a safe relative basename.
+            ProviderError: if the server was started without
+                ``--slot-save-path`` (the original 500 body is wrapped with
+                a hint pointing at that flag)."""
+        provider = self._slot_provider()
+        sanitized = _sanitize_slot_filename(filename)
+        try:
+            return provider.save_slot(0, sanitized)
+        except ProviderError as e:
+            raise _wrap_slot_provider_error(e, op="save_slot") from e
+
+    async def asave_slot(self, filename: str) -> dict[str, Any]:
+        """Async equivalent of ``save_slot``."""
+        provider = self._slot_provider()
+        sanitized = _sanitize_slot_filename(filename)
+        try:
+            return await provider.asave_slot(0, sanitized)
+        except ProviderError as e:
+            raise _wrap_slot_provider_error(e, op="asave_slot") from e
+
+    def restore_slot(self, filename: str) -> dict[str, Any]:
+        """Load a previously-saved KV state from ``filename`` into slot ``0``.
+
+        The next ``send`` / ``stream`` against this conversation will
+        prefix-match the restored KV; matching tokens skip prefill.
+        Mismatched-prefix sends fall through to a normal cold prefill —
+        restore is never destructive. See ``save_slot`` for filename rules
+        and capability gating."""
+        provider = self._slot_provider()
+        sanitized = _sanitize_slot_filename(filename)
+        try:
+            return provider.restore_slot(0, sanitized)
+        except ProviderError as e:
+            raise _wrap_slot_provider_error(e, op="restore_slot") from e
+
+    async def arestore_slot(self, filename: str) -> dict[str, Any]:
+        """Async equivalent of ``restore_slot``."""
+        provider = self._slot_provider()
+        sanitized = _sanitize_slot_filename(filename)
+        try:
+            return await provider.arestore_slot(0, sanitized)
+        except ProviderError as e:
+            raise _wrap_slot_provider_error(e, op="arestore_slot") from e
+
+    def erase_slot(self) -> dict[str, Any]:
+        """Wipe slot ``0``'s in-memory KV state on the server.
+
+        This is llama-server's ``?action=erase`` — it clears the slot's
+        live cache only. It does NOT delete any ``--slot-save-path`` files
+        on disk; previously saved KVs remain restorable. See ``save_slot``
+        for capability gating."""
+        provider = self._slot_provider()
+        try:
+            return provider.erase_slot(0)
+        except ProviderError as e:
+            raise _wrap_slot_provider_error(e, op="erase_slot") from e
+
+    async def aerase_slot(self) -> dict[str, Any]:
+        """Async equivalent of ``erase_slot``."""
+        provider = self._slot_provider()
+        try:
+            return await provider.aerase_slot(0)
+        except ProviderError as e:
+            raise _wrap_slot_provider_error(e, op="aerase_slot") from e
+
+    def warm_and_save(self, filename: str, *, max_warmup_tokens: int = 1) -> dict[str, Any]:
+        """Drive a one-token completion against the current system block,
+        then save the resulting slot to disk under ``filename``.
+
+        The conversation's history must be empty when called — this is
+        intended to run once, right after construction, to materialise the
+        static-prefix KV. The warmup user/assistant turns are rolled back
+        so subsequent ``send`` calls behave as a fresh first turn that
+        prefix-matches the saved KV. Like the other slot methods, this is
+        not internally atomic; wrap with ``with provider.slot_lock(): ...``
+        if other tasks may mutate the slot concurrently.
+
+        Returns the dict that ``save_slot`` returns. Raises
+        ``ConversationStateError`` if history is non-empty; otherwise
+        propagates the same errors as ``save_slot``."""
+        provider = self._slot_provider()
+        sanitized = _sanitize_slot_filename(filename)
+        if self._history:
+            raise ConversationStateError(
+                "warm_and_save requires an empty conversation history; got "
+                f"{len(self._history)} prior message(s). Call this once right "
+                "after new_conversation(), or clone the convo first."
+            )
+        snap = self.snapshot()
+        try:
+            self.send(".", max_tokens=max_warmup_tokens)
+        finally:
+            self.rollback(snap)
+        try:
+            return provider.save_slot(0, sanitized)
+        except ProviderError as e:
+            raise _wrap_slot_provider_error(e, op="warm_and_save") from e
+
+    async def awarm_and_save(self, filename: str, *, max_warmup_tokens: int = 1) -> dict[str, Any]:
+        """Async equivalent of ``warm_and_save``."""
+        provider = self._slot_provider()
+        sanitized = _sanitize_slot_filename(filename)
+        if self._history:
+            raise ConversationStateError(
+                "awarm_and_save requires an empty conversation history; got "
+                f"{len(self._history)} prior message(s). Call this once right "
+                "after new_conversation(), or clone the convo first."
+            )
+        snap = self.snapshot()
+        try:
+            await self.asend(".", max_tokens=max_warmup_tokens)
+        finally:
+            self.rollback(snap)
+        try:
+            return await provider.asave_slot(0, sanitized)
+        except ProviderError as e:
+            raise _wrap_slot_provider_error(e, op="awarm_and_save") from e
+
+    def _check_slot_capable(self) -> None:
+        provider = self._model.provider
+        if provider.NAME != "llamacpp":
+            raise UnsupportedFeature("slot_save_restore", provider.NAME, self._model.model_id)
+        # Managed mode is deferred to v2 — slot routing across llama-swap
+        # model loads is undefined (KV state is per-architecture and the
+        # swap may evict the model between calls). Callers that really
+        # want managed-mode slot ops can still hit `provider.save_slot(...)`
+        # directly with model=<id>; this conversation-level surface stays
+        # opinionated.
+        if getattr(provider, "_managed", False):
+            raise NotImplementedError(
+                "Conversation slot save/restore is external-mode only in v1. "
+                "In managed mode (llama-swap), call provider.save_slot/"
+                "restore_slot/erase_slot directly with model=<id>."
+            )
+
     def _finalize_stream(
         self,
         req: CompletionRequest,
@@ -1101,6 +1269,49 @@ def _logsafe(v: Any) -> Any:
     if isinstance(v, Enum):
         return v.value
     return v
+
+
+_SLOT_FILENAME_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _sanitize_slot_filename(filename: str) -> str:
+    """Validate ``filename`` is a safe basename for llama-server's
+    ``--slot-save-path`` directory. Mirrors server-side ``fs_validate_filename``
+    so we surface a clear ValueError up front rather than letting a 400/500
+    leak through. Allowed: ``[a-zA-Z0-9._-]+``; rejected: empty, leading
+    dot, ``..`` segment, path separators, anything else."""
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("slot filename must be a non-empty string")
+    if filename.startswith("."):
+        raise ValueError(f"slot filename {filename!r} must not start with '.' (server-side rule)")
+    if ".." in filename:
+        raise ValueError(f"slot filename {filename!r} must not contain '..' (path traversal)")
+    bad = sorted({c for c in filename if c not in _SLOT_FILENAME_ALLOWED})
+    if bad:
+        raise ValueError(
+            f"slot filename {filename!r} contains disallowed characters {bad!r}; "
+            "allowed: [a-zA-Z0-9._-]"
+        )
+    return filename
+
+
+def _wrap_slot_provider_error(exc: ProviderError, *, op: str) -> ProviderError:
+    """Re-wrap a ProviderError from a slot endpoint with a hint pointing at
+    ``--slot-save-path`` when the body indicates the server was launched
+    without it. Otherwise the original error passes through. The original
+    exception is preserved as ``__cause__`` via the caller's ``raise ...
+    from e``."""
+    msg = str(exc)
+    haystack = msg.lower()
+    if "slots action" in haystack or "slot-save-path" in haystack:
+        return ProviderError(
+            f"{op} failed: {msg} — start llama-server with "
+            "--slot-save-path <dir> to enable slot save/restore.",
+            original=exc.original,
+        )
+    return exc
 
 
 def _resolve_log_path(
