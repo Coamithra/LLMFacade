@@ -59,6 +59,7 @@ LAUNCH_KNOBS: frozenset[str] = frozenset(
         "cache_type_k",
         "cache_type_v",
         "n_gpu_layers",
+        "n_cpu_moe",
         "parallel",
         "slot_save_path",
         "ttl",

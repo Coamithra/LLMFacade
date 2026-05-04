@@ -62,6 +62,8 @@ def _build_llama_server_cmd(entry: _LaunchEntry) -> str:
         parts += ["--cache-type-v", entry.cache_type_v]
     if entry.n_gpu_layers is not None:
         parts += ["--n-gpu-layers", str(entry.n_gpu_layers)]
+    if entry.n_cpu_moe is not None:
+        parts += ["--n-cpu-moe", str(entry.n_cpu_moe)]
     if entry.parallel is not None:
         parts += ["--parallel", str(entry.parallel)]
     if entry.flash_attn is not None:

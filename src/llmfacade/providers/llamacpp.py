@@ -97,6 +97,7 @@ class LlamaCppServerProvider(Provider):
         cache_type_k: str | None = None,
         cache_type_v: str | None = None,
         n_gpu_layers: int | None = None,
+        n_cpu_moe: int | None = None,
         parallel: int | None = None,
         slot_save_path: str | None = None,
         ttl: int | None = None,
@@ -146,6 +147,7 @@ class LlamaCppServerProvider(Provider):
             "cache_type_k": cache_type_k,
             "cache_type_v": cache_type_v,
             "n_gpu_layers": n_gpu_layers,
+            "n_cpu_moe": n_cpu_moe,
             "parallel": parallel,
             "slot_save_path": slot_save_path,
             "ttl": ttl,
@@ -288,6 +290,7 @@ class LlamaCppServerProvider(Provider):
         cache_type_k: str | None = None,
         cache_type_v: str | None = None,
         n_gpu_layers: int | None = None,
+        n_cpu_moe: int | None = None,
         parallel: int | None = None,
         slot_save_path: str | None = None,
         ttl: int | None = None,
@@ -326,6 +329,7 @@ class LlamaCppServerProvider(Provider):
             "cache_type_k": cache_type_k,
             "cache_type_v": cache_type_v,
             "n_gpu_layers": n_gpu_layers,
+            "n_cpu_moe": n_cpu_moe,
             "parallel": parallel,
             "slot_save_path": slot_save_path,
             "ttl": ttl,
@@ -415,6 +419,7 @@ class LlamaCppServerProvider(Provider):
             cache_type_k=merged.get("cache_type_k"),
             cache_type_v=merged.get("cache_type_v"),
             n_gpu_layers=merged.get("n_gpu_layers"),
+            n_cpu_moe=merged.get("n_cpu_moe"),
             parallel=merged.get("parallel"),
             slot_save_path=merged.get("slot_save_path"),
             ttl=merged.get("ttl"),
@@ -1039,6 +1044,8 @@ class LlamaCppServerProvider(Provider):
             argv += ["--cache-type-v", entry.cache_type_v]
         if entry.n_gpu_layers is not None:
             argv += ["--n-gpu-layers", str(entry.n_gpu_layers)]
+        if entry.n_cpu_moe is not None:
+            argv += ["--n-cpu-moe", str(entry.n_cpu_moe)]
         if entry.parallel is not None:
             argv += ["--parallel", str(entry.parallel)]
         if entry.fit_target is not None:

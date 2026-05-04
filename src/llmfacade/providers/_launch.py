@@ -64,6 +64,7 @@ class _LaunchEntry:
     cache_type_k: str | None = None
     cache_type_v: str | None = None
     n_gpu_layers: int | None = None
+    n_cpu_moe: int | None = None
     parallel: int | None = None
     slot_save_path: str | None = None
     ttl: int | None = None
@@ -129,6 +130,7 @@ def default_provider_launch_defaults(llmfacade_dir: Path) -> dict[str, Any]:
         "cache_type_k": None,
         "cache_type_v": None,
         "n_gpu_layers": None,
+        "n_cpu_moe": None,
         "parallel": 1,
         "slot_save_path": str(llmfacade_dir / "slots"),
         "ttl": 0,

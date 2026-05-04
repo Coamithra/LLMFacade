@@ -799,6 +799,75 @@ def test_flash_attn_invalid_value_in_new_model_raises(tmp_path: Path) -> None:
         p.new_model(gguf=str(gguf), flash_attn="enabled")
 
 
+def test_external_mode_rejects_n_cpu_moe_in_init() -> None:
+    with pytest.raises(UnsupportedFeature, match="launch knobs"):
+        LlamaCppServerProvider(base_url="http://x:0/v1", n_cpu_moe=60)
+
+
+def test_external_mode_rejects_n_cpu_moe_in_new_model() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    with pytest.raises(UnsupportedFeature, match="launch knobs"):
+        p.new_model("qwen", n_cpu_moe=60)
+
+
+def test_managed_mode_n_cpu_moe_provider_default_cascades(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", n_cpu_moe=60)
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].n_cpu_moe == 60  # type: ignore[union-attr]
+
+
+def test_managed_mode_n_cpu_moe_model_overrides_provider(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", n_cpu_moe=60)
+    p.new_model(gguf=str(gguf), n_cpu_moe=40)
+    assert p._supervisor.entries[0].n_cpu_moe == 40  # type: ignore[union-attr]
+
+
+def test_managed_mode_n_cpu_moe_default_is_none(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].n_cpu_moe is None  # type: ignore[union-attr]
+
+
+def test_new_model_forwards_n_cpu_moe_to_fit_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`n_cpu_moe` IS forwarded to llama-fit-params (unlike extra_args). It's a
+    common-arg flag and changes the GPU memory footprint, so forwarding it
+    produces a more accurate VRAM estimate."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    seen_argv: dict[str, Any] = {}
+
+    class _FakeOk:
+        returncode = 0
+        stdout = "-c 4096 -ngl 32"
+        stderr = ""
+
+    def fake_run(argv: list[str], **_kw: Any) -> _FakeOk:
+        seen_argv["argv"] = argv
+        return _FakeOk()
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    p.new_model(gguf=str(gguf), name="m", n_cpu_moe=60)
+    argv = seen_argv["argv"]
+    assert "--n-cpu-moe" in argv
+    idx = argv.index("--n-cpu-moe")
+    assert argv[idx + 1] == "60"
+
+
 def test_new_model_forwards_flash_attn_to_fit_params(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

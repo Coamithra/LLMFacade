@@ -208,6 +208,34 @@ def test_derive_model_id_ignores_fit_knobs() -> None:
     assert a == b == c
 
 
+def test_render_n_cpu_moe() -> None:
+    entry = _LaunchEntry(
+        model_id="qwen-moe",
+        gguf="x.gguf",
+        n_gpu_layers=-1,
+        n_cpu_moe=60,
+    )
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["qwen-moe"]["cmd"]
+    assert "--n-gpu-layers -1" in cmd
+    assert "--n-cpu-moe 60" in cmd
+
+
+def test_render_n_cpu_moe_omitted_by_default() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf")
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--n-cpu-moe" not in cmd
+
+
+def test_derive_model_id_changes_with_n_cpu_moe() -> None:
+    """n_cpu_moe IS in the hash — switching it materially changes how
+    llama-server places weights, mirroring how cache_type_k toggles do."""
+    base = {"gguf": "models/qwen.gguf", "n_gpu_layers": -1}
+    a = derive_model_id(base, name=None)
+    b = derive_model_id({**base, "n_cpu_moe": 40}, name=None)
+    c = derive_model_id({**base, "n_cpu_moe": 60}, name=None)
+    assert len({a, b, c}) == 3
+
+
 def test_render_flash_attn_on() -> None:
     entry = _LaunchEntry(model_id="m", gguf="x.gguf", flash_attn="on")
     cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
