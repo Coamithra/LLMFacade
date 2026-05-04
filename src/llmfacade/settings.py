@@ -66,6 +66,7 @@ LAUNCH_KNOBS: frozenset[str] = frozenset(
         "fit",
         "fit_target",
         "fit_ctx",
+        "flash_attn",
     }
 )
 
