@@ -800,13 +800,13 @@ def test_flash_attn_invalid_value_in_new_model_raises(tmp_path: Path) -> None:
 
 
 def test_external_mode_rejects_n_cpu_moe_in_init() -> None:
-    with pytest.raises(UnsupportedFeature, match="launch knobs"):
+    with pytest.raises(UnsupportedFeature, match="n_cpu_moe"):
         LlamaCppServerProvider(base_url="http://x:0/v1", n_cpu_moe=60)
 
 
 def test_external_mode_rejects_n_cpu_moe_in_new_model() -> None:
     p = LlamaCppServerProvider(base_url="http://x:0/v1")
-    with pytest.raises(UnsupportedFeature, match="launch knobs"):
+    with pytest.raises(UnsupportedFeature, match="n_cpu_moe"):
         p.new_model("qwen", n_cpu_moe=60)
 
 
