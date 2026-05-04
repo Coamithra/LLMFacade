@@ -55,14 +55,23 @@ class _LaunchEntry:
     fit_ctx: int | None = None
 
 
+_HASH_EXCLUDED_KEYS: frozenset[str] = frozenset({"fit", "fit_target", "fit_ctx"})
+
+
 def canonical_launch_json(launch_config: dict[str, Any]) -> str:
     """Produce a deterministic JSON string of a launch config so the same
     settings always hash to the same model id. Sorted keys; tuples become
     lists; `None` values are dropped so omitting a knob equals defaulting it.
     `gguf` is normalised via ``Path.resolve()`` so the same file referenced by
-    relative vs absolute path produces the same hash."""
+    relative vs absolute path produces the same hash.
+
+    The `fit*` knobs are excluded: they govern spawn-time VRAM fitting, not
+    generation behaviour, so flipping `--fit on/off` mustn't change `model_id`
+    (and break slot-cache continuity for users on persisted slots)."""
     cleaned: dict[str, Any] = {}
     for k in sorted(launch_config):
+        if k in _HASH_EXCLUDED_KEYS:
+            continue
         v = launch_config[k]
         if v is None:
             continue
@@ -116,6 +125,8 @@ def default_provider_launch_defaults(llmfacade_dir: Path) -> dict[str, Any]:
 # the underlying `common_fit_params` machinery emits go to stderr and contain
 # per-device "<N> MiB used" totals we sum into a VRAM estimate. Source:
 # llama.cpp/common/fit.cpp + tools/fit-params/fit-params.cpp.
+# `_RE_NGL` accepts negatives because `-ngl -1` is the canonical "all layers"
+# sentinel; `_RE_CTX` doesn't because llama-server rejects negative ctx sizes.
 _RE_CTX = re.compile(r"-c\s+(\d+)")
 _RE_NGL = re.compile(r"-ngl\s+(-?\d+)")
 _RE_MIB_USED = re.compile(r"(\d+)\s*MiB\s+used")

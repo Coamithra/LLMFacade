@@ -74,6 +74,10 @@ class LlamaCppServerProvider(Provider):
             "tool_choice",
         }
     )
+    # Wall-clock cap on the synchronous `llama-fit-params` probe in
+    # `_maybe_estimate_fit`. Sub-second in the normal case; capped low so
+    # `new_model()` never hangs on a missing or stuck binary.
+    _FIT_PARAMS_TIMEOUT_SECONDS: float = 15.0
 
     def __init__(
         self,
@@ -396,8 +400,7 @@ class LlamaCppServerProvider(Provider):
             raise FileNotFoundError(f"gguf not found: {gguf_path}")
 
         derived = derive_model_id(merged, name)
-        merged_fit = merged.get("fit")
-        merged_fit_target = merged.get("fit_target")
+        fit_target = merged.get("fit_target")
         entry = _LaunchEntry(
             model_id=derived,
             gguf=str(gguf_path),
@@ -409,8 +412,8 @@ class LlamaCppServerProvider(Provider):
             slot_save_path=merged.get("slot_save_path"),
             ttl=merged.get("ttl"),
             extra_args=tuple(merged.get("extra_args") or ()),
-            fit=bool(merged_fit) if merged_fit is not None else True,
-            fit_target=tuple(merged_fit_target) if merged_fit_target is not None else None,
+            fit=bool(merged.get("fit", True)),
+            fit_target=tuple(fit_target) if fit_target is not None else None,
             fit_ctx=merged.get("fit_ctx"),
         )
         assert self._supervisor is not None
@@ -998,14 +1001,16 @@ class LlamaCppServerProvider(Provider):
 
     # ---- fit estimation + metadata ---------------------------------------
 
-    _FIT_PARAMS_TIMEOUT_SECONDS: float = 60.0
-
     def _maybe_estimate_fit(self, entry: _LaunchEntry) -> None:
         """Best-effort: spawn `llama-fit-params` with this entry's launch flags
         and stash the parsed estimate keyed by `entry.model_id`. Records `None`
         on any failure (binary missing, non-zero exit, timeout, unparseable
         output) so `log_metadata` can skip the field for that model. Never
-        raises — `new_model()` must not be blocked on a side-channel probe."""
+        raises — `new_model()` callers see at most a brief synchronous wait
+        (capped by `_FIT_PARAMS_TIMEOUT_SECONDS`, currently 15s; the probe is
+        normally sub-second once GPU is warm). `entry.extra_args` is
+        intentionally NOT forwarded: those are llama-server-specific flags
+        that `llama-fit-params` will reject and exit non-zero."""
         import shutil as _shutil
         import subprocess as _subprocess
 
@@ -1032,7 +1037,6 @@ class LlamaCppServerProvider(Provider):
             argv += ["--fit-target", ",".join(str(v) for v in entry.fit_target)]
         if entry.fit_ctx is not None:
             argv += ["--fit-ctx", str(entry.fit_ctx)]
-        argv.extend(entry.extra_args)
 
         try:
             result = _subprocess.run(
@@ -1041,6 +1045,7 @@ class LlamaCppServerProvider(Provider):
                 timeout=self._FIT_PARAMS_TIMEOUT_SECONDS,
                 check=False,
                 text=True,
+                stdin=_subprocess.DEVNULL,
             )
         except (OSError, _subprocess.SubprocessError):
             self._fit_estimates[entry.model_id] = None
@@ -1059,7 +1064,9 @@ class LlamaCppServerProvider(Provider):
     def log_metadata(self, *, model_id: str) -> dict[str, Any] | None:
         """Surface the cached `fit_estimate` for `model_id` so the conversation
         log header can record it. External mode and entries without a cached
-        estimate return `None`."""
+        estimate return `None`. The returned dict's inner `fit_estimate` is a
+        shallow copy — currently safe because every value is a primitive; if
+        the estimate ever holds nested containers, switch to `copy.deepcopy`."""
         if not self._managed:
             return None
         est = self._fit_estimates.get(model_id)

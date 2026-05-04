@@ -195,3 +195,14 @@ def test_parse_fit_print_returns_none_for_empty_inputs() -> None:
 
 def test_parse_fit_print_returns_none_for_unrecognised_output() -> None:
     assert parse_fit_print("hello world\n", "nothing here\n") is None
+
+
+def test_derive_model_id_ignores_fit_knobs() -> None:
+    """Flipping fit/fit_target/fit_ctx mustn't change model_id — those govern
+    spawn-time VRAM fitting, not generation, so users on persisted slot
+    caches keep cache continuity across `--fit on/off` toggles."""
+    base = {"gguf": "models/qwen.gguf", "context_size": 8192}
+    a = derive_model_id(base, name=None)
+    b = derive_model_id({**base, "fit": False}, name=None)
+    c = derive_model_id({**base, "fit_target": [1024, 2048], "fit_ctx": 1024}, name=None)
+    assert a == b == c

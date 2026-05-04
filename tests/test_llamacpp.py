@@ -602,12 +602,13 @@ def test_new_model_runs_fit_params_and_stores_estimate(
         "est_vram_mib": 8192,
         "parallel": 2,
     }
-    # Sanity-check the spawned argv shape.
+    # Sanity-check the spawned argv shape — assert positionally so swapping
+    # two flag/value pairs would still be caught.
     argv = seen_argv["argv"]
     assert argv[0].endswith("llama-fit-params")
-    assert "--model" in argv and str(gguf) in argv
-    assert "--parallel" in argv and "2" in argv
-    assert "--fit-target" in argv and "1024" in argv
+    assert argv[argv.index("--model") + 1] == str(gguf)
+    assert argv[argv.index("--parallel") + 1] == "2"
+    assert argv[argv.index("--fit-target") + 1] == "1024"
 
 
 def test_new_model_handles_fit_params_nonzero_exit(
@@ -649,6 +650,39 @@ def test_new_model_handles_fit_params_timeout(
     monkeypatch.setattr(_subprocess, "run", fake_run)
     model = p.new_model(gguf=str(gguf), name="m")
     assert p._fit_estimates[model.model_id] is None
+
+
+def test_new_model_does_not_forward_extra_args_to_fit_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`extra_args` are llama-server-specific flags. Forwarding them to
+    `llama-fit-params` would make it exit non-zero and silently lose every
+    estimate for users with non-empty extra_args."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    seen_argv: dict[str, Any] = {}
+
+    class _FakeOk:
+        returncode = 0
+        stdout = "-c 4096 -ngl 32"
+        stderr = ""
+
+    def fake_run(argv: list[str], **_kw: Any) -> _FakeOk:
+        seen_argv["argv"] = argv
+        return _FakeOk()
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    p.new_model(gguf=str(gguf), name="m", extra_args=["--mlock", "--flash-attn"])
+    argv = seen_argv["argv"]
+    assert "--mlock" not in argv
+    assert "--flash-attn" not in argv
 
 
 def test_external_mode_rejects_fit_target_in_init() -> None:
