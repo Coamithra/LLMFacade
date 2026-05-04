@@ -32,6 +32,7 @@ from llmfacade.providers._launch import (
     default_provider_launch_defaults,
     derive_model_id,
     parse_fit_print,
+    validate_flash_attn,
 )
 from llmfacade.providers._swap_lifecycle import _LlamaSwapSupervisor
 from llmfacade.settings import OutputFormat
@@ -103,6 +104,7 @@ class LlamaCppServerProvider(Provider):
         fit: bool | None = None,
         fit_target: list[int] | tuple[int, ...] | None = None,
         fit_ctx: int | None = None,
+        flash_attn: str | None = None,
         # RUNTIME_KNOBS passthrough
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -122,6 +124,7 @@ class LlamaCppServerProvider(Provider):
     ) -> None:
         # Mode is decided here and never changes.
         self._managed = base_url is None
+        flash_attn = validate_flash_attn(flash_attn)
 
         # Session dir is needed in managed mode for slot_save_path default,
         # YAML / pidfile / log location. Resolve eagerly so a later cwd change
@@ -151,6 +154,7 @@ class LlamaCppServerProvider(Provider):
             "fit": fit,
             "fit_target": tuple(fit_target) if fit_target is not None else None,
             "fit_ctx": fit_ctx,
+            "flash_attn": flash_attn,
         }
         if not self._managed:
             # External mode: launch knobs are nonsensical (the server is
@@ -291,6 +295,7 @@ class LlamaCppServerProvider(Provider):
         fit: bool | None = None,
         fit_target: list[int] | tuple[int, ...] | None = None,
         fit_ctx: int | None = None,
+        flash_attn: str | None = None,
         # Existing args (subset of base Provider.new_model)
         capability_override: frozenset[str] | None = None,
         log_dir: Any | None = None,
@@ -314,6 +319,8 @@ class LlamaCppServerProvider(Provider):
     ) -> Model:
         from llmfacade.model import Model
 
+        flash_attn = validate_flash_attn(flash_attn)
+
         # Build the per-model launch overrides dict from explicit kwargs only.
         explicit_launch: dict[str, Any] = {
             "gguf": gguf,
@@ -328,6 +335,7 @@ class LlamaCppServerProvider(Provider):
             "fit": fit,
             "fit_target": tuple(fit_target) if fit_target is not None else None,
             "fit_ctx": fit_ctx,
+            "flash_attn": flash_attn,
         }
         nonnull_launch_keys = sorted(k for k, v in explicit_launch.items() if v is not None)
 
@@ -415,6 +423,7 @@ class LlamaCppServerProvider(Provider):
             fit=bool(merged.get("fit", True)),
             fit_target=tuple(fit_target) if fit_target is not None else None,
             fit_ctx=merged.get("fit_ctx"),
+            flash_attn=merged.get("flash_attn"),
         )
         assert self._supervisor is not None
         self._supervisor.register(entry)
@@ -1037,6 +1046,8 @@ class LlamaCppServerProvider(Provider):
             argv += ["--fit-target", ",".join(str(v) for v in entry.fit_target)]
         if entry.fit_ctx is not None:
             argv += ["--fit-ctx", str(entry.fit_ctx)]
+        if entry.flash_attn is not None:
+            argv += ["--flash-attn", entry.flash_attn]
 
         try:
             result = _subprocess.run(

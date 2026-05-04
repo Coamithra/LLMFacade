@@ -751,6 +751,88 @@ def test_external_mode_rejects_fit_in_new_model() -> None:
         p.new_model("qwen", fit=False)
 
 
+def test_external_mode_rejects_flash_attn_in_init() -> None:
+    with pytest.raises(UnsupportedFeature, match="launch knobs"):
+        LlamaCppServerProvider(base_url="http://x:0/v1", flash_attn="on")
+
+
+def test_external_mode_rejects_flash_attn_in_new_model() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    with pytest.raises(UnsupportedFeature, match="launch knobs"):
+        p.new_model("qwen", flash_attn="on")
+
+
+def test_managed_mode_flash_attn_provider_default_cascades(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", flash_attn="on")
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].flash_attn == "on"  # type: ignore[union-attr]
+
+
+def test_managed_mode_flash_attn_model_overrides_provider(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", flash_attn="on")
+    p.new_model(gguf=str(gguf), flash_attn="off")
+    assert p._supervisor.entries[0].flash_attn == "off"  # type: ignore[union-attr]
+
+
+def test_managed_mode_flash_attn_default_is_none(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].flash_attn is None  # type: ignore[union-attr]
+
+
+def test_flash_attn_invalid_value_in_init_raises() -> None:
+    with pytest.raises(ValueError, match="flash_attn must be one of"):
+        LlamaCppServerProvider(flash_attn="yes")
+
+
+def test_flash_attn_invalid_value_in_new_model_raises(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    with pytest.raises(ValueError, match="flash_attn must be one of"):
+        p.new_model(gguf=str(gguf), flash_attn="enabled")
+
+
+def test_new_model_forwards_flash_attn_to_fit_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """flash_attn IS forwarded to llama-fit-params (unlike extra_args). It's part
+    of the same llama.cpp common arg parsing and affects KV cache layout, so
+    forwarding it produces a more accurate VRAM estimate."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    seen_argv: dict[str, Any] = {}
+
+    class _FakeOk:
+        returncode = 0
+        stdout = "-c 4096 -ngl 32"
+        stderr = ""
+
+    def fake_run(argv: list[str], **_kw: Any) -> _FakeOk:
+        seen_argv["argv"] = argv
+        return _FakeOk()
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    p.new_model(gguf=str(gguf), name="m", flash_attn="on")
+    argv = seen_argv["argv"]
+    assert "--flash-attn" in argv
+    idx = argv.index("--flash-attn")
+    assert argv[idx + 1] == "on"
+
+
 # ---- managed-mode introspection routing ----------------------------------
 #
 # These verify that managed-mode wrappers prepend ``/upstream/<model>/...``

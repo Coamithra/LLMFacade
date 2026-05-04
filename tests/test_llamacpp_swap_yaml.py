@@ -206,3 +206,42 @@ def test_derive_model_id_ignores_fit_knobs() -> None:
     b = derive_model_id({**base, "fit": False}, name=None)
     c = derive_model_id({**base, "fit_target": [1024, 2048], "fit_ctx": 1024}, name=None)
     assert a == b == c
+
+
+def test_render_flash_attn_on() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf", flash_attn="on")
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--flash-attn on" in cmd
+
+
+def test_render_flash_attn_off() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf", flash_attn="off")
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--flash-attn off" in cmd
+
+
+def test_render_flash_attn_auto() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf", flash_attn="auto")
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--flash-attn auto" in cmd
+
+
+def test_render_flash_attn_omitted_by_default() -> None:
+    """Default `flash_attn=None` must NOT add the flag — let llama-server's own
+    auto heuristic decide. Explicit `flash_attn="auto"` is a separate, opt-in
+    statement of intent."""
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf")
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--flash-attn" not in cmd
+
+
+def test_derive_model_id_changes_with_flash_attn() -> None:
+    """flash_attn IS in the hash (unlike fit/fit_target/fit_ctx) — it materially
+    changes how llama-server runs and what samplers are usable. Switching it
+    should yield a new model id, mirroring how cache_type_k toggles do."""
+    base = {"gguf": "models/qwen.gguf", "context_size": 8192}
+    a = derive_model_id(base, name=None)
+    b = derive_model_id({**base, "flash_attn": "on"}, name=None)
+    c = derive_model_id({**base, "flash_attn": "off"}, name=None)
+    assert a != b != c
+    assert a != c

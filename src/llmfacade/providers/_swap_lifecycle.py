@@ -64,6 +64,8 @@ def _build_llama_server_cmd(entry: _LaunchEntry) -> str:
         parts += ["--n-gpu-layers", str(entry.n_gpu_layers)]
     if entry.parallel is not None:
         parts += ["--parallel", str(entry.parallel)]
+    if entry.flash_attn is not None:
+        parts += ["--flash-attn", entry.flash_attn]
     if entry.slot_save_path is not None:
         parts += ["--slot-save-path", entry.slot_save_path]
     if entry.fit is True:

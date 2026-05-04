@@ -28,7 +28,25 @@ __all__ = [
     "default_provider_launch_defaults",
     "canonical_launch_json",
     "parse_fit_print",
+    "validate_flash_attn",
+    "FLASH_ATTN_VALUES",
 ]
+
+
+FLASH_ATTN_VALUES: frozenset[str] = frozenset({"on", "off", "auto"})
+
+
+def validate_flash_attn(value: str | None) -> str | None:
+    """Reject bad spellings early with a clear error rather than letting
+    llama-server fail at spawn. ``None`` means "don't pass the flag, let
+    llama-server's auto heuristic decide"."""
+    if value is None:
+        return None
+    if value not in FLASH_ATTN_VALUES:
+        raise ValueError(
+            f"flash_attn must be one of {sorted(FLASH_ATTN_VALUES)!r} or None, got {value!r}"
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +71,7 @@ class _LaunchEntry:
     fit: bool = True
     fit_target: tuple[int, ...] | None = None
     fit_ctx: int | None = None
+    flash_attn: str | None = None
 
 
 _HASH_EXCLUDED_KEYS: frozenset[str] = frozenset({"fit", "fit_target", "fit_ctx"})
