@@ -272,3 +272,40 @@ def test_derive_model_id_changes_with_flash_attn() -> None:
     b = derive_model_id({**base, "flash_attn": "on"}, name=None)
     c = derive_model_id({**base, "flash_attn": "off"}, name=None)
     assert len({a, b, c}) == 3
+
+
+def test_render_mmproj_path() -> None:
+    entry = _LaunchEntry(
+        model_id="qwen-vl",
+        gguf="qwen-vl.gguf",
+        mmproj_path="mmproj-qwen-vl.gguf",
+    )
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["qwen-vl"]["cmd"]
+    assert "--mmproj mmproj-qwen-vl.gguf" in cmd
+
+
+def test_render_mmproj_path_omitted_by_default() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf")
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--mmproj" not in cmd
+
+
+def test_render_mmproj_path_with_spaces_quoted() -> None:
+    entry = _LaunchEntry(
+        model_id="m",
+        gguf="x.gguf",
+        mmproj_path="C:/Path With Spaces/mmproj.gguf",
+    )
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "'C:/Path With Spaces/mmproj.gguf'" in cmd
+
+
+def test_derive_model_id_changes_with_mmproj_path() -> None:
+    """mmproj_path IS in the hash — adding a multimodal projector changes the
+    model's effective behaviour (text-only vs vision-capable), so the model_id
+    must differ to keep slot caches and response caches honest."""
+    base = {"gguf": "models/qwen.gguf"}
+    a = derive_model_id(base, name=None)
+    b = derive_model_id({**base, "mmproj_path": "models/mmproj-qwen.gguf"}, name=None)
+    c = derive_model_id({**base, "mmproj_path": "models/other.gguf"}, name=None)
+    assert len({a, b, c}) == 3

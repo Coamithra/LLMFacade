@@ -106,6 +106,7 @@ class LlamaCppServerProvider(Provider):
         fit_target: list[int] | tuple[int, ...] | None = None,
         fit_ctx: int | None = None,
         flash_attn: str | None = None,
+        mmproj_path: str | None = None,
         # RUNTIME_KNOBS passthrough
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -156,6 +157,7 @@ class LlamaCppServerProvider(Provider):
             "fit_target": tuple(fit_target) if fit_target is not None else None,
             "fit_ctx": fit_ctx,
             "flash_attn": flash_attn,
+            "mmproj_path": mmproj_path,
         }
         if not self._managed:
             # External mode: launch knobs are nonsensical (the server is
@@ -299,6 +301,7 @@ class LlamaCppServerProvider(Provider):
         fit_target: list[int] | tuple[int, ...] | None = None,
         fit_ctx: int | None = None,
         flash_attn: str | None = None,
+        mmproj_path: str | None = None,
         # Existing args (subset of base Provider.new_model)
         capability_override: frozenset[str] | None = None,
         log_dir: Any | None = None,
@@ -338,6 +341,7 @@ class LlamaCppServerProvider(Provider):
             "fit_target": tuple(fit_target) if fit_target is not None else None,
             "fit_ctx": fit_ctx,
             "flash_attn": flash_attn,
+            "mmproj_path": mmproj_path,
         }
         nonnull_launch_keys = sorted(k for k, v in explicit_launch.items() if v is not None)
 
@@ -410,6 +414,13 @@ class LlamaCppServerProvider(Provider):
         if not gguf_path.exists():
             raise FileNotFoundError(f"gguf not found: {gguf_path}")
 
+        mmproj_value = merged.get("mmproj_path")
+        if mmproj_value is not None:
+            mmproj_resolved = Path(mmproj_value)
+            if not mmproj_resolved.exists():
+                raise FileNotFoundError(f"mmproj_path not found: {mmproj_resolved}")
+            mmproj_value = str(mmproj_resolved)
+
         derived = derive_model_id(merged, name)
         fit_target = merged.get("fit_target")
         entry = _LaunchEntry(
@@ -428,6 +439,7 @@ class LlamaCppServerProvider(Provider):
             fit_target=tuple(fit_target) if fit_target is not None else None,
             fit_ctx=merged.get("fit_ctx"),
             flash_attn=merged.get("flash_attn"),
+            mmproj_path=mmproj_value,
         )
         assert self._supervisor is not None
         self._supervisor.register(entry)
@@ -1054,6 +1066,8 @@ class LlamaCppServerProvider(Provider):
             argv += ["--fit-ctx", str(entry.fit_ctx)]
         if entry.flash_attn is not None:
             argv += ["--flash-attn", entry.flash_attn]
+        if entry.mmproj_path is not None:
+            argv += ["--mmproj", entry.mmproj_path]
 
         try:
             result = _subprocess.run(

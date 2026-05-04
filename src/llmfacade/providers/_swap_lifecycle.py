@@ -68,6 +68,8 @@ def _build_llama_server_cmd(entry: _LaunchEntry) -> str:
         parts += ["--parallel", str(entry.parallel)]
     if entry.flash_attn is not None:
         parts += ["--flash-attn", entry.flash_attn]
+    if entry.mmproj_path is not None:
+        parts += ["--mmproj", entry.mmproj_path]
     if entry.slot_save_path is not None:
         parts += ["--slot-save-path", entry.slot_save_path]
     if entry.fit is True:

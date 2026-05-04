@@ -73,6 +73,7 @@ class _LaunchEntry:
     fit_target: tuple[int, ...] | None = None
     fit_ctx: int | None = None
     flash_attn: str | None = None
+    mmproj_path: str | None = None
 
 
 _HASH_EXCLUDED_KEYS: frozenset[str] = frozenset({"fit", "fit_target", "fit_ctx"})
@@ -95,7 +96,7 @@ def canonical_launch_json(launch_config: dict[str, Any]) -> str:
         v = launch_config[k]
         if v is None:
             continue
-        if k == "gguf" and isinstance(v, str):
+        if k in ("gguf", "mmproj_path") and isinstance(v, str):
             with contextlib.suppress(OSError):
                 v = str(Path(v).resolve())
         if isinstance(v, tuple):
@@ -138,6 +139,7 @@ def default_provider_launch_defaults(llmfacade_dir: Path) -> dict[str, Any]:
         "fit": True,
         "fit_target": None,
         "fit_ctx": None,
+        "mmproj_path": None,
     }
 
 

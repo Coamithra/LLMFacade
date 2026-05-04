@@ -1298,3 +1298,122 @@ async def test_model_ahealth_against_non_llamacpp_provider_raises_unsupported() 
     m = Model(provider=fake_provider, model_id="x")  # type: ignore[arg-type]
     with pytest.raises(UnsupportedFeature, match="ahealth"):
         await m.ahealth()
+
+
+# ---- mmproj_path (managed-mode vision launch knob) -----------------------
+
+
+def test_external_mode_rejects_mmproj_path_in_init() -> None:
+    with pytest.raises(UnsupportedFeature, match="mmproj_path"):
+        LlamaCppServerProvider(base_url="http://x:0/v1", mmproj_path="m.gguf")
+
+
+def test_external_mode_rejects_mmproj_path_in_new_model() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    with pytest.raises(UnsupportedFeature, match="mmproj_path"):
+        p.new_model("qwen", mmproj_path="m.gguf")
+
+
+def test_managed_mode_mmproj_path_provider_default_cascades(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    mmproj = tmp_path / "mmproj.gguf"
+    mmproj.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", mmproj_path=str(mmproj))
+    p.new_model(gguf=str(gguf))
+    entry = p._supervisor.entries[0]  # type: ignore[union-attr]
+    assert entry.mmproj_path == str(mmproj)
+
+
+def test_managed_mode_mmproj_path_model_overrides_provider(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    a = tmp_path / "a.gguf"
+    b = tmp_path / "b.gguf"
+    a.write_bytes(b"x")
+    b.write_bytes(b"y")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", mmproj_path=str(a))
+    p.new_model(gguf=str(gguf), mmproj_path=str(b))
+    assert p._supervisor.entries[0].mmproj_path == str(b)  # type: ignore[union-attr]
+
+
+def test_managed_mode_mmproj_path_default_is_none(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].mmproj_path is None  # type: ignore[union-attr]
+
+
+def test_managed_mode_new_model_missing_mmproj_path_raises(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    with pytest.raises(FileNotFoundError, match="mmproj_path not found"):
+        p.new_model(gguf=str(gguf), mmproj_path=str(tmp_path / "nonexistent.gguf"))
+
+
+def test_new_model_forwards_mmproj_path_to_fit_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`mmproj_path` IS forwarded to llama-fit-params: the multimodal projector
+    is loaded into VRAM alongside the main model, so a fit estimate that
+    ignores it will under-count VRAM use. If a future fit-params build doesn't
+    accept --mmproj it'll exit non-zero and we'll silently lose that one
+    estimate, same as for any other forwarded flag."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    mmproj = tmp_path / "mmproj.gguf"
+    mmproj.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    seen_argv: dict[str, Any] = {}
+
+    class _FakeOk:
+        returncode = 0
+        stdout = "-c 4096 -ngl 32"
+        stderr = ""
+
+    def fake_run(argv: list[str], **_kw: Any) -> _FakeOk:
+        seen_argv["argv"] = argv
+        return _FakeOk()
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    p.new_model(gguf=str(gguf), name="m", mmproj_path=str(mmproj))
+    argv = seen_argv["argv"]
+    assert "--mmproj" in argv
+    idx = argv.index("--mmproj")
+    assert argv[idx + 1] == str(mmproj)
+
+
+# ---- ImageBlock wire-format marshalling -----------------------------------
+
+
+def test_message_to_api_routes_image_block_as_openai_image_url(
+    provider: LlamaCppServerProvider,
+) -> None:
+    """ImageBlock on a user message becomes the OpenAI-shaped
+    `{"type": "image_url", "image_url": {"url": "data:<mime>;base64,..."}}`
+    block that llama-server consumes when --mmproj is loaded."""
+    import base64
+
+    from llmfacade import Message
+    from llmfacade.models import ImageBlock, TextBlock
+
+    raw = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+    img = ImageBlock(data=raw, media_type="image/png")
+    msg = Message(role="user", content=[TextBlock("look at this"), img])
+    api = provider._message_to_api(msg)
+    assert len(api) == 1
+    parts = api[0]["content"]
+    assert isinstance(parts, list)
+    assert {"type": "text", "text": "look at this"} in parts
+    expected_url = f"data:image/png;base64,{base64.b64encode(raw).decode('ascii')}"
+    image_parts = [p for p in parts if p.get("type") == "image_url"]
+    assert len(image_parts) == 1
+    assert image_parts[0]["image_url"] == {"url": expected_url}

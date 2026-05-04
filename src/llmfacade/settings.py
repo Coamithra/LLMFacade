@@ -68,6 +68,7 @@ LAUNCH_KNOBS: frozenset[str] = frozenset(
         "fit_target",
         "fit_ctx",
         "flash_attn",
+        "mmproj_path",
     }
 )
 
