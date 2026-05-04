@@ -69,8 +69,7 @@ def test_new_model_populates_fit_estimate_and_swap_yaml(tmp_path: Path) -> None:
             # succeeds. parallel echoes back from the entry; the rest come
             # from the fit-params output.
             assert any(
-                k in est
-                for k in ("context_size", "n_gpu_layers", "parallel", "est_vram_mib")
+                k in est for k in ("context_size", "n_gpu_layers", "parallel", "est_vram_mib")
             ), f"fit_estimate dict has no known fields: {est!r}"
 
         # Rendered swap.yaml must contain --fit on by default. Triggering
