@@ -1057,6 +1057,15 @@ class LlamaCppServerProvider(Provider):
         if parsed is None:
             self._fit_estimates[entry.model_id] = None
             return
+        # Translate llama.cpp's CLI sentinels to readable labels so the log
+        # block doesn't leave a user puzzling over `context_size: 0`. fit-params
+        # prints `-c N -ngl N` verbatim even when the model fits at defaults
+        # without any reduction; in that case N is the unset default
+        # (0 = "use the model's trained context", -1 = "all layers on GPU").
+        if parsed.get("context_size") == 0:
+            parsed["context_size"] = "model default"
+        if parsed.get("n_gpu_layers") == -1:
+            parsed["n_gpu_layers"] = "all"
         if entry.parallel is not None:
             parsed.setdefault("parallel", entry.parallel)
         self._fit_estimates[entry.model_id] = parsed

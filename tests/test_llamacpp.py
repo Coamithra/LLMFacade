@@ -611,6 +611,61 @@ def test_new_model_runs_fit_params_and_stores_estimate(
     assert argv[argv.index("--fit-target") + 1] == "1024"
 
 
+def test_new_model_translates_sentinel_estimate_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the model fits at defaults, fit-params prints the unset
+    sentinels (-c 0 -ngl -1) verbatim. The provider translates those to
+    human-readable labels so the JSONL/HTML log doesn't surface "0" / "-1"
+    to a user puzzling over what they mean."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    class _FakeOk:
+        returncode = 0
+        stdout = "-c 0 -ngl -1 -ts 1\n"
+        stderr = ""
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _FakeOk())
+
+    model = p.new_model(gguf=str(gguf), name="m")
+    est = p._fit_estimates[model.model_id]
+    assert est is not None
+    assert est["context_size"] == "model default"
+    assert est["n_gpu_layers"] == "all"
+
+
+def test_new_model_keeps_real_estimate_values_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sentinel translation must not touch real numbers."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    class _FakeOk:
+        returncode = 0
+        stdout = "-c 4096 -ngl 24\n"
+        stderr = ""
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", lambda *a, **k: _FakeOk())
+
+    model = p.new_model(gguf=str(gguf), name="m")
+    est = p._fit_estimates[model.model_id]
+    assert est is not None
+    assert est["context_size"] == 4096
+    assert est["n_gpu_layers"] == 24
+
+
 def test_new_model_handles_fit_params_nonzero_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
