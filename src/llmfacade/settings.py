@@ -63,6 +63,9 @@ LAUNCH_KNOBS: frozenset[str] = frozenset(
         "slot_save_path",
         "ttl",
         "extra_args",
+        "fit",
+        "fit_target",
+        "fit_ctx",
     }
 )
 

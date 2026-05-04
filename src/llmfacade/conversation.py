@@ -879,6 +879,13 @@ class Conversation:
             "tools": [t.name for t in self._tools.values()],
             "settings": settings_block,
         }
+        extra = provider.log_metadata(model_id=self._model.model_id)
+        if extra:
+            # Drop any keys that would shadow the base header fields so a
+            # misbehaving provider can't silently corrupt log readers.
+            reserved = set(record)
+            extra = {k: v for k, v in extra.items() if k not in reserved}
+            record.update(extra)
         self._append_log(record)
         if self._html_logger is not None:
             self._html_logger.write_header(
@@ -888,6 +895,7 @@ class Conversation:
                 system_blocks=list(self._system_blocks),
                 tools=[t.name for t in self._tools.values()],
                 settings=settings_block,
+                extra=extra,
             )
 
     def _log_request(self, req: CompletionRequest, per_call: dict[str, Any]) -> None:

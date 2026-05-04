@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ __all__ = [
     "derive_model_id",
     "default_provider_launch_defaults",
     "canonical_launch_json",
+    "parse_fit_print",
 ]
 
 
@@ -48,6 +50,12 @@ class _LaunchEntry:
     slot_save_path: str | None = None
     ttl: int | None = None
     extra_args: tuple[str, ...] = ()
+    fit: bool = True
+    fit_target: tuple[int, ...] | None = None
+    fit_ctx: int | None = None
+
+
+_HASH_EXCLUDED_KEYS: frozenset[str] = frozenset({"fit", "fit_target", "fit_ctx"})
 
 
 def canonical_launch_json(launch_config: dict[str, Any]) -> str:
@@ -55,9 +63,15 @@ def canonical_launch_json(launch_config: dict[str, Any]) -> str:
     settings always hash to the same model id. Sorted keys; tuples become
     lists; `None` values are dropped so omitting a knob equals defaulting it.
     `gguf` is normalised via ``Path.resolve()`` so the same file referenced by
-    relative vs absolute path produces the same hash."""
+    relative vs absolute path produces the same hash.
+
+    The `fit*` knobs are excluded: they govern spawn-time VRAM fitting, not
+    generation behaviour, so flipping `--fit on/off` mustn't change `model_id`
+    (and break slot-cache continuity for users on persisted slots)."""
     cleaned: dict[str, Any] = {}
     for k in sorted(launch_config):
+        if k in _HASH_EXCLUDED_KEYS:
+            continue
         v = launch_config[k]
         if v is None:
             continue
@@ -87,7 +101,10 @@ def default_provider_launch_defaults(llmfacade_dir: Path) -> dict[str, Any]:
     """Hardcoded provider-level launch defaults. Keys present here cascade
     into every model registered on the provider unless the model overrides
     them. `slot_save_path` is rooted at the per-provider session directory
-    so multiple providers in the same Python process don't collide."""
+    so multiple providers in the same Python process don't collide.
+
+    `fit=True` lets llama-server adjust unset launch args to fit available
+    VRAM at spawn time; opt out per-entry with `fit=False`."""
     return {
         "context_size": None,
         "cache_type_k": None,
@@ -97,4 +114,43 @@ def default_provider_launch_defaults(llmfacade_dir: Path) -> dict[str, Any]:
         "slot_save_path": str(llmfacade_dir / "slots"),
         "ttl": 0,
         "extra_args": (),
+        "fit": True,
+        "fit_target": None,
+        "fit_ctx": None,
     }
+
+
+# Defensive parsers for `llama-fit-params` output. The default invocation prints
+# the fitted args (`-c N -ngl N -ts ... -ot ...`) to stdout; LOG_INF lines that
+# the underlying `common_fit_params` machinery emits go to stderr and contain
+# per-device "<N> MiB used" totals we sum into a VRAM estimate. Source:
+# llama.cpp/common/fit.cpp + tools/fit-params/fit-params.cpp.
+# `_RE_NGL` accepts negatives because `-ngl -1` is the canonical "all layers"
+# sentinel; `_RE_CTX` doesn't because llama-server rejects negative ctx sizes.
+_RE_CTX = re.compile(r"-c\s+(\d+)")
+_RE_NGL = re.compile(r"-ngl\s+(-?\d+)")
+_RE_MIB_USED = re.compile(r"(\d+)\s*MiB\s+used")
+
+
+def parse_fit_print(stdout: str, stderr: str) -> dict[str, Any] | None:
+    """Defensive parser for `llama-fit-params` output. Returns a dict with any
+    of `{context_size, n_gpu_layers, est_vram_mib}` that could be extracted, or
+    `None` if nothing recognisable was found. Each field is independently
+    optional; the empirical regexes are tuned for llama.cpp master output and
+    fall through silently on shape changes so a future binary version can't
+    break `new_model()`."""
+    if not stdout and not stderr:
+        return None
+    out: dict[str, Any] = {}
+    if stdout:
+        m = _RE_CTX.search(stdout)
+        if m:
+            out["context_size"] = int(m.group(1))
+        m = _RE_NGL.search(stdout)
+        if m:
+            out["n_gpu_layers"] = int(m.group(1))
+    if stderr:
+        mibs = [int(m.group(1)) for m in _RE_MIB_USED.finditer(stderr)]
+        if mibs:
+            out["est_vram_mib"] = sum(mibs)
+    return out or None
