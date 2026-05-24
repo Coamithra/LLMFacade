@@ -15,12 +15,20 @@ import base64
 
 import pytest
 
-from llmfacade import UnsupportedFeature
-from llmfacade.models import ImageBlock, Message, TextBlock
+from llmfacade import UnsupportedFeature, helpers
+from llmfacade.models import (
+    ImageBlock,
+    Message,
+    TextBlock,
+    ToolCall,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from llmfacade.providers.anthropic import AnthropicProvider
 from llmfacade.providers.google import GoogleProvider
 from llmfacade.providers.llamacpp import LlamaCppServerProvider
 from llmfacade.providers.openai import OpenAIProvider
+from llmfacade.tools import tool
 
 from .conftest import MockProvider
 
@@ -161,3 +169,108 @@ def test_capability_override_drops_vision():
     m = p.new_model("claude-text-only-2099", capability_override=override)
     assert m.is_available("vision") is False
     assert "vision" not in m.get_capabilities()
+
+
+# ---- tool_result_images: capability + gate --------------------------------
+
+
+def test_only_anthropic_declares_tool_result_images():
+    assert "tool_result_images" in AnthropicProvider.SUPPORTS
+    for cls in (OpenAIProvider, GoogleProvider, LlamaCppServerProvider):
+        assert "tool_result_images" not in cls.SUPPORTS, cls.__name__
+
+
+def _convo_with_tool_result_image(model):
+    """Build a valid tool_use -> tool_result(image) history on a fresh convo."""
+    convo = model.new_conversation()
+    convo.add_assistant_message([ToolUseBlock(id="t1", name="make_graph", input={})])
+    convo.add_tool_result(
+        "t1", result=[TextBlock("graph:"), ImageBlock(data=_RAW, media_type="image/png")]
+    )
+    return convo
+
+
+def test_tool_result_image_gate_raises_without_flag():
+    provider = MockProvider()  # has "vision", not "tool_result_images"
+    convo = _convo_with_tool_result_image(provider.new_model("mock-model"))
+    with pytest.raises(UnsupportedFeature):
+        convo.send("describe it")
+    assert provider.calls == []
+
+
+def test_tool_result_image_allowed_with_flag():
+    provider = MockProvider()
+    model = provider.new_model(
+        "mock-model", capability_override=MockProvider.SUPPORTS | {"tool_result_images"}
+    )
+    convo = _convo_with_tool_result_image(model)
+    convo.send("describe it")
+    assert len(provider.calls) == 1
+    tool_msgs = [m for m in provider.calls[-1].req.messages if m.role == "tool"]
+    blocks = tool_msgs[-1].content
+    assert isinstance(blocks, list)
+    trb = blocks[0]
+    assert isinstance(trb, ToolResultBlock)
+    assert isinstance(trb.content, list)
+    assert any(isinstance(b, ImageBlock) for b in trb.content)
+
+
+# ---- tool_result_images: auto-loop helper behaviour -----------------------
+
+
+def test_run_bound_tools_embeds_image_when_supported():
+    @tool
+    def make_graph(title: str) -> ImageBlock:
+        """Make a graph."""
+        return ImageBlock(data=_RAW, media_type="image/png")
+
+    provider = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="make_graph", input={"title": "rev"})],
+    )
+    model = provider.new_model(
+        "mock-model", capability_override=MockProvider.SUPPORTS | {"tool_result_images"}
+    )
+    convo = model.new_conversation(tools=[make_graph])
+    resp = convo.send("plot")
+    results = helpers.run_bound_tools(convo, resp)
+    assert len(results) == 1
+    assert any(isinstance(b, ImageBlock) for b in results[0].content)
+    assert convo.history[-1].role == "tool"  # image rode in the tool result; no follow-up
+
+
+def test_run_bound_tools_defers_image_when_unsupported():
+    @tool
+    def make_graph(title: str) -> list[TextBlock | ImageBlock]:
+        """Make a graph."""
+        return [TextBlock("Chart:"), ImageBlock(data=_RAW, media_type="image/png")]
+
+    provider = MockProvider(  # has "vision", not "tool_result_images"
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="make_graph", input={"title": "rev"})],
+    )
+    convo = provider.new_model("mock-model").new_conversation(tools=[make_graph])
+    resp = convo.send("plot")
+    results = helpers.run_bound_tools(convo, resp)
+    assert len(results) == 1
+    assert results[0].content == "Chart:"  # tool result reduced to text
+    last = convo.history[-1]
+    assert last.role == "user"  # image deferred to a follow-up user message
+    assert any(isinstance(b, ImageBlock) for b in last.content)
+
+
+def test_run_bound_tools_string_return_unchanged():
+    @tool
+    def echo(x: int) -> int:
+        """Echo x."""
+        return x
+
+    provider = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="echo", input={"x": 7})],
+    )
+    convo = provider.new_model("mock-model").new_conversation(tools=[echo])
+    resp = convo.send("go")
+    results = helpers.run_bound_tools(convo, resp)
+    assert results[0].content == "7"
+    assert convo.history[-1].role == "tool"

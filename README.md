@@ -158,6 +158,8 @@ resp = chat.send()
 
 All four providers declare a `"vision"` capability and marshal `ImageBlock` content into their native wire shape. Query `model.is_available("vision")` first; sending an image to a model without it raises `UnsupportedFeature` at request time. Express a text-only model (or a llama.cpp GGUF launched without `--mmproj`) by narrowing: `provider.new_model(..., capability_override=provider.SUPPORTS - {"vision"})`.
 
+A separate `"tool_result_images"` capability covers an image *returned by a tool* (an `ImageBlock` inside a `ToolResultBlock`) — only Anthropic accepts that, so only it declares the flag. The `run_bound_tools` / `run_to_completion` helpers let a `@tool` return an `ImageBlock` directly: on Anthropic the image rides in the tool result; on the other providers the helpers reduce the tool result to text and re-attach the image as a follow-up user message. Putting a tool-result image in front of a model that lacks the flag (without going through the helpers) raises `UnsupportedFeature` rather than silently dropping it.
+
 ## Snapshot / Rollback / Clone
 
 ```python

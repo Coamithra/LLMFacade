@@ -47,6 +47,7 @@ _SUPPORTS: frozenset[str] = frozenset(
         "tools",
         "tool_choice",
         "vision",
+        "tool_result_images",
     }
 )
 

@@ -99,21 +99,26 @@ def _message_to_text(m: Message) -> str:
     return "\n".join(out)
 
 
-def _message_has_image(m: Message) -> bool:
-    """True if the message carries an ``ImageBlock`` — either as a top-level
-    content block or nested inside a ``ToolResultBlock``'s content."""
+def _message_has_toplevel_image(m: Message) -> bool:
+    """True if an ``ImageBlock`` sits directly in the message content (a user-
+    or assistant-supplied image). Gated by the ``"vision"`` capability."""
     if isinstance(m.content, str):
         return False
-    for block in m.content:
-        if isinstance(block, ImageBlock):
-            return True
-        if (
-            isinstance(block, ToolResultBlock)
-            and not isinstance(block.content, str)
-            and any(isinstance(inner, ImageBlock) for inner in block.content)
-        ):
-            return True
-    return False
+    return any(isinstance(block, ImageBlock) for block in m.content)
+
+
+def _message_has_tool_result_image(m: Message) -> bool:
+    """True if an ``ImageBlock`` is nested inside a ``ToolResultBlock`` (an image
+    a tool returned). Gated by the ``"tool_result_images"`` capability — only
+    Anthropic marshals images in this position."""
+    if isinstance(m.content, str):
+        return False
+    return any(
+        isinstance(block, ToolResultBlock)
+        and not isinstance(block.content, str)
+        and any(isinstance(inner, ImageBlock) for inner in block.content)
+        for block in m.content
+    )
 
 
 def _tokenizer_label(provider: Any, model_id: str) -> str:
@@ -956,9 +961,13 @@ class Conversation:
     ) -> CompletionRequest:
         provider = self._model.provider
         if not self._model.is_available("vision") and any(
-            _message_has_image(m) for m in self._history
+            _message_has_toplevel_image(m) for m in self._history
         ):
             raise UnsupportedFeature("vision", provider.NAME, self._model.model_id)
+        if not self._model.is_available("tool_result_images") and any(
+            _message_has_tool_result_image(m) for m in self._history
+        ):
+            raise UnsupportedFeature("tool_result_images", provider.NAME, self._model.model_id)
         merged: dict[str, Any] = {}
         sources: dict[str, str] = {}
         for k, v in provider._defaults.items():

@@ -20,6 +20,7 @@ from llmfacade.models import (
     Response,
     TextBlock,
     ThinkingBlock,
+    ToolCall,
     ToolResultBlock,
     Usage,
 )
@@ -33,6 +34,72 @@ def flatten_text_blocks(blocks: list[Any]) -> str:
     return "".join(b.text for b in blocks if isinstance(b, TextBlock))
 
 
+_DEFERRED_IMAGE_NOTE = (
+    "Here is the image output from the tool call(s) above (this model cannot "
+    "receive images inside a tool result, so they are attached here):"
+)
+
+
+def _normalize_tool_result(result: Any) -> str | list[ContentBlock]:
+    """Coerce a tool function's return into tool-result content.
+
+    A plain ``str`` passes through; any other scalar keeps the historical
+    ``_stringify`` (JSON/str) behaviour. An ``ImageBlock`` — or a non-empty list
+    of ``TextBlock``/``ImageBlock`` — is preserved so a tool can return an image."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, ImageBlock):
+        return [result]
+    if (
+        isinstance(result, list)
+        and result
+        and all(isinstance(b, TextBlock | ImageBlock) for b in result)
+    ):
+        return list(result)
+    return _stringify(result)
+
+
+def _as_result_content(content: str | list[ContentBlock]) -> str | list[TextBlock | ImageBlock]:
+    """Narrow normalised content to the block types a ``ToolResultBlock`` holds."""
+    if isinstance(content, str):
+        return content
+    return [b for b in content if isinstance(b, TextBlock | ImageBlock)]
+
+
+def _append_tool_result(
+    convo: Conversation,
+    call: ToolCall,
+    content: str | list[ContentBlock],
+    supports_tool_images: bool,
+    deferred_images: list[ImageBlock],
+) -> ToolResultBlock:
+    """Append a tool result for ``call`` and return the block that was stored.
+
+    If the content carries images but the model can't take images inside a tool
+    result, the result is reduced to its text and the image(s) are queued in
+    ``deferred_images`` for a single follow-up user message — emitted after the
+    whole batch so every ``tool_use`` stays paired with its ``tool_result``."""
+    result_content = _as_result_content(content)
+    if isinstance(result_content, str):
+        images: list[ImageBlock] = []
+    else:
+        images = [b for b in result_content if isinstance(b, ImageBlock)]
+    if not images or supports_tool_images:
+        convo.add_tool_result(call.id, content, name=call.name)
+        return ToolResultBlock(tool_use_id=call.id, content=result_content, name=call.name)
+    text = (
+        flatten_text_blocks(result_content) if isinstance(result_content, list) else result_content
+    ) or "(tool returned image output; see the next message)"
+    convo.add_tool_result(call.id, text, name=call.name)
+    deferred_images.extend(images)
+    return ToolResultBlock(tool_use_id=call.id, content=text, name=call.name)
+
+
+def _flush_deferred_images(convo: Conversation, deferred_images: list[ImageBlock]) -> None:
+    if deferred_images:
+        convo.add_user_message(content=[TextBlock(_DEFERRED_IMAGE_NOTE), *deferred_images])
+
+
 def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock]:
     """Run every tool call in ``resp`` whose name matches a tool registered on ``convo``.
 
@@ -41,31 +108,44 @@ def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock
     whose name is *not* registered are skipped — the caller is then responsible
     for handling them (or letting the next ``send`` raise ``ConversationStateError``).
 
-    Returns the list of ToolResultBlocks that were appended."""
+    A tool may return an ``ImageBlock`` (or a ``[TextBlock, ImageBlock, ...]``
+    list). If the model declares ``"tool_result_images"`` the image rides in the
+    tool result; otherwise the tool result is reduced to text and the image(s)
+    are appended as a single follow-up user message after the batch.
+
+    Returns the list of ToolResultBlocks that were appended (the text-only block
+    in the fallback case)."""
     out: list[ToolResultBlock] = []
+    deferred_images: list[ImageBlock] = []
+    supports_tool_images = convo.is_available("tool_result_images")
     for call in resp.tool_calls:
         tool_def = convo.tool(call.name)
         if tool_def is None:
             continue
         try:
-            result = tool_def.fn(**call.input)
-            content = _stringify(result)
-            convo.add_tool_result(call.id, content, name=call.name)
-            out.append(ToolResultBlock(tool_use_id=call.id, content=content, name=call.name))
-        except Exception as e:
-            content = f"Tool error: {e}"
-            convo.add_tool_result(call.id, content, is_error=True, name=call.name)
+            content = _normalize_tool_result(tool_def.fn(**call.input))
             out.append(
-                ToolResultBlock(
-                    tool_use_id=call.id, content=content, is_error=True, name=call.name
-                )
+                _append_tool_result(convo, call, content, supports_tool_images, deferred_images)
             )
+        except Exception as e:
+            err = f"Tool error: {e}"
+            convo.add_tool_result(call.id, err, is_error=True, name=call.name)
+            out.append(
+                ToolResultBlock(tool_use_id=call.id, content=err, is_error=True, name=call.name)
+            )
+    _flush_deferred_images(convo, deferred_images)
     return out
 
 
 async def arun_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock]:
-    """Async equivalent of ``run_bound_tools``. Awaits coroutine-returning tool fns."""
+    """Async equivalent of ``run_bound_tools``. Awaits coroutine-returning tool fns.
+
+    Handles tool-returned images the same way: embedded in the tool result when
+    the model declares ``"tool_result_images"``, otherwise reduced to text with
+    the image(s) appended as one follow-up user message after the batch."""
     out: list[ToolResultBlock] = []
+    deferred_images: list[ImageBlock] = []
+    supports_tool_images = convo.is_available("tool_result_images")
     for call in resp.tool_calls:
         tool_def = convo.tool(call.name)
         if tool_def is None:
@@ -74,17 +154,17 @@ async def arun_bound_tools(convo: Conversation, resp: Response) -> list[ToolResu
             result = tool_def.fn(**call.input)
             if inspect.isawaitable(result):
                 result = await result
-            content = _stringify(result)
-            convo.add_tool_result(call.id, content, name=call.name)
-            out.append(ToolResultBlock(tool_use_id=call.id, content=content, name=call.name))
-        except Exception as e:
-            content = f"Tool error: {e}"
-            convo.add_tool_result(call.id, content, is_error=True, name=call.name)
+            content = _normalize_tool_result(result)
             out.append(
-                ToolResultBlock(
-                    tool_use_id=call.id, content=content, is_error=True, name=call.name
-                )
+                _append_tool_result(convo, call, content, supports_tool_images, deferred_images)
             )
+        except Exception as e:
+            err = f"Tool error: {e}"
+            convo.add_tool_result(call.id, err, is_error=True, name=call.name)
+            out.append(
+                ToolResultBlock(tool_use_id=call.id, content=err, is_error=True, name=call.name)
+            )
+    _flush_deferred_images(convo, deferred_images)
     return out
 
 
