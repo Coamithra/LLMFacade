@@ -274,3 +274,65 @@ def test_run_bound_tools_string_return_unchanged():
     results = helpers.run_bound_tools(convo, resp)
     assert results[0].content == "7"
     assert convo.history[-1].role == "tool"
+
+
+def test_run_bound_tools_defers_multiple_images_after_batch():
+    """Two image-returning tools on a model without ``tool_result_images``: both
+    tool results must precede the single follow-up user message so every
+    ``tool_use`` stays paired with its ``tool_result``."""
+
+    @tool
+    def chart_a(x: int) -> ImageBlock:
+        """Chart A."""
+        return ImageBlock(data=_RAW, media_type="image/png")
+
+    @tool
+    def chart_b(x: int) -> ImageBlock:
+        """Chart B."""
+        return ImageBlock(data=b"\x89PNG\r\n\x1a\nsecond", media_type="image/png")
+
+    provider = MockProvider(  # has "vision", not "tool_result_images"
+        canned_text="",
+        canned_tool_calls=[
+            ToolCall(id="t1", name="chart_a", input={"x": 1}),
+            ToolCall(id="t2", name="chart_b", input={"x": 2}),
+        ],
+    )
+    convo = provider.new_model("mock-model").new_conversation(tools=[chart_a, chart_b])
+    resp = convo.send("plot both")
+    helpers.run_bound_tools(convo, resp)
+    assert [m.role for m in convo.history[-3:]] == ["tool", "tool", "user"]
+    last = convo.history[-1]
+    assert isinstance(last.content, list)
+    assert sum(isinstance(b, ImageBlock) for b in last.content) == 2
+    convo.send()  # the deferred message sends cleanly (no dangling tool_use)
+
+
+def test_run_bound_tools_drops_image_without_vision():
+    """A model with neither ``tool_result_images`` nor ``vision`` can't be shown
+    an image; the helper drops it (text-only result) rather than queuing a
+    follow-up message that the next ``send`` would reject."""
+
+    @tool
+    def make_graph(x: int) -> ImageBlock:
+        """Make a graph."""
+        return ImageBlock(data=_RAW, media_type="image/png")
+
+    provider = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="make_graph", input={"x": 1})],
+    )
+    model = provider.new_model(
+        "mock-model", capability_override=MockProvider.SUPPORTS - {"vision"}
+    )
+    convo = model.new_conversation(tools=[make_graph])
+    resp = convo.send("plot")
+    helpers.run_bound_tools(convo, resp)
+    assert convo.history[-1].role == "tool"  # no follow-up user message
+    assert not any(
+        isinstance(b, ImageBlock)
+        for m in convo.history
+        if not isinstance(m.content, str)
+        for b in m.content
+    )
+    convo.send()  # no UnsupportedFeature raised

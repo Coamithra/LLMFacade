@@ -45,7 +45,9 @@ def _normalize_tool_result(result: Any) -> str | list[ContentBlock]:
 
     A plain ``str`` passes through; any other scalar keeps the historical
     ``_stringify`` (JSON/str) behaviour. An ``ImageBlock`` — or a non-empty list
-    of ``TextBlock``/``ImageBlock`` — is preserved so a tool can return an image."""
+    in which **every** element is a ``TextBlock``/``ImageBlock`` — is preserved
+    so a tool can return an image. A mixed list (blocks plus other values) is
+    stringified whole, same as any other non-str return."""
     if isinstance(result, str):
         return result
     if isinstance(result, ImageBlock):
@@ -70,28 +72,32 @@ def _append_tool_result(
     convo: Conversation,
     call: ToolCall,
     content: str | list[ContentBlock],
-    supports_tool_images: bool,
     deferred_images: list[ImageBlock],
 ) -> ToolResultBlock:
     """Append a tool result for ``call`` and return the block that was stored.
 
-    If the content carries images but the model can't take images inside a tool
-    result, the result is reduced to its text and the image(s) are queued in
-    ``deferred_images`` for a single follow-up user message — emitted after the
-    whole batch so every ``tool_use`` stays paired with its ``tool_result``."""
+    If the content carries images and the model declares ``"tool_result_images"``
+    the image rides in the tool result. Otherwise the result is reduced to its
+    text and, when the model has ``"vision"``, the image(s) are queued in
+    ``deferred_images`` for a single follow-up user message (emitted after the
+    whole batch so every ``tool_use`` stays paired with its ``tool_result``). A
+    model with neither capability can't be shown the image at all, so it is
+    dropped — the next ``send`` would otherwise raise on the deferred message."""
     result_content = _as_result_content(content)
     if isinstance(result_content, str):
         images: list[ImageBlock] = []
     else:
         images = [b for b in result_content if isinstance(b, ImageBlock)]
-    if not images or supports_tool_images:
+    if not images or convo.is_available("tool_result_images"):
         convo.add_tool_result(call.id, content, name=call.name)
         return ToolResultBlock(tool_use_id=call.id, content=result_content, name=call.name)
-    text = (
-        flatten_text_blocks(result_content) if isinstance(result_content, list) else result_content
-    ) or "(tool returned image output; see the next message)"
+    base_text = flatten_text_blocks(result_content) if isinstance(result_content, list) else ""
+    if convo.is_available("vision"):
+        text = base_text or "(tool returned image output; see the next message)"
+        deferred_images.extend(images)
+    else:
+        text = base_text or "(tool returned image output, omitted: model can't receive images)"
     convo.add_tool_result(call.id, text, name=call.name)
-    deferred_images.extend(images)
     return ToolResultBlock(tool_use_id=call.id, content=text, name=call.name)
 
 
@@ -117,16 +123,13 @@ def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock
     in the fallback case)."""
     out: list[ToolResultBlock] = []
     deferred_images: list[ImageBlock] = []
-    supports_tool_images = convo.is_available("tool_result_images")
     for call in resp.tool_calls:
         tool_def = convo.tool(call.name)
         if tool_def is None:
             continue
         try:
             content = _normalize_tool_result(tool_def.fn(**call.input))
-            out.append(
-                _append_tool_result(convo, call, content, supports_tool_images, deferred_images)
-            )
+            out.append(_append_tool_result(convo, call, content, deferred_images))
         except Exception as e:
             err = f"Tool error: {e}"
             convo.add_tool_result(call.id, err, is_error=True, name=call.name)
@@ -145,7 +148,6 @@ async def arun_bound_tools(convo: Conversation, resp: Response) -> list[ToolResu
     the image(s) appended as one follow-up user message after the batch."""
     out: list[ToolResultBlock] = []
     deferred_images: list[ImageBlock] = []
-    supports_tool_images = convo.is_available("tool_result_images")
     for call in resp.tool_calls:
         tool_def = convo.tool(call.name)
         if tool_def is None:
@@ -155,9 +157,7 @@ async def arun_bound_tools(convo: Conversation, resp: Response) -> list[ToolResu
             if inspect.isawaitable(result):
                 result = await result
             content = _normalize_tool_result(result)
-            out.append(
-                _append_tool_result(convo, call, content, supports_tool_images, deferred_images)
-            )
+            out.append(_append_tool_result(convo, call, content, deferred_images))
         except Exception as e:
             err = f"Tool error: {e}"
             convo.add_tool_result(call.id, err, is_error=True, name=call.name)
