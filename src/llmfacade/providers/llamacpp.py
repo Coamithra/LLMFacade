@@ -73,6 +73,7 @@ class LlamaCppServerProvider(Provider):
             "output_format",
             "tools",
             "tool_choice",
+            "vision",
         }
     )
     # Wall-clock cap on the synchronous `llama-fit-params` probe in

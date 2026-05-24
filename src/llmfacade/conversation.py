@@ -99,6 +99,23 @@ def _message_to_text(m: Message) -> str:
     return "\n".join(out)
 
 
+def _message_has_image(m: Message) -> bool:
+    """True if the message carries an ``ImageBlock`` — either as a top-level
+    content block or nested inside a ``ToolResultBlock``'s content."""
+    if isinstance(m.content, str):
+        return False
+    for block in m.content:
+        if isinstance(block, ImageBlock):
+            return True
+        if (
+            isinstance(block, ToolResultBlock)
+            and not isinstance(block.content, str)
+            and any(isinstance(inner, ImageBlock) for inner in block.content)
+        ):
+            return True
+    return False
+
+
 def _tokenizer_label(provider: Any, model_id: str) -> str:
     return provider.tokenizer_name(model_id=model_id)
 
@@ -938,6 +955,10 @@ class Conversation:
         per_call: dict[str, Any],
     ) -> CompletionRequest:
         provider = self._model.provider
+        if not self._model.is_available("vision") and any(
+            _message_has_image(m) for m in self._history
+        ):
+            raise UnsupportedFeature("vision", provider.NAME, self._model.model_id)
         merged: dict[str, Any] = {}
         sources: dict[str, str] = {}
         for k, v in provider._defaults.items():

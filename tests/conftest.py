@@ -40,6 +40,7 @@ class MockProvider(Provider):
             "user_metadata",
             "tools",
             "tool_choice",
+            "vision",
         }
     )
 

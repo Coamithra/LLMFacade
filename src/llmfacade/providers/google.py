@@ -39,6 +39,7 @@ class GoogleProvider(Provider):
             "output_format",
             "tools",
             "tool_choice",
+            "vision",
         }
     )
 

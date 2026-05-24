@@ -156,6 +156,8 @@ resp = chat.send()
 
 `stream` and `send` are both strict single round-trips with the same wire-format guard: if history contains a `tool_use` without a matching `tool_result`, both raise `ConversationStateError`.
 
+All four providers declare a `"vision"` capability and marshal `ImageBlock` content into their native wire shape. Query `model.is_available("vision")` first; sending an image to a model without it raises `UnsupportedFeature` at request time. Express a text-only model (or a llama.cpp GGUF launched without `--mmproj`) by narrowing: `provider.new_model(..., capability_override=provider.SUPPORTS - {"vision"})`.
+
 ## Snapshot / Rollback / Clone
 
 ```python

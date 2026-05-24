@@ -46,6 +46,7 @@ _SUPPORTS: frozenset[str] = frozenset(
         "beta_headers",
         "tools",
         "tool_choice",
+        "vision",
     }
 )
 
