@@ -126,6 +126,18 @@ def test_vision_gate_allows_when_supported():
     assert any(isinstance(b, ImageBlock) for b in blocks)
 
 
+def test_vision_gate_raises_on_stream():
+    """The gate lives in the shared `_build_request`, so `stream` is covered by
+    the same funnel as `send`. Locks that against a refactor that moves the
+    cache lookup ahead of the gate on only one path."""
+    provider, model = _no_vision_model()
+    convo = model.new_conversation()
+    img = ImageBlock(data=_RAW, media_type="image/png")
+    with pytest.raises(UnsupportedFeature):
+        list(convo.stream([TextBlock("look"), img]))
+    assert provider.calls == []
+
+
 def test_vision_gate_checks_history_images():
     """An image added to history (not the current prompt) is still gated."""
     provider, model = _no_vision_model()
