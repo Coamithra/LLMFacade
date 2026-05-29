@@ -34,9 +34,23 @@ def test_effort_enum_is_wrapped_in_output_config():
 def test_effort_string_is_wrapped_in_output_config():
     """The cascade allows raw strings too; they should be wrapped identically."""
     p = AnthropicProvider(api_key="test-key")
-    api_kwargs = p._build_kwargs(_make_req(effort="normal"))
+    api_kwargs = p._build_kwargs(_make_req(effort="xhigh"))
     assert "effort" not in api_kwargs
-    assert api_kwargs["output_config"] == {"effort": "normal"}
+    assert api_kwargs["output_config"] == {"effort": "xhigh"}
+
+
+def test_effort_level_values_match_anthropic_api():
+    """EffortLevel members must be exactly the values the Anthropic API accepts
+    (output_config.effort): low | medium | high | xhigh | max. A stale or
+    invalid member (e.g. the former "normal") would 400 at request time.
+    https://platform.claude.com/docs/en/build-with-claude/effort"""
+    assert {e.value for e in EffortLevel} == {"low", "medium", "high", "xhigh", "max"}
+
+
+def test_effort_level_high_is_wrapped_in_output_config():
+    p = AnthropicProvider(api_key="test-key")
+    api_kwargs = p._build_kwargs(_make_req(effort=EffortLevel.HIGH))
+    assert api_kwargs["output_config"] == {"effort": "high"}
 
 
 def test_no_effort_means_no_output_config():

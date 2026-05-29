@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import pytest
 
+from llmfacade import ThinkingMode, UnsupportedFeature
 from llmfacade.models import (
     Message,
     TextBlock,
     ThinkingBlock,
     ToolUseBlock,
 )
+from llmfacade.provider import CompletionRequest
 from llmfacade.providers.anthropic import AnthropicProvider
 from llmfacade.providers.google import GoogleProvider
+
+from .conftest import MockProvider
 
 
 def test_thinking_block_defaults():
@@ -195,3 +199,94 @@ def test_google_message_to_api_drops_encrypted_thinking():
     out = p._message_to_api(msg)
     parts = out[0]["parts"]
     assert parts == [{"text": "answer"}]
+
+
+# ---- thinking knob: adaptive modes vs budget ------------------------------
+
+
+def _thinking_req(value: object) -> CompletionRequest:
+    return CompletionRequest(
+        model="claude-opus-4-8",
+        messages=[Message(role="user", content="hi")],
+        system_blocks=[],
+        tools=[],
+        stop=None,
+        settings={"thinking": value, "max_tokens": 16},
+        settings_source={"thinking": "convo", "max_tokens": "convo"},
+    )
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (ThinkingMode.ADAPTIVE, {"type": "adaptive"}),
+        ("adaptive", {"type": "adaptive"}),
+        (ThinkingMode.ADAPTIVE_SUMMARIZED, {"type": "adaptive", "display": "summarized"}),
+        (ThinkingMode.DISABLED, {"type": "disabled"}),
+        ("disabled", {"type": "disabled"}),
+        (4096, {"type": "enabled", "budget_tokens": 4096}),
+    ],
+)
+def test_anthropic_thinking_knob_maps_to_api_shape(value, expected):
+    """ThinkingMode (and its string values) select adaptive/disabled modes; an
+    int selects legacy budget-based extended thinking."""
+    p = AnthropicProvider(api_key="test-key")
+    api_kwargs = p._build_kwargs(_thinking_req(value))
+    assert api_kwargs["thinking"] == expected
+
+
+def test_anthropic_thinking_bool_is_rejected():
+    """A stray `thinking=True` must fail loudly, not be silently read as
+    budget_tokens=1 (bool is an int subclass)."""
+    p = AnthropicProvider(api_key="test-key")
+    with pytest.raises(TypeError):
+        p._build_kwargs(_thinking_req(True))
+
+
+def test_anthropic_no_thinking_means_no_thinking_kwarg():
+    p = AnthropicProvider(api_key="test-key")
+    req = CompletionRequest(
+        model="claude-opus-4-8",
+        messages=[Message(role="user", content="hi")],
+        system_blocks=[],
+        tools=[],
+        stop=None,
+        settings={"max_tokens": 16},
+        settings_source={"max_tokens": "convo"},
+    )
+    assert "thinking" not in p._build_kwargs(req)
+
+
+# ---- budget-thinking request-time gate ------------------------------------
+
+
+def test_budget_thinking_gated_when_unsupported(mock_provider):
+    """A model that supports adaptive thinking but not the budget form rejects
+    an int budget at request time, before the provider is called (mirrors the
+    vision gate). Opus 4.7/4.8 are the real-world case."""
+    m = mock_provider.new_model(
+        "m", capability_override=MockProvider.SUPPORTS - {"thinking_budget"}
+    )
+    convo = m.new_conversation()
+    with pytest.raises(UnsupportedFeature):
+        convo.send("q", thinking=2048)
+    assert mock_provider.calls == []
+
+
+def test_adaptive_thinking_not_gated_without_budget(mock_provider):
+    """An adaptive ThinkingMode is not the budget form, so it passes the gate
+    even when "thinking_budget" is absent — this is how Opus 4.8 enables
+    thinking through the facade."""
+    m = mock_provider.new_model(
+        "m", capability_override=MockProvider.SUPPORTS - {"thinking_budget"}
+    )
+    convo = m.new_conversation()
+    convo.send("q", thinking=ThinkingMode.ADAPTIVE)
+    assert len(mock_provider.calls) == 1
+
+
+def test_budget_thinking_allowed_when_supported(mock_provider):
+    """A model that declares "thinking_budget" accepts an int budget."""
+    convo = mock_provider.new_model("m").new_conversation()
+    convo.send("q", thinking=2048)
+    assert len(mock_provider.calls) == 1

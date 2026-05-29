@@ -26,7 +26,7 @@ from llmfacade.models import (
     Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider
-from llmfacade.settings import OutputFormat
+from llmfacade.settings import EffortLevel, OutputFormat
 
 
 def _openai_cached_tokens(usage: Any) -> int:
@@ -46,6 +46,7 @@ class OpenAIProvider(Provider):
             "max_tokens",
             "temperature",
             "top_p",
+            "effort",
             "output_format",
             "tools",
             "tool_choice",
@@ -127,7 +128,11 @@ class OpenAIProvider(Provider):
         api_kwargs: dict[str, Any] = {
             "model": req.model,
             "messages": api_msgs,
-            "max_tokens": req.settings.get("max_tokens", 1024),
+            # The GPT-5 series and o-series reasoning models reject the legacy
+            # `max_tokens` (400) and require `max_completion_tokens`; the
+            # gpt-4o-class models accept it too, so always emit it. The facade
+            # knob stays named `max_tokens`.
+            "max_completion_tokens": req.settings.get("max_tokens", 1024),
         }
         temperature = req.settings.get("temperature")
         if temperature is not None:
@@ -138,19 +143,53 @@ class OpenAIProvider(Provider):
         if top_p is not None:
             api_kwargs["top_p"] = top_p
 
+        # `effort` maps to OpenAI's `reasoning_effort` (reasoning models only;
+        # OpenAI accepts none/minimal/low/medium/high/xhigh — note it has no
+        # "max", unlike Anthropic). Passed verbatim; an unsupported value or a
+        # non-reasoning model is the caller's responsibility (the API 400s).
+        effort = req.settings.get("effort")
+        if effort is not None:
+            api_kwargs["reasoning_effort"] = (
+                effort.value if isinstance(effort, EffortLevel) else effort
+            )
+
         if req.tools:
             api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
             api_kwargs["tool_choice"] = self._tool_choice_to_api(
                 req.settings.get("tool_choice", "auto")
             )
 
-        out_format = req.settings.get("output_format")
-        if out_format is not None:
-            value = out_format.value if isinstance(out_format, OutputFormat) else out_format
-            if value == "json":
-                api_kwargs["response_format"] = {"type": "json_object"}
-
+        self._apply_output_format(api_kwargs, req.settings.get("output_format"))
         return api_kwargs
+
+    @staticmethod
+    def _apply_output_format(api_kwargs: dict[str, Any], out_format: Any) -> None:
+        """Translate the `output_format` knob to OpenAI's `response_format`.
+
+        A `dict` is a JSON Schema for strict Structured Outputs — emitted as
+        `{"type": "json_schema", ...}`. Accepts either a full
+        `{name, schema, strict}` config or a bare schema (wrapped with
+        `name="response"`, `strict=True`). `OutputFormat.JSON` / `"json"` emits
+        the looser `{"type": "json_object"}` mode; `"text"` / `None` omits it."""
+        if out_format is None:
+            return
+        if isinstance(out_format, dict):
+            # Disambiguate by a top-level "schema" key: a {name, schema, strict}
+            # config has one; a bare JSON Schema does not (the JSON Schema root
+            # vocabulary has no "schema" keyword).
+            if "schema" in out_format:
+                cfg = {
+                    "name": out_format.get("name", "response"),
+                    "schema": out_format["schema"],
+                    "strict": out_format.get("strict", True),
+                }
+            else:
+                cfg = {"name": "response", "schema": out_format, "strict": True}
+            api_kwargs["response_format"] = {"type": "json_schema", "json_schema": cfg}
+            return
+        value = out_format.value if isinstance(out_format, OutputFormat) else out_format
+        if value == "json":
+            api_kwargs["response_format"] = {"type": "json_object"}
 
     def _complete_raw(self, req: CompletionRequest) -> Response:
         api_kwargs = self._build_kwargs(req)

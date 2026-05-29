@@ -26,7 +26,7 @@ from llmfacade.models import (
     Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider, SystemBlock
-from llmfacade.settings import EffortLevel, EphemeralCacheTTL
+from llmfacade.settings import EffortLevel, EphemeralCacheTTL, ThinkingMode
 
 if TYPE_CHECKING:
     from llmfacade.model import Model
@@ -39,6 +39,7 @@ _SUPPORTS: frozenset[str] = frozenset(
         "top_k",
         "effort",
         "thinking",
+        "thinking_budget",
         "auto_cache_last_user",
         "auto_cache_tools",
         "user_metadata",
@@ -50,6 +51,21 @@ _SUPPORTS: frozenset[str] = frozenset(
         "tool_result_images",
     }
 )
+
+# Opus 4.7 and later reject the sampling knobs (temperature/top_p/top_k set to a
+# non-default value -> HTTP 400) and the budget-based thinking form
+# (thinking={"type":"enabled","budget_tokens":N} -> HTTP 400). They DO support
+# adaptive thinking (thinking={"type":"adaptive"}), so the `thinking` knob is
+# kept and only the pure `"thinking_budget"` capability flag is dropped — the
+# request-time gate rejects an int budget but allows a ThinkingMode. Depth is
+# controlled via `effort` + adaptive thinking, so `effort` is retained too.
+# https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-8
+_OPUS_4_8_SUPPORTS: frozenset[str] = _SUPPORTS - {
+    "temperature",
+    "top_p",
+    "top_k",
+    "thinking_budget",
+}
 
 
 class AnthropicModel(Enum):
@@ -63,15 +79,31 @@ class AnthropicModel(Enum):
 
     This enum is a snapshot of what the library knows about as of its release.
     Use a string for any model not listed here (new releases between library
-    versions, fine-tunes, custom deployments)."""
+    versions, fine-tunes, custom deployments).
 
-    OPUS_4_7 = ("claude-opus-4-7", _SUPPORTS)
-    SONNET_4_6 = ("claude-sonnet-4-6", _SUPPORTS)
-    HAIKU_4_5 = ("claude-haiku-4-5-20251001", _SUPPORTS)
+    A member may also carry `defaults` — model-scope generation knobs applied by
+    `new_model()` unless the caller passes their own value. Opus 4.8 defaults to
+    `effort=xhigh` + adaptive thinking (its recommended settings); pass `effort=`
+    / `thinking=` explicitly to override, or `thinking=ThinkingMode.DISABLED` to
+    turn thinking off."""
 
-    def __init__(self, model_id: str, capabilities: frozenset[str]):
+    OPUS_4_8 = (
+        "claude-opus-4-8",
+        _OPUS_4_8_SUPPORTS,
+        {"effort": EffortLevel.XHIGH, "thinking": ThinkingMode.ADAPTIVE},
+    )
+    SONNET_4_6 = ("claude-sonnet-4-6", _SUPPORTS, {})
+    HAIKU_4_5 = ("claude-haiku-4-5-20251001", _SUPPORTS, {})
+
+    def __init__(
+        self,
+        model_id: str,
+        capabilities: frozenset[str],
+        defaults: dict[str, Any] | None = None,
+    ):
         self.model_id = model_id
         self.capabilities = capabilities
+        self.defaults: dict[str, Any] = defaults or {}
 
 
 _EXACT_COUNT_FALLBACK_WARNED: set[str] = set()
@@ -163,7 +195,7 @@ class AnthropicProvider(Provider):
         min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
-        thinking: int | None = None,
+        thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,
@@ -179,10 +211,18 @@ class AnthropicProvider(Provider):
         raw string, the provider's full SUPPORTS set is used — pass
         `capability_override=` if the model needs narrowing. An explicit
         `capability_override=` always wins, even when an enum member is
-        passed."""
+        passed.
+
+        The member's `.defaults` (e.g. Opus 4.8's `effort=xhigh` + adaptive
+        thinking) are applied as model-scope defaults for any knob the caller
+        left unset; an explicit kwarg always wins."""
         if isinstance(model_id, AnthropicModel):
             if capability_override is None:
                 capability_override = model_id.capabilities
+            if effort is None:
+                effort = model_id.defaults.get("effort")
+            if thinking is None:
+                thinking = model_id.defaults.get("thinking")
             model_id = model_id.model_id
         return super().new_model(
             model_id,
@@ -267,8 +307,7 @@ class AnthropicProvider(Provider):
 
         thinking_val = req.settings.get("thinking")
         if thinking_val is not None:
-            budget = thinking_val if isinstance(thinking_val, int) else int(thinking_val)
-            api_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            api_kwargs["thinking"] = self._thinking_to_api(thinking_val)
 
         effort = req.settings.get("effort")
         if effort is not None:
@@ -543,6 +582,33 @@ class AnthropicProvider(Provider):
             "description": t.description,
             "input_schema": t.schema,
         }
+
+    @staticmethod
+    def _thinking_to_api(value: Any) -> dict[str, Any]:
+        """Map the `thinking` knob value to the API's thinking config.
+
+        `ThinkingMode` members (or their string values) select adaptive/disabled
+        modes; any other value is treated as a legacy budget-token count. The
+        gate in `_build_request` rejects the budget *form* on models without the
+        `"thinking_budget"` capability (Opus 4.7/4.8), so a budget only reaches
+        here on models that accept the form — but the budget's value range is not
+        validated, so an out-of-range count surfaces as a provider 400."""
+        if isinstance(value, bool):
+            raise TypeError(
+                "thinking= expects a ThinkingMode, a mode string "
+                "('adaptive'/'adaptive_summarized'/'disabled'), or an int token "
+                "budget — got a bool."
+            )
+        if isinstance(value, ThinkingMode):
+            value = value.value
+        if value == ThinkingMode.ADAPTIVE.value:
+            return {"type": "adaptive"}
+        if value == ThinkingMode.ADAPTIVE_SUMMARIZED.value:
+            return {"type": "adaptive", "display": "summarized"}
+        if value == ThinkingMode.DISABLED.value:
+            return {"type": "disabled"}
+        budget = value if isinstance(value, int) else int(value)
+        return {"type": "enabled", "budget_tokens": budget}
 
     def _tool_choice_to_api(self, tc: str) -> dict[str, Any]:
         if tc == "auto":

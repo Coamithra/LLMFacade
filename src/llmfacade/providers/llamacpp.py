@@ -35,7 +35,7 @@ from llmfacade.providers._launch import (
     validate_flash_attn,
 )
 from llmfacade.providers._swap_lifecycle import _LlamaSwapSupervisor
-from llmfacade.settings import OutputFormat
+from llmfacade.settings import OutputFormat, ThinkingMode
 
 if TYPE_CHECKING:
     from llmfacade.facade import LLM
@@ -116,7 +116,7 @@ class LlamaCppServerProvider(Provider):
         min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
-        thinking: int | None = None,
+        thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,
@@ -326,7 +326,7 @@ class LlamaCppServerProvider(Provider):
         min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
-        thinking: int | None = None,
+        thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,

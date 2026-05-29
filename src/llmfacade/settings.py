@@ -4,8 +4,61 @@ from enum import Enum
 
 
 class EffortLevel(Enum):
-    NORMAL = "normal"
+    """Reasoning-effort levels — controls thinking depth and overall token spend.
+
+    Maps to Anthropic ``output_config.effort`` and OpenAI ``reasoning_effort``.
+    The members cover the Anthropic value set (default ``HIGH``; ``XHIGH``/``MAX``
+    are Opus-tier only — Sonnet/Haiku reject them, and Sonnet 4.5 / Haiku 4.5
+    reject effort entirely). The provider surfaces don't line up exactly: OpenAI
+    accepts ``none``/``minimal`` (not in this enum) but has **no ``MAX``**. Both
+    providers also accept a raw string for the knob, so provider-specific values
+    pass through; ``EffortLevel`` is the portable convenience for the shared
+    levels (``low``/``medium``/``high``/``xhigh``)."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
     MAX = "max"
+
+
+class ThinkingMode(Enum):
+    """Adaptive-thinking modes for the Anthropic ``thinking`` knob.
+
+    On Opus 4.7/4.8 adaptive is the *only* on-mode — budget-based extended
+    thinking (passing an ``int`` token budget) returns a 400 there and is gated
+    by the ``"thinking_budget"`` capability. ``ADAPTIVE`` lets the model decide
+    when/how much to think with reasoning text omitted (the API default);
+    ``ADAPTIVE_SUMMARIZED`` surfaces a summary of the reasoning in thinking
+    blocks; ``DISABLED`` turns thinking off explicitly. Passing an ``int`` for
+    ``thinking`` still selects legacy budget-based extended thinking on models
+    that support it (e.g. Sonnet 4.6, older models)."""
+
+    ADAPTIVE = "adaptive"
+    ADAPTIVE_SUMMARIZED = "adaptive_summarized"
+    DISABLED = "disabled"
+
+
+_ADAPTIVE_THINKING_VALUES: frozenset[str] = frozenset(m.value for m in ThinkingMode)
+
+
+def is_budget_thinking(value: object) -> bool:
+    """True if a ``thinking`` knob value selects legacy budget-based extended
+    thinking (an integer token budget) rather than an adaptive/disabled mode.
+
+    The budget form (``{"type": "enabled", "budget_tokens": N}``) is rejected by
+    Opus 4.7/4.8; the request-time gate uses this to raise ``UnsupportedFeature``
+    on models that lack the ``"thinking_budget"`` capability. ``ThinkingMode``
+    members and their string values are adaptive/disabled modes, never budget.
+    This classifies the thinking *form* only — it does not validate a budget's
+    value range (a non-positive or too-small budget is the caller's problem and
+    surfaces as a provider 400). ``bool`` is never a budget (so a stray
+    ``thinking=True`` isn't silently read as ``budget_tokens=1``)."""
+    if value is None or isinstance(value, (bool, ThinkingMode)):
+        return False
+    if isinstance(value, str):
+        return value not in _ADAPTIVE_THINKING_VALUES
+    return True
 
 
 class OutputFormat(Enum):
@@ -75,6 +128,8 @@ LAUNCH_KNOBS: frozenset[str] = frozenset(
 
 __all__ = [
     "EffortLevel",
+    "ThinkingMode",
+    "is_budget_thinking",
     "OutputFormat",
     "EphemeralCacheTTL",
     "RUNTIME_KNOBS",

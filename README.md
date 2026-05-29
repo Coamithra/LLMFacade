@@ -63,7 +63,7 @@ All generation knobs are plain string kwargs — currently `temperature`, `max_t
 
 ```python
 provider = mgr.new_provider("anthropic", temperature=0.7)        # provider-wide default
-model    = provider.new_model("claude-opus-4-7", thinking=2048)  # narrows for this model
+model    = provider.new_model("claude-sonnet-4-6", thinking=2048) # narrows for this model
 chat     = model.new_conversation(temperature=0.3)               # narrows for this convo
 resp     = chat.send("Hello", max_tokens=128)                    # one-shot override
 ```
@@ -90,11 +90,25 @@ For Anthropic, you can pass an `AnthropicModel` enum member to `new_model` — i
 
 ```python
 from llmfacade.providers.anthropic import AnthropicModel
+from llmfacade import EffortLevel, ThinkingMode
 
-opus = provider.new_model(AnthropicModel.OPUS_4_7, max_tokens=4096)
+# Opus 4.8 comes pre-tuned: effort=xhigh + adaptive thinking are applied as
+# model defaults. Just bind it and go.
+opus = provider.new_model(AnthropicModel.OPUS_4_8, max_tokens=4096)
+chat = opus.new_conversation()                                    # pre-tuned: xhigh + adaptive
+
+# Override per conversation when you want something else:
+quick = opus.new_conversation(effort=EffortLevel.LOW, thinking=ThinkingMode.DISABLED)
+verbose = opus.new_conversation(thinking=ThinkingMode.ADAPTIVE_SUMMARIZED)  # surface reasoning
 ```
 
-The enum is a per-release snapshot of the current generation (`OPUS_4_7`, `SONNET_4_6`, `HAIKU_4_5`). Passing a raw string opts out — full `SUPPORTS` is used and you're responsible for `capability_override=` if needed (e.g. for older 3.x models that lack `thinking`).
+The enum is a per-release snapshot of the current generation (`OPUS_4_8`, `SONNET_4_6`, `HAIKU_4_5`). Each member carries the right capability set **and** sensible defaults:
+
+- `OPUS_4_8` drops `temperature`, `top_p`, and `top_k` (the Opus 4.7+ API rejects them with a 400), so setting any of those raises `UnsupportedFeature` up front. It keeps thinking, but only in **adaptive** form (`thinking=ThinkingMode.ADAPTIVE` / `ADAPTIVE_SUMMARIZED` / `DISABLED`) — a budget-based `thinking=<int>` also 400s on Opus 4.7+, so it's gated and raises at request time. Depth is controlled by `effort` (`LOW`/`MEDIUM`/`HIGH`/`XHIGH`/`MAX`).
+- `OPUS_4_8` also defaults to `effort=XHIGH` + `thinking=ADAPTIVE` (its recommended settings for coding/agentic work); pass your own `effort=` / `thinking=` to override, or `thinking=ThinkingMode.DISABLED` to turn thinking off.
+- Sonnet 4.6 / Haiku 4.5 carry no generation defaults and still accept budget thinking.
+
+Passing a raw string model id opts out of all narrowing and defaults — full `SUPPORTS` is used and you're responsible for `capability_override=` if needed.
 
 ## Tools
 
@@ -232,8 +246,8 @@ The same machinery powers the `cache_summary.approximate_messages_cached` field 
 
 | Provider | Install extra | API key env | Notes |
 |---|---|---|---|
-| Anthropic | `[anthropic]` | `ANTHROPIC_API_KEY` | Extended thinking, prompt caching, system blocks with `cache=True`, `cache_ttl` (`EphemeralCacheTTL.FIVE_MINUTES` / `ONE_HOUR`), `auto_cache_last_user`, `auto_cache_tools`. Exports `AnthropicModel` enum (`OPUS_4_7`, `SONNET_4_6`, `HAIKU_4_5`). |
-| OpenAI    | `[openai]`    | `OPENAI_API_KEY`    | `output_format` (JSON mode); `org_id` constructor arg. |
+| Anthropic | `[anthropic]` | `ANTHROPIC_API_KEY` | Extended thinking, prompt caching, system blocks with `cache=True`, `cache_ttl` (`EphemeralCacheTTL.FIVE_MINUTES` / `ONE_HOUR`), `auto_cache_last_user`, `auto_cache_tools`. Exports `AnthropicModel` enum (`OPUS_4_8`, `SONNET_4_6`, `HAIKU_4_5`). |
+| OpenAI    | `[openai]`    | `OPENAI_API_KEY`    | Chat Completions. `effort` → `reasoning_effort` (GPT-5 / o-series); `output_format` does JSON mode **and** strict Structured Outputs (pass a JSON-Schema `dict`); `org_id` constructor arg. Emits `max_completion_tokens` (the GPT-5 series rejects legacy `max_tokens`). |
 | Google Gemini | `[google]` | `GOOGLE_API_KEY`   | Registered as both `"google"` and `"gemini"`. |
 | llama.cpp | `[llamacpp]`  | (none)              | Two modes (see below). First-class `min_p`; `top_k`/`min_p`/`repeat_penalty` ride the SDK's `extra_body=`. Introspection: `health()`, `slots()`, `save_slot()`, `restore_slot()`, `erase_slot()`. Managed-mode-only: `running()`, `unload()`, `unload_all()`, `shutdown()`. `count_tokens()` calls the server's `/tokenize`. |
 

@@ -41,6 +41,7 @@ from llmfacade.provider import (
     _filter_unsupported,
     _validate_knobs,
 )
+from llmfacade.settings import ThinkingMode, is_budget_thinking
 from llmfacade.tools import Tool
 
 if TYPE_CHECKING:
@@ -185,7 +186,7 @@ class Conversation:
         min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
-        thinking: int | None = None,
+        thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,
@@ -408,7 +409,7 @@ class Conversation:
         min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
-        thinking: int | None = None,
+        thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,
@@ -473,7 +474,7 @@ class Conversation:
         min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
-        thinking: int | None = None,
+        thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,
@@ -533,7 +534,7 @@ class Conversation:
         min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
-        thinking: int | None = None,
+        thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,
@@ -620,7 +621,7 @@ class Conversation:
         min_p: float | None = None,
         repeat_penalty: float | None = None,
         effort: Any | None = None,
-        thinking: int | None = None,
+        thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
         user_metadata: dict[str, str] | None = None,
         cache_ttl: Any | None = None,
@@ -992,6 +993,17 @@ class Conversation:
         if "max_tokens" not in merged and "max_tokens" in self._model._supports:
             merged["max_tokens"] = 1024
             sources["max_tokens"] = "default"
+
+        # Budget-based extended thinking (an int token budget) is a distinct
+        # capability from the adaptive `thinking` modes: Opus 4.7/4.8 accept
+        # adaptive thinking but 400 on a budget. The `thinking` knob name is
+        # gated by SUPPORTS like any other; this is the value-level gate that
+        # rejects the budget *form* on models without "thinking_budget" (e.g.
+        # Opus 4.8), so it fails fast here instead of as a provider 400. A
+        # ThinkingMode value is never a budget and passes through.
+        thinking_val = merged.get("thinking")
+        if is_budget_thinking(thinking_val) and not self._model.is_available("thinking_budget"):
+            raise UnsupportedFeature("thinking_budget", provider.NAME, self._model.model_id)
 
         # Validate forced-tool selection: a named tool_choice must match a
         # registered tool, and any non-"auto" tool_choice requires tools to be

@@ -35,6 +35,7 @@ class MockProvider(Provider):
             "temperature",
             "top_p",
             "thinking",
+            "thinking_budget",
             "auto_cache_last_user",
             "auto_cache_tools",
             "user_metadata",

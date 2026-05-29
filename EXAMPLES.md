@@ -48,18 +48,40 @@ print(resp.text)
 
 ## Streaming with extended thinking
 
+`thinking=<int>` requests legacy budget-based extended thinking — valid on Sonnet 4.6 (and older models), but **not** Opus 4.7/4.8, which only accept adaptive thinking:
+
 ```python
 from llmfacade import LLM
 
 chat = (LLM.default()
         .new_provider("anthropic")
-        .new_model("claude-opus-4-7", thinking=4096)
+        .new_model("claude-sonnet-4-6", thinking=4096)
         .new_conversation())
 
 for ev in chat.stream("Prove there are infinitely many primes."):
     if ev.thinking_delta:                    # dim — model's scratch reasoning
         print(f"\033[2m{ev.thinking_delta}\033[0m", end="", flush=True)
     if ev.text_delta:                        # bright — final answer
+        print(ev.text_delta, end="", flush=True)
+```
+
+On Opus 4.8, use **adaptive** thinking instead — the model decides when and how
+much to reason, and `effort` controls depth. `ADAPTIVE_SUMMARIZED` surfaces a
+summary of the reasoning as `thinking_delta`s (plain `ADAPTIVE` keeps them
+empty, the API default):
+
+```python
+from llmfacade import LLM, EffortLevel, ThinkingMode
+
+chat = (LLM.default()
+        .new_provider("anthropic")
+        .new_model("claude-opus-4-8")
+        .new_conversation(thinking=ThinkingMode.ADAPTIVE_SUMMARIZED, effort=EffortLevel.HIGH))
+
+for ev in chat.stream("Prove there are infinitely many primes."):
+    if ev.thinking_delta:
+        print(f"\033[2m{ev.thinking_delta}\033[0m", end="", flush=True)
+    if ev.text_delta:
         print(ev.text_delta, end="", flush=True)
 ```
 
