@@ -356,6 +356,40 @@ def test_tool_replay_round_trip(tmp_path):
     assert len(p2.calls) == 0
 
 
+def test_usage_reasoning_tokens_round_trip():
+    """reasoning_tokens survives serialise → deserialise; an older cache entry
+    written without the field deserialises to the default 0."""
+    from llmfacade.cache import _deserialize_response, _serialize_response
+    from llmfacade.models import Response
+
+    resp = Response(
+        text="answer",
+        blocks=[TextBlock(text="answer")],
+        tool_calls=[],
+        thinking="reasoning",
+        usage=Usage(prompt_tokens=5, completion_tokens=20, total_tokens=25, reasoning_tokens=12),
+        finish_reason="stop",
+        model="mock",
+    )
+    restored = _deserialize_response(_serialize_response(resp))
+    assert restored.usage is not None
+    assert restored.usage.reasoning_tokens == 12
+
+    # Legacy entry: usage dict predating the field → default 0, no crash.
+    legacy = {
+        "text": "x",
+        "blocks": [],
+        "tool_calls": [],
+        "thinking": None,
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        "finish_reason": "stop",
+        "model": "mock",
+    }
+    legacy_restored = _deserialize_response(legacy)
+    assert legacy_restored.usage is not None
+    assert legacy_restored.usage.reasoning_tokens == 0
+
+
 # --- replay_stream helper directly --------------------------------------
 
 

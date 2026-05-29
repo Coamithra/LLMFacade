@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import uuid
@@ -1163,6 +1164,9 @@ class Conversation:
         summary = self._cache_summary(req, resp.usage)
         if summary is not None:
             record["cache_summary"] = summary
+        reasoning = self._reasoning_summary(resp)
+        if reasoning is not None:
+            record["reasoning"] = reasoning
         self._append_log(record)
         if self._html_logger is not None:
             self._html_logger.write_response(
@@ -1170,10 +1174,38 @@ class Conversation:
                 text=resp.text,
                 usage=_dump_usage(resp.usage),
                 cache_summary=summary,
+                reasoning=reasoning,
                 finish_reason=resp.finish_reason,
                 model_id=resp.model,
             )
         self._logged_msg_count += 1
+
+    def _reasoning_summary(self, resp: Response) -> dict[str, Any] | None:
+        """Resolve a reasoning-token count for the log.
+
+        Prefers the provider-reported ``usage.reasoning_tokens``. When the API
+        doesn't break reasoning out — llama.cpp folds it into
+        ``completion_tokens``; Anthropic doesn't report it separately — falls
+        back to counting the reasoning text (``resp.thinking``) with the
+        provider's local tokenizer: exact for llama.cpp (``/tokenize``), a
+        labelled ``chars/4`` estimate for Anthropic. Returns ``None`` when the
+        turn produced no visible reasoning (no text and no reported count)."""
+        reported = resp.usage.reasoning_tokens if resp.usage else 0
+        text = resp.thinking or ""
+        if not reported and not text:
+            return None
+        if reported:
+            return {"reasoning_tokens": reported, "source": "provider", "estimated": False}
+        provider = self._model.provider
+        model_id = self._model.model_id
+        out: dict[str, Any] = {
+            "source": provider.tokenizer_name(model_id=model_id),
+            "estimated": True,
+            "chars": len(text),
+        }
+        with contextlib.suppress(Exception):
+            out["reasoning_tokens"] = provider.count_tokens(text, model_id=model_id)
+        return out
 
     def _cache_summary(self, req: CompletionRequest, usage: Any) -> dict[str, Any] | None:
         if usage is None:

@@ -42,6 +42,27 @@ if TYPE_CHECKING:
     from llmfacade.model import Model
 
 
+def _llama_reasoning(obj: Any) -> str:
+    """Read reasoning text off a llama-server message or streaming delta.
+
+    llama.cpp surfaces extracted reasoning as ``reasoning_content`` (DeepSeek
+    convention, the default when ``--reasoning-format`` parsing is on); some
+    OpenAI-compat builds use ``reasoning``. The OpenAI SDK preserves these as
+    extra attributes on the parsed model. Returns ``""`` when neither is set."""
+    return getattr(obj, "reasoning_content", None) or getattr(obj, "reasoning", None) or ""
+
+
+def _llama_reasoning_tokens(usage: Any) -> int:
+    """Pull a reasoning-token count from llama-server usage if the build
+    reports one in ``completion_tokens_details.reasoning_tokens``. Most builds
+    fold reasoning into ``completion_tokens`` with no breakdown (→ 0); the
+    conversation log then counts the reasoning text locally via ``/tokenize``."""
+    details = getattr(usage, "completion_tokens_details", None)
+    if details is None:
+        return 0
+    return getattr(details, "reasoning_tokens", 0) or 0
+
+
 class LlamaCppServerProvider(Provider):
     """Talks to a llama.cpp ``llama-server`` over its OpenAI-compatible
     HTTP endpoint at ``<base_url>/v1/chat/completions`` plus a small set of
@@ -564,7 +585,11 @@ class LlamaCppServerProvider(Provider):
         try:
             stream = self._client.chat.completions.create(**api_kwargs)
             tool_buf: dict[int, dict[str, Any]] = {}
-            state: dict[str, Any] = {"finish_reason": None}
+            state: dict[str, Any] = {
+                "finish_reason": None,
+                "reasoning": [],
+                "reasoning_emitted": False,
+            }
             for chunk in stream:
                 yield from self._chunk_to_events(chunk, tool_buf, state)
         except self._module.RateLimitError as e:
@@ -580,7 +605,11 @@ class LlamaCppServerProvider(Provider):
         try:
             stream = await self._aclient.chat.completions.create(**api_kwargs)
             tool_buf: dict[int, dict[str, Any]] = {}
-            state: dict[str, Any] = {"finish_reason": None}
+            state: dict[str, Any] = {
+                "finish_reason": None,
+                "reasoning": [],
+                "reasoning_emitted": False,
+            }
             async for chunk in stream:
                 for ev in self._chunk_to_events(chunk, tool_buf, state):
                     yield ev
@@ -588,6 +617,16 @@ class LlamaCppServerProvider(Provider):
             raise RateLimitError(str(e)) from e
         except self._module.APIError as e:
             raise ProviderError(str(e), original=e) from e
+
+    @staticmethod
+    def _flush_reasoning(state: dict[str, Any]) -> StreamEvent | None:
+        """Emit the accumulated reasoning as a single ``ThinkingBlock`` event,
+        once, before the first non-reasoning content. Returns ``None`` if there
+        is nothing to flush or it was already flushed."""
+        if state.get("reasoning") and not state.get("reasoning_emitted"):
+            state["reasoning_emitted"] = True
+            return StreamEvent(thinking_block=ThinkingBlock(text="".join(state["reasoning"])))
+        return None
 
     def _chunk_to_events(
         self,
@@ -599,8 +638,15 @@ class LlamaCppServerProvider(Provider):
             delta = getattr(choice, "delta", None)
             if delta is None:
                 continue
+            reasoning = _llama_reasoning(delta)
+            if reasoning:
+                state["reasoning"].append(reasoning)
+                yield StreamEvent(thinking_delta=reasoning)
             text = getattr(delta, "content", None)
             if text:
+                flushed = self._flush_reasoning(state)
+                if flushed is not None:
+                    yield flushed
                 yield StreamEvent(text_delta=text)
             for tc in getattr(delta, "tool_calls", None) or []:
                 idx = getattr(tc, "index", 0)
@@ -616,6 +662,11 @@ class LlamaCppServerProvider(Provider):
             choice_finish = getattr(choice, "finish_reason", None)
             if choice_finish is not None:
                 state["finish_reason"] = choice_finish
+                # Flush a reasoning-only turn (reasoning with no following text)
+                # before any tool calls so it still lands in history.
+                flushed = self._flush_reasoning(state)
+                if flushed is not None:
+                    yield flushed
                 for slot in tool_buf.values():
                     if slot["id"] is None:
                         continue
@@ -631,12 +682,18 @@ class LlamaCppServerProvider(Provider):
                 tool_buf.clear()
         usage = getattr(chunk, "usage", None)
         if usage is not None:
+            # Safety net: a usage chunk with no prior finish_reason still gets
+            # any pending reasoning flushed before the terminal event.
+            flushed = self._flush_reasoning(state)
+            if flushed is not None:
+                yield flushed
             yield StreamEvent(
                 done=True,
                 usage=Usage(
                     prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                     completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
                     total_tokens=getattr(usage, "total_tokens", 0) or 0,
+                    reasoning_tokens=_llama_reasoning_tokens(usage),
                 ),
                 finish_reason=state.get("finish_reason"),
             )
@@ -726,8 +783,13 @@ class LlamaCppServerProvider(Provider):
     def _parse_response(self, raw: Any) -> Response:
         choice = raw.choices[0]
         msg = choice.message
+        reasoning = _llama_reasoning(msg)
         text = getattr(msg, "content", "") or ""
+        # Reasoning leads the assistant turn (matches the canonical thinking-
+        # then-text ordering the rest of the facade assumes).
         blocks: list[ContentBlock] = []
+        if reasoning:
+            blocks.append(ThinkingBlock(text=reasoning))
         if text:
             blocks.append(TextBlock(text))
         tool_calls: list[ToolCall] = []
@@ -745,13 +807,14 @@ class LlamaCppServerProvider(Provider):
                 prompt_tokens=raw.usage.prompt_tokens,
                 completion_tokens=raw.usage.completion_tokens,
                 total_tokens=raw.usage.total_tokens,
+                reasoning_tokens=_llama_reasoning_tokens(raw.usage),
             )
 
         return Response(
             text=text,
             blocks=blocks,
             tool_calls=tool_calls,
-            thinking=None,
+            thinking=reasoning or None,
             usage=usage,
             finish_reason=choice.finish_reason,
             model=raw.model,

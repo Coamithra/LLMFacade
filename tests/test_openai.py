@@ -96,3 +96,21 @@ def test_openai_text_and_unset_omit_response_format(openai_provider: OpenAIProvi
         _req(output_format=OutputFormat.TEXT)
     )
     assert "response_format" not in openai_provider._build_kwargs(_req())
+
+
+# ---- reasoning-token extraction -------------------------------------------
+
+
+def test_openai_reasoning_tokens_extracted():
+    """``completion_tokens_details.reasoning_tokens`` is pulled out; absent
+    details or absent field → 0."""
+    from types import SimpleNamespace
+
+    from llmfacade.providers.openai import _openai_reasoning_tokens
+
+    with_details = SimpleNamespace(completion_tokens_details=SimpleNamespace(reasoning_tokens=33))
+    assert _openai_reasoning_tokens(with_details) == 33
+    assert _openai_reasoning_tokens(SimpleNamespace()) == 0
+    assert (
+        _openai_reasoning_tokens(SimpleNamespace(completion_tokens_details=SimpleNamespace())) == 0
+    )

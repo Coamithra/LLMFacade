@@ -377,6 +377,7 @@ class HtmlLogger:
         text: str,
         usage: dict[str, int] | None,
         cache_summary: dict[str, Any] | None,
+        reasoning: dict[str, Any] | None = None,
         finish_reason: str | None,
         model_id: str,
     ) -> None:
@@ -399,8 +400,8 @@ class HtmlLogger:
             body = _escape(_abbreviate_text(text, self.max_lines))
             out.append(f'<div class="msg-text">{body}</div>\n')
 
+        badges: list[str] = []
         if usage:
-            badges: list[str] = []
             for key, label in (
                 ("prompt_tokens", "in"),
                 ("completion_tokens", "out"),
@@ -410,8 +411,11 @@ class HtmlLogger:
                 v = usage.get(key) or 0
                 if v:
                     badges.append(f'<span class="badge">{label} {v}</span>')
-            if badges:
-                out.append(f'<div class="usage-line">{"".join(badges)}</div>\n')
+        reasoning_badge = self._reasoning_badge(reasoning)
+        if reasoning_badge:
+            badges.append(reasoning_badge)
+        if badges:
+            out.append(f'<div class="usage-line">{"".join(badges)}</div>\n')
 
         if cache_summary:
             note = cache_summary.get("_note", "")
@@ -423,6 +427,20 @@ class HtmlLogger:
 
         out.append("</section>\n")
         self._append("".join(out))
+
+    @staticmethod
+    def _reasoning_badge(reasoning: dict[str, Any] | None) -> str:
+        """Render the reasoning-token count as a usage badge, sitting next to
+        ``out``. ``~`` prefixes a locally-counted estimate (the provider didn't
+        report a breakdown); a ``title`` tooltip names the source tokenizer."""
+        if not reasoning or reasoning.get("reasoning_tokens") is None:
+            return ""
+        n = reasoning["reasoning_tokens"]
+        estimated = reasoning.get("estimated")
+        source = reasoning.get("source", "")
+        prefix = "~" if estimated else ""
+        title = f"counted locally via {source}" if estimated else "reported by provider usage"
+        return f'<span class="badge" title="{_escape(str(title))}">reasoning {prefix}{n}</span>'
 
     def _append(self, content: str) -> None:
         with self.path.open("a", encoding="utf-8") as fh:

@@ -14,6 +14,7 @@ import pytest
 
 from llmfacade import Message, tool
 from llmfacade.exceptions import ProviderError
+from llmfacade.models import TextBlock, ThinkingBlock
 from llmfacade.provider import CompletionRequest
 from llmfacade.providers.llamacpp import LlamaCppServerProvider
 from llmfacade.settings import OutputFormat
@@ -126,10 +127,25 @@ class _FakeToolCall:
         self.function = _FakeFn(name, arguments)
 
 
+class _FakeReasoningDetails:
+    def __init__(self, reasoning_tokens: int):
+        self.reasoning_tokens = reasoning_tokens
+
+
 class _FakeMsg:
-    def __init__(self, *, content: str = "", tool_calls: list[Any] | None = None):
+    def __init__(
+        self,
+        *,
+        content: str = "",
+        tool_calls: list[Any] | None = None,
+        reasoning_content: str | None = None,
+    ):
         self.content = content
         self.tool_calls = tool_calls
+        # Only set when present so getattr(..., None) mirrors the SDK, where a
+        # non-reasoning response simply lacks the extra attribute.
+        if reasoning_content is not None:
+            self.reasoning_content = reasoning_content
 
 
 class _FakeChoice:
@@ -139,10 +155,12 @@ class _FakeChoice:
 
 
 class _FakeUsage:
-    def __init__(self, *, prompt: int, completion: int):
+    def __init__(self, *, prompt: int, completion: int, reasoning_tokens: int | None = None):
         self.prompt_tokens = prompt
         self.completion_tokens = completion
         self.total_tokens = prompt + completion
+        if reasoning_tokens is not None:
+            self.completion_tokens_details = _FakeReasoningDetails(reasoning_tokens)
 
 
 class _FakeResponse:
@@ -155,14 +173,22 @@ class _FakeResponse:
         model: str = "qwen2.5",
         prompt: int = 5,
         completion: int = 2,
+        reasoning_content: str | None = None,
+        reasoning_tokens: int | None = None,
     ):
         self.choices = [
             _FakeChoice(
-                message=_FakeMsg(content=content, tool_calls=tool_calls),
+                message=_FakeMsg(
+                    content=content,
+                    tool_calls=tool_calls,
+                    reasoning_content=reasoning_content,
+                ),
                 finish_reason=finish_reason,
             )
         ]
-        self.usage = _FakeUsage(prompt=prompt, completion=completion)
+        self.usage = _FakeUsage(
+            prompt=prompt, completion=completion, reasoning_tokens=reasoning_tokens
+        )
         self.model = model
 
 
@@ -212,13 +238,70 @@ def test_complete_tool_call_roundtrip(monkeypatch, provider: LlamaCppServerProvi
     assert call.id == "call-1"
 
 
+# ---- reasoning capture ----------------------------------------------------
+
+
+def test_complete_captures_reasoning_content(monkeypatch, provider: LlamaCppServerProvider):
+    """llama-server's ``reasoning_content`` becomes a leading ThinkingBlock and
+    populates ``Response.thinking`` (was silently dropped before)."""
+    monkeypatch.setattr(
+        provider._client.chat.completions,
+        "create",
+        lambda **_kw: _FakeResponse(content="the answer", reasoning_content="let me think"),
+    )
+    resp = provider._complete_raw(_req())
+    assert resp.thinking == "let me think"
+    thinking = [b for b in resp.blocks if isinstance(b, ThinkingBlock)]
+    assert len(thinking) == 1
+    assert thinking[0].text == "let me think"
+    assert thinking[0].encrypted is False
+    # Reasoning leads the assistant turn, text follows.
+    assert isinstance(resp.blocks[0], ThinkingBlock)
+    assert isinstance(resp.blocks[1], TextBlock)
+
+
+def test_complete_reasoning_tokens_from_details(monkeypatch, provider: LlamaCppServerProvider):
+    """A build that reports ``completion_tokens_details.reasoning_tokens`` is
+    surfaced verbatim on ``Usage``."""
+    monkeypatch.setattr(
+        provider._client.chat.completions,
+        "create",
+        lambda **_kw: _FakeResponse(content="answer", reasoning_content="x", reasoning_tokens=42),
+    )
+    resp = provider._complete_raw(_req())
+    assert resp.usage is not None
+    assert resp.usage.reasoning_tokens == 42
+
+
+def test_complete_without_reasoning_is_unchanged(monkeypatch, provider: LlamaCppServerProvider):
+    """No ``reasoning_content`` → no ThinkingBlock, thinking is None, count 0."""
+    monkeypatch.setattr(
+        provider._client.chat.completions,
+        "create",
+        lambda **_kw: _FakeResponse(content="answer"),
+    )
+    resp = provider._complete_raw(_req())
+    assert resp.thinking is None
+    assert all(not isinstance(b, ThinkingBlock) for b in resp.blocks)
+    assert resp.usage is not None
+    assert resp.usage.reasoning_tokens == 0
+
+
 # ---- streaming ------------------------------------------------------------
 
 
 class _FakeDelta:
-    def __init__(self, *, content: str | None = None, tool_calls: list[Any] | None = None):
+    def __init__(
+        self,
+        *,
+        content: str | None = None,
+        tool_calls: list[Any] | None = None,
+        reasoning_content: str | None = None,
+    ):
         self.content = content
         self.tool_calls = tool_calls
+        if reasoning_content is not None:
+            self.reasoning_content = reasoning_content
 
 
 class _FakeStreamChoice:
@@ -255,6 +338,56 @@ def test_stream_finish_reason_length(monkeypatch, provider: LlamaCppServerProvid
     final = [e for e in events if e.done]
     assert len(final) == 1
     assert final[0].finish_reason == "length"
+
+
+def test_stream_captures_reasoning_content(monkeypatch, provider: LlamaCppServerProvider):
+    """Streaming ``delta.reasoning_content`` is emitted as thinking deltas and
+    consolidated into one ThinkingBlock flushed *before* the first text."""
+    chunks = [
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(reasoning_content="think "))]
+        ),
+        _FakeStreamChunk(choices=[_FakeStreamChoice(delta=_FakeDelta(reasoning_content="more"))]),
+        _FakeStreamChunk(choices=[_FakeStreamChoice(delta=_FakeDelta(content="answer"))]),
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(), finish_reason="stop")],
+            usage=_FakeUsage(prompt=5, completion=4, reasoning_tokens=3),
+        ),
+    ]
+    monkeypatch.setattr(provider._client.chat.completions, "create", lambda **_kw: iter(chunks))
+    events = list(provider._stream_raw(_req()))
+
+    assert [e.thinking_delta for e in events if e.thinking_delta] == ["think ", "more"]
+    tblocks = [e.thinking_block for e in events if e.thinking_block is not None]
+    assert len(tblocks) == 1
+    assert tblocks[0].text == "think more"
+    # The consolidated thinking block precedes the text delta.
+    block_idx = next(i for i, e in enumerate(events) if e.thinking_block is not None)
+    text_idx = next(i for i, e in enumerate(events) if e.text_delta)
+    assert block_idx < text_idx
+    # reasoning_tokens rides on the terminal usage event.
+    final = [e for e in events if e.done]
+    assert final[0].usage is not None
+    assert final[0].usage.reasoning_tokens == 3
+
+
+def test_stream_reasoning_only_still_flushes_block(monkeypatch, provider: LlamaCppServerProvider):
+    """A reasoning-only turn (no following content) still flushes the
+    ThinkingBlock so it lands in history."""
+    chunks = [
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(reasoning_content="just thinking"))]
+        ),
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(), finish_reason="stop")],
+            usage=_FakeUsage(prompt=5, completion=4),
+        ),
+    ]
+    monkeypatch.setattr(provider._client.chat.completions, "create", lambda **_kw: iter(chunks))
+    events = list(provider._stream_raw(_req()))
+    tblocks = [e.thinking_block for e in events if e.thinking_block is not None]
+    assert len(tblocks) == 1
+    assert tblocks[0].text == "just thinking"
 
 
 # ---- introspection (mocked httpx) ----------------------------------------

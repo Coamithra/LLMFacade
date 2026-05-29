@@ -38,6 +38,16 @@ def _openai_cached_tokens(usage: Any) -> int:
     return getattr(details, "cached_tokens", 0) or 0
 
 
+def _openai_reasoning_tokens(usage: Any) -> int:
+    """Pull reasoning-token count from OpenAI usage. Lives in
+    ``completion_tokens_details.reasoning_tokens`` on reasoning-model
+    (o-series, GPT-5) chat-completion responses; absent (→ 0) otherwise."""
+    details = getattr(usage, "completion_tokens_details", None)
+    if details is None:
+        return 0
+    return getattr(details, "reasoning_tokens", 0) or 0
+
+
 class OpenAIProvider(Provider):
     NAME = "openai"
     API_KEY_ENV = "OPENAI_API_KEY"
@@ -299,6 +309,7 @@ class OpenAIProvider(Provider):
                     completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
                     total_tokens=getattr(usage, "total_tokens", 0) or 0,
                     cache_read_tokens=_openai_cached_tokens(usage),
+                    reasoning_tokens=_openai_reasoning_tokens(usage),
                 ),
                 finish_reason=state.get("finish_reason"),
             )
@@ -416,6 +427,7 @@ class OpenAIProvider(Provider):
                 completion_tokens=raw.usage.completion_tokens,
                 total_tokens=raw.usage.total_tokens,
                 cache_read_tokens=_openai_cached_tokens(raw.usage),
+                reasoning_tokens=_openai_reasoning_tokens(raw.usage),
             )
 
         return Response(

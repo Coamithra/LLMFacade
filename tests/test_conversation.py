@@ -271,6 +271,38 @@ def test_stream_writes_response_record(mock_model, tmp_path):
     assert reqs[1]["prior_history"]["messages"] == 2
 
 
+def test_response_record_carries_reasoning_summary(tmp_path):
+    """A turn with reasoning logs a `reasoning` summary block (locally counted,
+    flagged estimated) and a usage.reasoning_tokens field."""
+    from llmfacade.models import ThinkingBlock
+
+    p = MockProvider(
+        canned_text="answer",
+        canned_thinking_blocks=[ThinkingBlock(text="some reasoning text")],
+    )
+    model = p.new_model("mock-model")
+    log = tmp_path / "log.jsonl"
+    convo = model.new_conversation(name="t", log_path=log)
+    convo.send("q")
+
+    [resp] = _response_records(log)
+    assert "reasoning_tokens" in resp["usage"]
+    assert resp["reasoning"]["estimated"] is True
+    assert resp["reasoning"]["reasoning_tokens"] >= 1
+    assert resp["reasoning"]["source"] == "chars/4"
+
+
+def test_response_record_no_reasoning_block_without_reasoning(mock_model, tmp_path):
+    """A plain turn omits the `reasoning` summary block entirely."""
+    log = tmp_path / "log.jsonl"
+    convo = mock_model.new_conversation(name="t", log_path=log)
+    convo.send("q")
+    [resp] = _response_records(log)
+    assert "reasoning" not in resp
+    # usage still always carries the field (0 here).
+    assert resp["usage"]["reasoning_tokens"] == 0
+
+
 def test_astream_writes_response_record(mock_model, tmp_path):
     import asyncio
 

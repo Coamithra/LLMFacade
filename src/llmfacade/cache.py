@@ -247,6 +247,7 @@ def _serialize_response(resp: Response) -> dict[str, Any]:
                 "total_tokens": resp.usage.total_tokens,
                 "cache_creation_tokens": resp.usage.cache_creation_tokens,
                 "cache_read_tokens": resp.usage.cache_read_tokens,
+                "reasoning_tokens": resp.usage.reasoning_tokens,
             }
         ),
         "finish_reason": resp.finish_reason,

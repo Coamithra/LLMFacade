@@ -83,3 +83,42 @@ def test_assistant_text_round_trip_unchanged():
     m = Message(role="assistant", content=[TextBlock("hello")])
     out = p._message_to_api(m, {})
     assert out == [{"role": "model", "parts": [{"text": "hello"}]}]
+
+
+def test_usage_extracts_thoughts_token_count():
+    """Gemini reports thinking tokens in ``thoughts_token_count``; they map to
+    ``Usage.reasoning_tokens`` and are folded into the total."""
+    from types import SimpleNamespace
+
+    p = _bare_provider()
+    raw = SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=20,
+            thoughts_token_count=15,
+            cached_content_token_count=0,
+            total_token_count=45,
+        )
+    )
+    u = p._usage_from(raw)
+    assert u is not None
+    assert u.reasoning_tokens == 15
+    assert u.total_tokens == 45
+
+
+def test_usage_total_falls_back_to_sum_including_thoughts():
+    """With no ``total_token_count`` reported, the total includes thoughts."""
+    from types import SimpleNamespace
+
+    p = _bare_provider()
+    raw = SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=20,
+            thoughts_token_count=15,
+        )
+    )
+    u = p._usage_from(raw)
+    assert u is not None
+    assert u.reasoning_tokens == 15
+    assert u.total_tokens == 45

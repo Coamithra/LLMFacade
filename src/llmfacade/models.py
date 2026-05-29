@@ -88,6 +88,14 @@ class Usage:
     total_tokens: int
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    # Tokens spent on reasoning / chain-of-thought, a subset of the output the
+    # model produced. Reported separately by providers that expose it (OpenAI
+    # ``completion_tokens_details.reasoning_tokens``, Google
+    # ``thoughts_token_count``); ``0`` when the provider folds reasoning into
+    # ``completion_tokens`` without a breakdown (Anthropic, most llama.cpp
+    # builds). The conversation log falls back to a local tokenizer count of
+    # the reasoning text in that case.
+    reasoning_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)

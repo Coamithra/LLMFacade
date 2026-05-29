@@ -388,11 +388,18 @@ class GoogleProvider(Provider):
         prompt = getattr(um, "prompt_token_count", 0) or 0
         completion = getattr(um, "candidates_token_count", 0) or 0
         cached = getattr(um, "cached_content_token_count", 0) or 0
+        # Gemini reports thinking tokens separately; candidates_token_count is
+        # the visible output and excludes them, so add them into the total.
+        thoughts = getattr(um, "thoughts_token_count", 0) or 0
+        total = getattr(um, "total_token_count", None)
+        if not total:
+            total = prompt + completion + thoughts
         return Usage(
             prompt_tokens=prompt,
             completion_tokens=completion,
-            total_tokens=prompt + completion,
+            total_tokens=total,
             cache_read_tokens=cached,
+            reasoning_tokens=thoughts,
         )
 
     def _reraise(self, e: Exception) -> None:

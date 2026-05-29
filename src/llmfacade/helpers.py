@@ -275,6 +275,7 @@ def _dump_usage(u: Usage | None) -> dict[str, int] | None:
         "total_tokens": u.total_tokens,
         "cache_creation_tokens": u.cache_creation_tokens,
         "cache_read_tokens": u.cache_read_tokens,
+        "reasoning_tokens": u.reasoning_tokens,
     }
 
 

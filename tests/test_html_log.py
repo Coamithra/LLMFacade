@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from llmfacade import SystemBlock, tool
-from llmfacade.models import ToolCall
+from llmfacade.models import ThinkingBlock, ToolCall, Usage
 
 from .conftest import MockProvider
 
@@ -90,6 +90,56 @@ def test_html_renders_tool_use_block(tmp_path: Path):
     assert 'class="tool-use"' in html
     assert ">add<" in html  # tool name rendered
     assert "id=call_1" in html
+
+
+def test_html_renders_reasoning_block_and_estimated_badge(tmp_path: Path):
+    """A ThinkingBlock with no provider-reported reasoning_tokens renders a
+    collapsible reasoning block plus a usage badge with a locally-counted (~)
+    estimate. This is the llama.cpp / Gemma 4 case."""
+    p = MockProvider(
+        canned_text="the answer",
+        canned_thinking_blocks=[ThinkingBlock(text="a long stretch of reasoning text")],
+    )
+    model = p.new_model("mock-model")
+    log = tmp_path / "reason.jsonl"
+    convo = model.new_conversation(log_path=log)
+    convo.send("q")
+
+    html = log.with_suffix(".html").read_text(encoding="utf-8")
+    # Collapsible, default-collapsed reasoning block (no `open` attribute).
+    assert 'class="thinking-block"' in html
+    assert "<summary>thinking" in html
+    assert "a long stretch of reasoning text" in html
+    # Estimated token badge sits in the usage line, prefixed with ~.
+    assert "reasoning ~" in html
+
+
+def test_html_reasoning_badge_uses_provider_reported_count(tmp_path: Path):
+    """When the provider reports reasoning_tokens, the badge shows the exact
+    count with no ~ prefix."""
+    usage = Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30, reasoning_tokens=7)
+    p = MockProvider(
+        canned_text="answer",
+        canned_thinking_blocks=[ThinkingBlock(text="reason")],
+        canned_usage=usage,
+    )
+    model = p.new_model("mock-model")
+    log = tmp_path / "reason2.jsonl"
+    convo = model.new_conversation(log_path=log)
+    convo.send("q")
+
+    html = log.with_suffix(".html").read_text(encoding="utf-8")
+    assert "reasoning 7" in html
+    assert "reasoning ~" not in html
+
+
+def test_html_no_reasoning_badge_without_reasoning(mock_model, tmp_path: Path):
+    """A plain turn with no reasoning produces no reasoning badge."""
+    log = tmp_path / "plain.jsonl"
+    convo = mock_model.new_conversation(log_path=log)
+    convo.send("q")
+    html = log.with_suffix(".html").read_text(encoding="utf-8")
+    assert "reasoning " not in html
 
 
 def test_html_collapsibles_present(mock_model, tmp_path: Path):
