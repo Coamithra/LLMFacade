@@ -12,7 +12,7 @@ Trello board: **LLMFacade** — https://trello.com/b/WIanVfPx (board id `69f8642
 
 `plans/*.md` files are the long-form source of truth for open work; each file has a corresponding Trello card whose description points back to it. When a card's work is completed (and merged), delete the matching `plans/<file>.md` and archive (or move to `Done`) the card. The convention is: a card with no `plans/` file behind it is either already done or hasn't been spec'd yet.
 
-`docs/learnings/*.md` is the opposite of `plans/`: durable, persistent knowledge — external quirks, upstream bugs, non-obvious gotchas that cost real debugging time. Add an entry (and link it from `docs/learnings/README.md`) whenever a debugging session ends in an insight worth not rediscovering. These are never deleted.
+`docs/learnings/*.md` is the opposite of `plans/`: durable, persistent knowledge — external quirks, upstream bugs, non-obvious gotchas that cost real debugging time. Add an entry (and link it from `docs/learnings/README.md`) whenever a debugging or research session ends in an insight worth not rediscovering. These are never deleted.
 
 **Picking up a new card:** read `CONTRIBUTING.md` first — it covers the dev-loop expectations (style, tests, integration-test gating, commit/PR conventions) that every card depends on.
 
