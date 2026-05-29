@@ -54,6 +54,11 @@ def _build_llama_server_cmd(entry: _LaunchEntry) -> str:
     """Build the llama-server CLI string for one entry. ``${PORT}`` is left
     literal so llama-swap substitutes its allocated port at spawn time."""
     parts: list[str] = ["llama-server", "--model", entry.gguf, "--port", "${PORT}"]
+    if entry.jinja:
+        # Render the GGUF's embedded chat template instead of built-in format
+        # detection — prerequisite for the enable_thinking template kwarg and
+        # correct tool-calling on newer Gemma 4 / Qwen3 quants. Boolean flag.
+        parts.append("--jinja")
     if entry.context_size is not None:
         parts += ["--ctx-size", str(entry.context_size)]
     if entry.cache_type_k is not None:

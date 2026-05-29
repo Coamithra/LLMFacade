@@ -39,4 +39,4 @@ Empirically, on the gemma4 quants with `--jinja --reasoning-format auto`:
 
 ## Follow-up
 
-Folding this into the facade: see [`plans/llamacpp-thinking-control.md`](../../plans/llamacpp-thinking-control.md) (Trello card `6a19f630`).
+Folded into the facade (Trello card `6a19f630`, shipped): the llamacpp provider now takes a `thinking` knob (`ThinkingMode` → `chat_template_kwargs={"enable_thinking": …}`), a managed-mode `jinja` launch knob (default-on), and auto-detects each GGUF's `thinking_style` to warn when the knob won't bite. See the **llama.cpp** provider quirks in `CLAUDE.md` (**Thinking control** and **Thinking-style auto-detect**). Still caller-owned: the retry-if-no-toolcall guard for reasoning + structured output under `tool_choice="auto"`.

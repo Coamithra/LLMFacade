@@ -61,6 +61,36 @@ def is_budget_thinking(value: object) -> bool:
     return True
 
 
+class ThinkingStyle(Enum):
+    """How a local (llama.cpp) model's chat template gates reasoning output.
+
+    Auto-detected from the GGUF's embedded ``tokenizer.chat_template`` at
+    ``new_model()`` time (managed mode), or set explicitly via
+    ``new_model(thinking_style=...)``. It records *whether the* ``thinking``
+    *knob can actually control reasoning* for that model: only
+    ``TEMPLATE_KWARG`` models honor the ``enable_thinking`` template kwarg the
+    knob emits, so the provider warns when ``thinking`` is set against a model
+    of any other recognised style.
+
+    * ``TEMPLATE_KWARG``   — ``enable_thinking`` template kwarg (Gemma 4, Qwen3).
+                             The ``thinking`` knob maps to it cleanly.
+    * ``REASONING_BUDGET`` — ``reasoning_effort`` / ``thinking_budget`` template
+                             kwarg; ``enable_thinking`` is not the control.
+    * ``THINK_TOKEN``      — emits ``<think>``/``<thinking>`` with no template
+                             toggle; reasoning is governed by the server's
+                             ``--reasoning-format`` parsing, not a kwarg.
+    * ``DEFAULT``          — template carries no recognised reasoning machinery.
+    * ``UNKNOWN``          — template absent or GGUF unreadable (and external
+                             mode, where the GGUF isn't local to inspect).
+    """
+
+    TEMPLATE_KWARG = "template_kwarg"
+    REASONING_BUDGET = "reasoning_budget"
+    THINK_TOKEN = "think_token"
+    DEFAULT = "default"
+    UNKNOWN = "unknown"
+
+
 class OutputFormat(Enum):
     TEXT = "text"
     JSON = "json"
@@ -122,6 +152,7 @@ LAUNCH_KNOBS: frozenset[str] = frozenset(
         "fit_ctx",
         "flash_attn",
         "mmproj_path",
+        "jinja",
     }
 )
 
@@ -129,6 +160,7 @@ LAUNCH_KNOBS: frozenset[str] = frozenset(
 __all__ = [
     "EffortLevel",
     "ThinkingMode",
+    "ThinkingStyle",
     "is_budget_thinking",
     "OutputFormat",
     "EphemeralCacheTTL",

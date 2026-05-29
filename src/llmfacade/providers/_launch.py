@@ -74,6 +74,7 @@ class _LaunchEntry:
     fit_ctx: int | None = None
     flash_attn: str | None = None
     mmproj_path: str | None = None
+    jinja: bool = True
 
 
 _HASH_EXCLUDED_KEYS: frozenset[str] = frozenset({"fit", "fit_target", "fit_ctx"})
@@ -125,7 +126,13 @@ def default_provider_launch_defaults(llmfacade_dir: Path) -> dict[str, Any]:
     so multiple providers in the same Python process don't collide.
 
     `fit=True` lets llama-server adjust unset launch args to fit available
-    VRAM at spawn time; opt out per-entry with `fit=False`."""
+    VRAM at spawn time; opt out per-entry with `fit=False`.
+
+    `jinja=True` makes llama-server render the GGUF's embedded chat template
+    (`--jinja`) instead of its built-in format detection. It's the prerequisite
+    for template-kwarg thinking control (`enable_thinking`) and for tool-calling
+    on newer Gemma 4 / Qwen3 quants whose embedded template is the only correct
+    one; opt out per-entry with `jinja=False`."""
     return {
         "context_size": None,
         "cache_type_k": None,
@@ -140,6 +147,7 @@ def default_provider_launch_defaults(llmfacade_dir: Path) -> dict[str, Any]:
         "fit_target": None,
         "fit_ctx": None,
         "mmproj_path": None,
+        "jinja": True,
     }
 
 

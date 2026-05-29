@@ -674,7 +674,10 @@ def test_new_model_silently_skips_when_fit_params_missing(
     monkeypatch.setattr(_shutil, "which", lambda _b: None)
     model = p.new_model(gguf=str(gguf), name="m")
     assert p._fit_estimates[model.model_id] is None
-    assert p.log_metadata(model_id=model.model_id) is None
+    # log_metadata no longer returns None for a managed model: it also surfaces
+    # the auto-detected thinking_style. The fake gguf has no readable chat
+    # template, so the style is UNKNOWN and there's no fit_estimate key.
+    assert p.log_metadata(model_id=model.model_id) == {"thinking_style": "unknown"}
 
 
 def test_new_model_skips_estimate_when_fit_disabled(
@@ -1566,3 +1569,298 @@ def test_message_to_api_drops_image_block_on_assistant_role(
     assert len(api) == 1
     assert api[0]["content"] == "here you go"
     assert "image_url" not in str(api[0])
+
+
+# ---- thinking knob -> chat_template_kwargs (enable_thinking) ---------------
+
+from llmfacade.providers import llamacpp as _llamacpp_mod  # noqa: E402
+from llmfacade.settings import ThinkingMode, ThinkingStyle  # noqa: E402
+
+
+def _req_for_model(model_id: str, **settings: Any) -> CompletionRequest:
+    """A `_req`-style request bound to a specific `model` id, so a test can line
+    it up with an entry in `provider._thinking_styles`."""
+    return CompletionRequest(
+        model=model_id,
+        messages=[Message(role="user", content="hi")],
+        system_blocks=[],
+        tools=[],
+        stop=None,
+        settings={"max_tokens": 16, **settings},
+        settings_source={},
+    )
+
+
+def test_thinking_in_supports_but_not_thinking_budget() -> None:
+    """The `thinking` knob is settable; the budget *form* is not — so an int
+    budget fails fast through the value-level gate rather than being dropped."""
+    assert "thinking" in LlamaCppServerProvider.SUPPORTS
+    assert "thinking_budget" not in LlamaCppServerProvider.SUPPORTS
+
+
+def test_thinking_adaptive_sets_enable_thinking_true(provider: LlamaCppServerProvider) -> None:
+    kwargs = provider._build_kwargs(_req(settings={"thinking": ThinkingMode.ADAPTIVE}))
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+
+
+def test_thinking_disabled_sets_enable_thinking_false(provider: LlamaCppServerProvider) -> None:
+    kwargs = provider._build_kwargs(_req(settings={"thinking": ThinkingMode.DISABLED}))
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_thinking_summarized_maps_to_enable_thinking_true(
+    provider: LlamaCppServerProvider,
+) -> None:
+    """llama.cpp has no 'summarized' display mode, so ADAPTIVE_SUMMARIZED folds
+    to thinking-on (the closest equivalent)."""
+    kwargs = provider._build_kwargs(_req(settings={"thinking": ThinkingMode.ADAPTIVE_SUMMARIZED}))
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+
+
+def test_thinking_string_value_works(provider: LlamaCppServerProvider) -> None:
+    kwargs = provider._build_kwargs(_req(settings={"thinking": "disabled"}))
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_thinking_omitted_no_chat_template_kwargs(provider: LlamaCppServerProvider) -> None:
+    kwargs = provider._build_kwargs(_req(settings={"temperature": 0.5}))
+    assert "extra_body" not in kwargs
+
+
+def test_thinking_coexists_with_samplers_in_extra_body(provider: LlamaCppServerProvider) -> None:
+    """The enable_thinking kwarg rides in the same extra_body dict as the
+    llama.cpp samplers, without clobbering them."""
+    kwargs = provider._build_kwargs(
+        _req(settings={"thinking": ThinkingMode.ADAPTIVE, "top_k": 40, "min_p": 0.05})
+    )
+    assert kwargs["extra_body"] == {
+        "top_k": 40,
+        "min_p": 0.05,
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+
+
+def test_thinking_bool_raises_typeerror(provider: LlamaCppServerProvider) -> None:
+    with pytest.raises(TypeError, match="got a bool"):
+        provider._build_kwargs(_req(settings={"thinking": True}))
+
+
+# ---- conversation-level budget gate (reuses the Opus-4.8 mechanism) -------
+
+
+def test_int_thinking_budget_rejected_by_gate() -> None:
+    """An int token budget is the budget *form*, which llamacpp doesn't accept
+    (`thinking_budget` not in SUPPORTS). The value-level gate in
+    `Conversation._build_request` raises before any provider call."""
+    p = LlamaCppServerProvider(base_url="http://invalid.local:0/v1")
+    convo = p.new_model("m").new_conversation(log_dir=False)
+    with pytest.raises(UnsupportedFeature, match="thinking_budget"):
+        convo._build_request(stop=None, per_call={"thinking": 5})
+
+
+def test_adaptive_thinking_passes_gate() -> None:
+    """A ThinkingMode is never the budget form, so it sails through the gate and
+    lands in the merged request settings (no network needed to verify)."""
+    p = LlamaCppServerProvider(base_url="http://invalid.local:0/v1")
+    convo = p.new_model("m").new_conversation(log_dir=False)
+    req = convo._build_request(stop=None, per_call={"thinking": ThinkingMode.ADAPTIVE})
+    assert req.settings["thinking"] == ThinkingMode.ADAPTIVE
+
+
+# ---- jinja launch knob (managed mode) -------------------------------------
+
+
+def test_external_mode_rejects_jinja_in_init() -> None:
+    with pytest.raises(UnsupportedFeature, match="jinja"):
+        LlamaCppServerProvider(base_url="http://x:0/v1", jinja=True)
+
+
+def test_external_mode_rejects_jinja_in_new_model() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    with pytest.raises(UnsupportedFeature, match="jinja"):
+        p.new_model("qwen", jinja=False)
+
+
+def test_managed_mode_jinja_default_true(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].jinja is True  # type: ignore[union-attr]
+
+
+def test_managed_mode_jinja_false_override(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p.new_model(gguf=str(gguf), jinja=False)
+    assert p._supervisor.entries[0].jinja is False  # type: ignore[union-attr]
+
+
+def test_managed_mode_jinja_provider_default_cascades(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", jinja=False)
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].jinja is False  # type: ignore[union-attr]
+
+
+def test_managed_mode_jinja_model_overrides_provider(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", jinja=False)
+    p.new_model(gguf=str(gguf), jinja=True)
+    assert p._supervisor.entries[0].jinja is True  # type: ignore[union-attr]
+
+
+def test_new_model_does_not_forward_jinja_to_fit_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--jinja` governs chat templating, not VRAM layout, and fit-params would
+    reject the flag — so it's intentionally NOT forwarded to the estimate."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    seen_argv: dict[str, Any] = {}
+
+    class _FakeOk:
+        returncode = 0
+        stdout = "-c 4096 -ngl 32"
+        stderr = ""
+
+    def fake_run(argv: list[str], **_kw: Any) -> _FakeOk:
+        seen_argv["argv"] = argv
+        return _FakeOk()
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    p.new_model(gguf=str(gguf), name="m", jinja=True)
+    assert "--jinja" not in seen_argv["argv"]
+
+
+# ---- thinking_style auto-detect / override / log surfacing / warning ------
+
+
+def _write_gguf_with_template(path: Path, template: str) -> None:
+    """Write a minimal GGUF (header KV metadata only) carrying just the
+    `tokenizer.chat_template` string, enough for the reader to extract it."""
+    import struct
+
+    kb = b"tokenizer.chat_template"
+    vb = template.encode("utf-8")
+    path.write_bytes(
+        b"GGUF"
+        + struct.pack("<I", 3)  # version
+        + struct.pack("<Q", 0)  # tensor_count
+        + struct.pack("<Q", 1)  # kv_count
+        + struct.pack("<Q", len(kb))
+        + kb
+        + struct.pack("<I", 8)  # value type = STRING
+        + struct.pack("<Q", len(vb))
+        + vb
+    )
+
+
+def test_managed_new_model_autodetects_template_kwarg_style(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gguf = tmp_path / "gemma.gguf"
+    _write_gguf_with_template(gguf, "{% if enable_thinking %}<think>{% endif %}")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    # Skip the fit-params probe so the test is fast and deterministic.
+    import shutil as _shutil
+
+    monkeypatch.setattr(_shutil, "which", lambda _b: None)
+    model = p.new_model(gguf=str(gguf), name="gemma")
+    assert p._thinking_styles[model.model_id] == ThinkingStyle.TEMPLATE_KWARG
+
+
+def test_managed_new_model_explicit_thinking_style_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit thinking_style= overrides whatever the template would detect."""
+    gguf = tmp_path / "gemma.gguf"
+    _write_gguf_with_template(gguf, "{% if enable_thinking %}{% endif %}")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    import shutil as _shutil
+
+    monkeypatch.setattr(_shutil, "which", lambda _b: None)
+    model = p.new_model(gguf=str(gguf), name="g", thinking_style=ThinkingStyle.THINK_TOKEN)
+    assert p._thinking_styles[model.model_id] == ThinkingStyle.THINK_TOKEN
+
+
+def test_new_model_invalid_thinking_style_raises(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    with pytest.raises(ValueError, match="thinking_style must be"):
+        p.new_model(gguf=str(gguf), name="m", thinking_style="bogus")
+
+
+def test_external_mode_explicit_thinking_style_stored() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    p.new_model("m", thinking_style="template_kwarg")
+    assert p._thinking_styles["m"] == ThinkingStyle.TEMPLATE_KWARG
+
+
+def test_external_mode_no_thinking_style_absent_from_log_metadata() -> None:
+    """External mode can't read a local GGUF, so without an explicit
+    thinking_style= nothing is stored and log_metadata stays None."""
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    p.new_model("m")
+    assert "m" not in p._thinking_styles
+    assert p.log_metadata(model_id="m") is None
+
+
+def test_thinking_style_surfaced_in_log_metadata(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")  # no readable template -> UNKNOWN
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    model = p.new_model(gguf=str(gguf), name="m", thinking_style=ThinkingStyle.TEMPLATE_KWARG)
+    meta = p.log_metadata(model_id=model.model_id)
+    assert meta is not None
+    assert meta["thinking_style"] == "template_kwarg"
+
+
+def test_warns_when_thinking_set_on_non_kwarg_style(
+    provider: LlamaCppServerProvider, recwarn: pytest.WarningsRecorder
+) -> None:
+    _llamacpp_mod._WARNED_THINKING_STYLE.clear()
+    provider._thinking_styles["tk-warn"] = ThinkingStyle.THINK_TOKEN
+    req = _req_for_model("tk-warn", thinking=ThinkingMode.ADAPTIVE)
+    provider._build_kwargs(req)
+    provider._build_kwargs(req)  # second call must not re-warn
+    msgs = [str(w.message) for w in recwarn.list if issubclass(w.category, UserWarning)]
+    assert len(msgs) == 1
+    assert "thinking_style" in msgs[0] and "tk-warn" in msgs[0]
+    # The kwarg is still emitted ("never silently wrong" warns, doesn't drop).
+    assert provider._build_kwargs(req)["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": True
+    }
+
+
+def test_no_warn_when_thinking_set_on_template_kwarg_style(
+    provider: LlamaCppServerProvider, recwarn: pytest.WarningsRecorder
+) -> None:
+    _llamacpp_mod._WARNED_THINKING_STYLE.clear()
+    provider._thinking_styles["tkw"] = ThinkingStyle.TEMPLATE_KWARG
+    req = _req_for_model("tkw", thinking=ThinkingMode.ADAPTIVE)
+    provider._build_kwargs(req)
+    assert [w for w in recwarn.list if issubclass(w.category, UserWarning)] == []
+
+
+def test_no_warn_when_thinking_style_unknown(
+    provider: LlamaCppServerProvider, recwarn: pytest.WarningsRecorder
+) -> None:
+    """UNKNOWN means we couldn't detect — warning then would be a false positive
+    (and every external-mode model without an explicit style is UNKNOWN)."""
+    _llamacpp_mod._WARNED_THINKING_STYLE.clear()
+    provider._thinking_styles["unk"] = ThinkingStyle.UNKNOWN
+    req = _req_for_model("unk", thinking=ThinkingMode.ADAPTIVE)
+    provider._build_kwargs(req)
+    assert [w for w in recwarn.list if issubclass(w.category, UserWarning)] == []

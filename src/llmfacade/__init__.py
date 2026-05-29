@@ -36,6 +36,7 @@ from llmfacade.settings import (
     EphemeralCacheTTL,
     OutputFormat,
     ThinkingMode,
+    ThinkingStyle,
 )
 from llmfacade.tools import Tool, tool
 
@@ -52,6 +53,7 @@ __all__ = [
     "RUNTIME_KNOBS",
     "EffortLevel",
     "ThinkingMode",
+    "ThinkingStyle",
     "OutputFormat",
     "EphemeralCacheTTL",
     # Tools

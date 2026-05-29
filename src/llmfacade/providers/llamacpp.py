@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json as _json
+import warnings
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,7 @@ from llmfacade.models import (
     Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider
+from llmfacade.providers._gguf import classify_thinking_style, read_gguf_chat_template
 from llmfacade.providers._launch import (
     _LaunchEntry,
     default_provider_launch_defaults,
@@ -35,7 +37,7 @@ from llmfacade.providers._launch import (
     validate_flash_attn,
 )
 from llmfacade.providers._swap_lifecycle import _LlamaSwapSupervisor
-from llmfacade.settings import OutputFormat, ThinkingMode
+from llmfacade.settings import OutputFormat, ThinkingMode, ThinkingStyle
 
 if TYPE_CHECKING:
     from llmfacade.facade import LLM
@@ -61,6 +63,43 @@ def _llama_reasoning_tokens(usage: Any) -> int:
     if details is None:
         return 0
     return getattr(details, "reasoning_tokens", 0) or 0
+
+
+def _coerce_thinking_style(value: ThinkingStyle | str) -> ThinkingStyle:
+    """Validate an explicit ``thinking_style=`` value into a ``ThinkingStyle``.
+    Raises ``ValueError`` on an unrecognised string rather than silently
+    defaulting, so a typo surfaces at ``new_model()`` instead of as a missing
+    warning later."""
+    if isinstance(value, ThinkingStyle):
+        return value
+    try:
+        return ThinkingStyle(value)
+    except ValueError as e:
+        valid = [s.value for s in ThinkingStyle]
+        raise ValueError(
+            f"thinking_style must be a ThinkingStyle or one of {valid!r}, got {value!r}"
+        ) from e
+
+
+def _resolve_thinking_style(
+    *, gguf_path: str | None, explicit: ThinkingStyle | str | None
+) -> ThinkingStyle:
+    """Resolve a model's thinking style. An explicit override always wins;
+    otherwise auto-detect by reading the GGUF's embedded ``tokenizer.chat_template``
+    (only possible when the file is local, i.e. managed mode). Best-effort: an
+    absent ``gguf_path`` or an unreadable/template-less GGUF resolves to
+    ``ThinkingStyle.UNKNOWN`` and never raises, so detection can't block
+    ``new_model()``."""
+    if explicit is not None:
+        return _coerce_thinking_style(explicit)
+    if gguf_path is None:
+        return ThinkingStyle.UNKNOWN
+    return classify_thinking_style(read_gguf_chat_template(gguf_path))
+
+
+# Track (model_id, style) tuples we've warned about so a thinking-knob-vs-style
+# mismatch warning fires once per model rather than on every send().
+_WARNED_THINKING_STYLE: set[tuple[str, str]] = set()
 
 
 class LlamaCppServerProvider(Provider):
@@ -91,12 +130,18 @@ class LlamaCppServerProvider(Provider):
             "top_k",
             "min_p",
             "repeat_penalty",
+            "thinking",
             "output_format",
             "tools",
             "tool_choice",
             "vision",
         }
     )
+    # Note: "thinking_budget" is intentionally absent. The `thinking` knob maps
+    # to llama.cpp's `enable_thinking` template kwarg (a ThinkingMode), which
+    # has no budget form — so an int token budget fails fast through the
+    # value-level gate in `Conversation._build_request` (the same mechanism that
+    # rejects a budget on Opus 4.8), instead of being silently dropped here.
     # Wall-clock cap on the synchronous `llama-fit-params` probe in
     # `_maybe_estimate_fit`. Sub-second in the normal case; capped low so
     # `new_model()` never hangs on a missing or stuck binary.
@@ -129,6 +174,7 @@ class LlamaCppServerProvider(Provider):
         fit_ctx: int | None = None,
         flash_attn: str | None = None,
         mmproj_path: str | None = None,
+        jinja: bool | None = None,
         # RUNTIME_KNOBS passthrough
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -161,6 +207,11 @@ class LlamaCppServerProvider(Provider):
         # absence is intentional and lets `log_metadata` skip the field.
         self._fit_estimates: dict[str, dict[str, Any] | None] = {}
 
+        # Auto-detected (or explicitly set) thinking style per model_id, keyed
+        # like `_fit_estimates`. Drives the thinking-knob-vs-style warning in
+        # `_build_kwargs` and surfaces in `log_metadata`.
+        self._thinking_styles: dict[str, ThinkingStyle] = {}
+
         # Merge provider-level launch defaults: hardcoded < explicit kwargs.
         # Only non-None explicit values override the defaults.
         baseline = default_provider_launch_defaults(sess_dir)
@@ -180,6 +231,7 @@ class LlamaCppServerProvider(Provider):
             "fit_ctx": fit_ctx,
             "flash_attn": flash_attn,
             "mmproj_path": mmproj_path,
+            "jinja": jinja,
         }
         if not self._managed:
             # External mode: launch knobs are nonsensical (the server is
@@ -335,8 +387,10 @@ class LlamaCppServerProvider(Provider):
         fit_ctx: int | None = None,
         flash_attn: str | None = None,
         mmproj_path: str | None = None,
+        jinja: bool | None = None,
         # Existing args (subset of base Provider.new_model)
         capability_override: frozenset[str] | None = None,
+        thinking_style: ThinkingStyle | str | None = None,
         log_dir: Any | None = None,
         cache_dir: Any | None = None,
         cache_mode: str | None = None,
@@ -375,6 +429,7 @@ class LlamaCppServerProvider(Provider):
             "fit_ctx": fit_ctx,
             "flash_attn": flash_attn,
             "mmproj_path": mmproj_path,
+            "jinja": jinja,
         }
         nonnull_launch_keys = sorted(k for k, v in explicit_launch.items() if v is not None)
 
@@ -398,6 +453,11 @@ class LlamaCppServerProvider(Provider):
                     "external-mode new_model() requires a positional model_id "
                     "(the model name your llama-server is configured to expose)."
                 )
+            # No local GGUF to inspect in external mode, so style is UNKNOWN
+            # unless the caller states it explicitly. Only store when given so
+            # `log_metadata` doesn't surface a noisy UNKNOWN for every model.
+            if thinking_style is not None:
+                self._thinking_styles[model_id] = _coerce_thinking_style(thinking_style)
             return Model(
                 provider=self,
                 model_id=model_id,
@@ -473,10 +533,14 @@ class LlamaCppServerProvider(Provider):
             fit_ctx=merged.get("fit_ctx"),
             flash_attn=merged.get("flash_attn"),
             mmproj_path=mmproj_value,
+            jinja=bool(merged.get("jinja", True)),
         )
         assert self._supervisor is not None
         self._supervisor.register(entry)
         self._maybe_estimate_fit(entry)
+        self._thinking_styles[derived] = _resolve_thinking_style(
+            gguf_path=str(gguf_path), explicit=thinking_style
+        )
 
         return Model(
             provider=self,
@@ -538,6 +602,19 @@ class LlamaCppServerProvider(Provider):
             value = req.settings.get(key)
             if value is not None:
                 extra[key] = value
+
+        # Thinking control: a ThinkingMode maps to llama.cpp's
+        # `chat_template_kwargs={"enable_thinking": bool}`, routed through
+        # extra_body like the samplers above. The embedded chat template only
+        # honors this under --jinja (managed-mode default-on); on a model whose
+        # template doesn't gate thinking that way, `_warn_thinking_style_mismatch`
+        # flags it once. An int budget never reaches here (gated upstream).
+        thinking_val = req.settings.get("thinking")
+        template_kwargs = self._thinking_to_template_kwargs(thinking_val)
+        if template_kwargs is not None:
+            extra["chat_template_kwargs"] = template_kwargs
+            self._warn_thinking_style_mismatch(req.model, thinking_val)
+
         if extra:
             api_kwargs["extra_body"] = extra
 
@@ -554,6 +631,60 @@ class LlamaCppServerProvider(Provider):
                 api_kwargs["response_format"] = {"type": "json_object"}
 
         return api_kwargs
+
+    @staticmethod
+    def _thinking_to_template_kwargs(value: Any) -> dict[str, Any] | None:
+        """Map the ``thinking`` knob to llama.cpp's ``chat_template_kwargs``.
+
+        ``ThinkingMode.ADAPTIVE`` / ``ADAPTIVE_SUMMARIZED`` →
+        ``{"enable_thinking": True}`` (llama.cpp has no "summarized" display mode,
+        so both map to thinking-on); ``DISABLED`` → ``{"enable_thinking": False}``.
+        Returns ``None`` when thinking is unset. An int token budget never
+        reaches here — llamacpp doesn't declare ``"thinking_budget"``, so the
+        request-time gate in ``Conversation._build_request`` rejects it first;
+        any other non-mode value is treated defensively as "no kwarg" rather
+        than forwarded as garbage. Mirrors Anthropic's ``_thinking_to_api``:
+        a uniform knob value, a provider-specific wire form."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise TypeError(
+                "thinking= expects a ThinkingMode or a mode string "
+                "('adaptive'/'adaptive_summarized'/'disabled') for the llamacpp "
+                "provider — got a bool."
+            )
+        if isinstance(value, ThinkingMode):
+            value = value.value
+        if value == ThinkingMode.DISABLED.value:
+            return {"enable_thinking": False}
+        if value in (ThinkingMode.ADAPTIVE.value, ThinkingMode.ADAPTIVE_SUMMARIZED.value):
+            return {"enable_thinking": True}
+        return None
+
+    def _warn_thinking_style_mismatch(self, model_id: str, thinking_val: Any) -> None:
+        """Warn once per (model_id, style) when ``thinking`` is set against a
+        model whose detected ``thinking_style`` won't honor the ``enable_thinking``
+        kwarg (any recognised style other than ``TEMPLATE_KWARG``). ``UNKNOWN``
+        is skipped — we couldn't detect the style, so a warning would be a false
+        positive (and every external-mode model without an explicit
+        ``thinking_style=`` is ``UNKNOWN``). "Never silently wrong": the kwarg is
+        still emitted (harmless on a template that ignores it), but the caller is
+        told it probably did nothing."""
+        style = self._thinking_styles.get(model_id)
+        if style is None or style in (ThinkingStyle.TEMPLATE_KWARG, ThinkingStyle.UNKNOWN):
+            return
+        tag = (model_id, style.value)
+        if tag in _WARNED_THINKING_STYLE:
+            return
+        _WARNED_THINKING_STYLE.add(tag)
+        warnings.warn(
+            f"thinking={thinking_val!r} is set, but model {model_id!r}'s chat "
+            f"template (thinking_style={style.value!r}) does not gate reasoning "
+            f"via the enable_thinking kwarg, so the thinking knob likely has no "
+            f"effect. Pass thinking_style= to new_model() to override detection "
+            f"if this is wrong.",
+            stacklevel=2,
+        )
 
     def _complete_raw(self, req: CompletionRequest) -> Response:
         self._ensure_supervised()
@@ -1197,17 +1328,21 @@ class LlamaCppServerProvider(Provider):
         self._fit_estimates[entry.model_id] = parsed
 
     def log_metadata(self, *, model_id: str) -> dict[str, Any] | None:
-        """Surface the cached `fit_estimate` for `model_id` so the conversation
-        log header can record it. External mode and entries without a cached
-        estimate return `None`. The returned dict's inner `fit_estimate` is a
-        shallow copy — currently safe because every value is a primitive; if
-        the estimate ever holds nested containers, switch to `copy.deepcopy`."""
-        if not self._managed:
-            return None
-        est = self._fit_estimates.get(model_id)
-        if est is None:
-            return None
-        return {"fit_estimate": dict(est)}
+        """Surface per-model extras for the conversation log header: the cached
+        `fit_estimate` (managed mode only) and the detected/declared
+        `thinking_style` (either mode, when known). Returns `None` when neither
+        is known. The inner `fit_estimate` is a shallow copy — currently safe
+        because every value is a primitive; if it ever holds nested containers,
+        switch to `copy.deepcopy`."""
+        out: dict[str, Any] = {}
+        if self._managed:
+            est = self._fit_estimates.get(model_id)
+            if est is not None:
+                out["fit_estimate"] = dict(est)
+        style = self._thinking_styles.get(model_id)
+        if style is not None:
+            out["thinking_style"] = style.value
+        return out or None
 
     # ---- token counting ---------------------------------------------------
 

@@ -309,3 +309,27 @@ def test_derive_model_id_changes_with_mmproj_path() -> None:
     b = derive_model_id({**base, "mmproj_path": "models/mmproj-qwen.gguf"}, name=None)
     c = derive_model_id({**base, "mmproj_path": "models/other.gguf"}, name=None)
     assert len({a, b, c}) == 3
+
+
+def test_render_jinja_on_by_default() -> None:
+    """Default `jinja=True` adds the `--jinja` flag so llama-server renders the
+    GGUF's embedded chat template (prerequisite for enable_thinking control)."""
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf")
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--jinja" in cmd
+
+
+def test_render_jinja_off_omits_flag() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf", jinja=False)
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--jinja" not in cmd
+
+
+def test_derive_model_id_changes_with_jinja() -> None:
+    """jinja IS in the hash — toggling `--jinja` swaps the chat template
+    llama-server uses, materially changing tokenization and output (and whether
+    enable_thinking works), so the model_id must differ, like cache_type_k."""
+    base = {"gguf": "models/qwen.gguf", "context_size": 8192}
+    a = derive_model_id({**base, "jinja": True}, name=None)
+    b = derive_model_id({**base, "jinja": False}, name=None)
+    assert a != b
