@@ -441,6 +441,102 @@ def test_shutdown_no_op_when_never_started(
     fake_supervisor.shutdown()  # must not raise
 
 
+# ---- interrupt (instant hard-kill) ----------------------------------------
+
+
+def _stub_taskkill(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Capture taskkill invocations and never spawn a real process so the
+    Windows branch of ``_hard_kill_tree`` is testable without a live PID."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args=args, returncode=0)
+
+    monkeypatch.setattr(ls.subprocess, "run", fake_run)
+    return calls
+
+
+def test_interrupt_hard_kills_running_proc(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    proc = _FakeProc(pid=4242)
+    _patch_for_successful_start(monkeypatch, proc=proc)
+    taskkill_calls = _stub_taskkill(monkeypatch)
+    fake_supervisor.register(_LaunchEntry(model_id="m", gguf="x.gguf"))
+    fake_supervisor.ensure_started()
+
+    assert fake_supervisor.interrupt() is True
+
+    # The process was force-killed (proc.kill on both branches; taskkill /T /F
+    # additionally on Windows). NOT terminate() — that's the graceful path.
+    assert proc.kill_called
+    assert not proc.terminate_called
+    import sys
+
+    if sys.platform == "win32":
+        assert any("/F" in c and "/T" in c for c in taskkill_calls)
+
+    # Reset to not-started so the next call lazily respawns; pidfile gone.
+    assert not fake_supervisor.is_started
+    assert fake_supervisor._proc is None
+    assert not fake_supervisor.pid_file.exists()
+    # shutdown is still armed (interrupt must not consume it).
+    assert fake_supervisor._shutdown_done is False
+
+
+def test_interrupt_returns_false_when_never_started(
+    fake_supervisor: ls._LlamaSwapSupervisor,
+) -> None:
+    assert fake_supervisor.interrupt() is False  # must not raise
+
+
+def test_interrupt_returns_false_when_proc_already_dead(
+    fake_supervisor: ls._LlamaSwapSupervisor,
+) -> None:
+    fake_supervisor._proc = _FakeProc(alive=False)  # type: ignore[assignment]
+    fake_supervisor._port = 5599
+    assert fake_supervisor.interrupt() is False
+    # Stale handle cleared even though nothing was killed.
+    assert fake_supervisor._proc is None
+    assert fake_supervisor._port is None
+
+
+def test_interrupt_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    proc = _FakeProc(pid=4242)
+    _patch_for_successful_start(monkeypatch, proc=proc)
+    _stub_taskkill(monkeypatch)
+    fake_supervisor.register(_LaunchEntry(model_id="m", gguf="x.gguf"))
+    fake_supervisor.ensure_started()
+
+    assert fake_supervisor.interrupt() is True
+    assert fake_supervisor.interrupt() is False  # nothing left to kill
+    assert fake_supervisor.interrupt() is False
+
+
+def test_interrupt_allows_respawn(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    """After interrupt the supervisor must lazily respawn on the next
+    ensure_started — the recovery contract the provider relies on."""
+    proc1 = _FakeProc(pid=1111)
+    _patch_for_successful_start(monkeypatch, proc=proc1, port=5570)
+    _stub_taskkill(monkeypatch)
+    fake_supervisor.register(_LaunchEntry(model_id="m", gguf="x.gguf"))
+    fake_supervisor.ensure_started()
+    assert fake_supervisor.interrupt() is True
+
+    # Re-patch spawn to hand back a fresh proc at a new port.
+    proc2 = _FakeProc(pid=2222)
+    _patch_for_successful_start(monkeypatch, proc=proc2, port=5571)
+    fake_supervisor.ensure_started()
+    assert fake_supervisor.is_started
+    assert fake_supervisor._proc is proc2  # type: ignore[comparison-overlap]
+    assert fake_supervisor.base_url == "http://127.0.0.1:5571"
+
+
 # ---- PID-file sweep -------------------------------------------------------
 
 
@@ -558,3 +654,55 @@ def test_pid_alive_and_named_zero_pid_false() -> None:
 
 def test_pid_alive_and_named_negative_pid_false() -> None:
     assert ls._pid_alive_and_named(-1, "anything") is False
+
+
+# ---- _hard_kill_tree ------------------------------------------------------
+
+
+def test_hard_kill_tree_windows_taskkill_then_proc_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ls.sys, "platform", "win32")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        ls.subprocess,
+        "run",
+        lambda args, **kw: (
+            calls.append(list(args)) or subprocess.CompletedProcess(args=args, returncode=0)
+        ),
+    )
+    proc = _FakeProc(pid=4242)
+    ls._hard_kill_tree(4242, proc)  # type: ignore[arg-type]
+    assert calls and calls[0] == ["taskkill", "/PID", "4242", "/T", "/F"]
+    assert proc.kill_called  # belt-and-braces TerminateProcess
+
+
+def test_hard_kill_tree_posix_uses_proc_kill_not_killpg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ls.sys, "platform", "linux")
+    # killpg must never be reached — it would take the host process group down.
+    monkeypatch.setattr(
+        ls.os,
+        "killpg",
+        lambda *a: pytest.fail("hard_kill_tree must not killpg on POSIX"),
+        raising=False,
+    )
+
+    def no_taskkill(*a, **k):
+        raise AssertionError("taskkill must not run on POSIX")
+
+    monkeypatch.setattr(ls.subprocess, "run", no_taskkill)
+    proc = _FakeProc(pid=4242)
+    ls._hard_kill_tree(4242, proc)  # type: ignore[arg-type]
+    assert proc.kill_called
+
+
+def test_hard_kill_tree_never_raises_on_kill_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ls.sys, "platform", "linux")
+
+    class _BoomProc:
+        pid = 7
+        kill_called = False
+
+        def kill(self):
+            raise OSError("no such process")
+
+    # Must swallow the error — interrupt() promises never to raise.
+    ls._hard_kill_tree(7, _BoomProc())  # type: ignore[arg-type]

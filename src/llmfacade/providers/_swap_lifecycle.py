@@ -363,6 +363,37 @@ def _try_kill(pid: int, expected_name: str) -> bool:
     return not _pid_alive_and_named(pid, expected_name)
 
 
+def _hard_kill_tree(pid: int, proc: subprocess.Popen) -> None:
+    """Force-kill ``pid`` and its child process tree *immediately* — no SIGTERM
+    grace period, no waiting for an in-flight request to drain. This is the
+    instant-abort path behind ``_LlamaSwapSupervisor.interrupt()``; contrast
+    ``shutdown()`` / ``_try_kill`` which terminate politely first.
+
+    Windows: ``taskkill /PID <pid> /T /F`` force-kills the whole tree (llama-swap
+    plus the llama-server children it spawned), then ``proc.kill()`` as a
+    belt-and-braces TerminateProcess in case taskkill isn't on PATH. POSIX:
+    SIGKILL the supervised pid directly via ``proc.kill()``. We deliberately do
+    NOT ``killpg`` — the supervisor spawns llama-swap in the parent's process
+    group, so killing the group would take the host process down with it. (On
+    POSIX, orphaned llama-server children are a known limitation of the instant
+    path; the supported managed-mode target is Windows, where the tree kill is
+    clean.) Best-effort; never raises."""
+    if sys.platform == "win32":
+        with contextlib.suppress(subprocess.SubprocessError, FileNotFoundError, OSError):
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        with contextlib.suppress(Exception):
+            proc.kill()
+        return
+    with contextlib.suppress(Exception):
+        proc.kill()
+
+
 # ---------------------------------------------------------------------------
 # Reload signalling
 # ---------------------------------------------------------------------------
@@ -768,6 +799,41 @@ class _LlamaSwapSupervisor:
             self._close_log()
             with contextlib.suppress(OSError):
                 self.pid_file.unlink()
+
+    def interrupt(self) -> bool:
+        """Hard-kill the running llama-swap subprocess (and the llama-server
+        backends it spawned) *immediately*, then reset to the not-started state
+        so the next ``ensure_started()`` lazily respawns. The instant-abort
+        primitive behind the provider's ``interrupt()``.
+
+        Unlike ``shutdown()`` this does NOT send a graceful SIGTERM first and
+        does NOT wait for the current request to drain — it force-terminates the
+        process tree (see ``_hard_kill_tree``) so a thread parked inside an HTTP
+        call to the backend gets an immediate transport error and unblocks.
+        Thread-safe (takes the supervisor's RLock, which a blocked worker does
+        not hold) and idempotent.
+
+        Returns True iff a live process was actually killed; False if nothing
+        was running (idle, already dead, never started). Never raises. Leaves
+        ``_shutdown_done`` untouched so a later explicit ``shutdown()`` / atexit
+        still cleans up the respawned process."""
+        with self._lock:
+            proc = self._proc
+            live = proc is not None and proc.poll() is None
+            if live:
+                assert proc is not None
+                _hard_kill_tree(proc.pid, proc)
+            # Reset to the not-started state even when nothing was killed, so a
+            # stale (already-dead) proc doesn't leave a leaked log handle, a
+            # dead-port `base_url`, or an orphan pidfile lying around before the
+            # next respawn.
+            self._proc = None
+            self._anchor = None
+            self._port = None
+            self._close_log()
+            with contextlib.suppress(OSError):
+                self.pid_file.unlink()
+            return live
 
     def __del__(self) -> None:
         # Best-effort safety net; atexit + signal handlers are the primary path.

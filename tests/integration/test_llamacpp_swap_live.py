@@ -156,3 +156,56 @@ def test_register_after_send_does_not_400(session_dir: Path) -> None:
         assert resp_b.text is not None
     finally:
         provider.shutdown()
+
+
+def test_interrupt_aborts_in_flight_send_from_another_thread(session_dir: Path) -> None:
+    """Acceptance for `provider.interrupt()`: park a long managed-mode send on a
+    background thread, call `interrupt()` from the main thread mid-flight, and
+    assert the send raises promptly (well under its natural duration) and that a
+    subsequent send recovers (lazy respawn)."""
+    import threading
+
+    from llmfacade.exceptions import LLMError
+
+    gguf_a, _ = _require_swap_and_gguf()
+
+    llm = LLM(log_dir=False)
+    provider: LlamaCppServerProvider = llm.new_provider("llamacpp", llmfacade_dir=session_dir)  # type: ignore[assignment]
+    # A large max_tokens so the decode runs for many seconds — long enough that
+    # an instant abort is unambiguously faster than natural completion.
+    model = provider.new_model(name="long", gguf=gguf_a, context_size=2048, max_tokens=2048)
+    convo = model.new_conversation(log_dir=False)
+
+    result: dict[str, object] = {}
+    started = threading.Event()
+
+    def worker() -> None:
+        started.set()
+        try:
+            convo.send("Write an extremely long, detailed essay about the history of computing.")
+            result["ok"] = True
+        except LLMError as e:  # transport error surfaces as a facade error
+            result["error"] = e
+
+    try:
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        started.wait(timeout=5)
+        # Give the backend a moment to load + actually be parked decoding, then
+        # abort. (First send also lazily spawns llama-swap and loads the model.)
+        time.sleep(15.0)
+        killed = provider.interrupt()
+        assert killed is True
+
+        # The blocked send must unblock promptly after the kill — not run to the
+        # natural end of a 2048-token decode.
+        t.join(timeout=20)
+        assert not t.is_alive(), "send() did not unblock after interrupt()"
+        assert "error" in result, f"expected a transport error, got {result!r}"
+
+        # Recovery: a fresh send respawns llama-swap and reloads the model.
+        recover = model.new_conversation(log_dir=False)
+        resp = recover.send("hi")
+        assert resp.text is not None
+    finally:
+        provider.shutdown()

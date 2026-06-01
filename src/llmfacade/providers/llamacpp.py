@@ -1250,6 +1250,32 @@ class LlamaCppServerProvider(Provider):
         if self._supervisor is not None:
             self._supervisor.shutdown()
 
+    def interrupt(self) -> bool:
+        """Instantly abort an in-flight local generation by hard-killing the
+        managed llama-swap backend process tree.
+
+        Designed to be called from a *different thread* than the one blocked
+        inside ``send()`` / ``stream()`` (i.e. parked in the OpenAI SDK's HTTP
+        call): terminating the backend out from under the blocked call makes it
+        raise a transport error promptly, which a consumer can treat as a clean
+        cancel. This is NOT a graceful drain — it does not wait for the current
+        request or token batch to finish (a graceful unload that blocks until
+        the request completes would defeat the purpose).
+
+        Recoverable: leaves the provider in the lazy-spawn state, so the next
+        ``send()`` / ``stream()`` respawns llama-swap and reloads the model just
+        like the first call did (``_ensure_supervised`` rebuilds the clients
+        against the freshly allocated port). Idempotent and safe to call
+        repeatedly.
+
+        Returns ``True`` if a backend was actually killed, ``False`` if nothing
+        was running (idle, no model loaded yet) or in **external mode** (we
+        don't own the process there). Never raises for the nothing-to-kill
+        case."""
+        if not self._managed or self._supervisor is None:
+            return False
+        return self._supervisor.interrupt()
+
     # ---- fit estimation + metadata ---------------------------------------
 
     def _maybe_estimate_fit(self, entry: _LaunchEntry) -> None:

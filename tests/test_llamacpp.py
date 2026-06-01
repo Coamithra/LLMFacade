@@ -632,6 +632,32 @@ def test_external_mode_shutdown_no_op() -> None:
     p.shutdown()  # supervisor is None; should just no-op
 
 
+def test_external_mode_interrupt_returns_false() -> None:
+    # We don't own the process in external mode — interrupt is a no-op.
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    assert p.interrupt() is False
+    assert p.interrupt() is False  # idempotent
+
+
+def test_managed_mode_interrupt_no_op_when_never_started(tmp_path: Path) -> None:
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    assert p.interrupt() is False  # nothing running yet
+    assert p.interrupt() is False
+
+
+def test_managed_mode_interrupt_delegates_to_supervisor(tmp_path: Path) -> None:
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    calls: list[int] = []
+
+    def fake_interrupt() -> bool:
+        calls.append(1)
+        return True
+
+    p._supervisor.interrupt = fake_interrupt  # type: ignore[union-attr,method-assign]
+    assert p.interrupt() is True
+    assert len(calls) == 1
+
+
 # ---- fit-params estimation + log_metadata --------------------------------
 
 
