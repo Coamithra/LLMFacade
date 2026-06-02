@@ -527,6 +527,23 @@ def test_managed_mode_constructor_no_supervisor_started(tmp_path: Path) -> None:
     assert p._client is None
 
 
+def test_external_mode_client_keeps_default_retries(
+    provider: LlamaCppServerProvider,
+) -> None:
+    # External mode talks to a real remote server, so SDK retries stay on.
+    assert provider._client.max_retries > 0
+    assert provider._aclient.max_retries > 0
+
+
+def test_managed_mode_client_disables_retries(tmp_path: Path) -> None:
+    # Managed mode owns a killable local process; retries against the dead port
+    # defeat instant interrupt(), so the clients are built with max_retries=0.
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p._build_clients("http://invalid.local:0/v1")
+    assert p._client.max_retries == 0
+    assert p._aclient.max_retries == 0
+
+
 def test_managed_mode_new_model_requires_gguf(tmp_path: Path) -> None:
     p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
     with pytest.raises(ValueError, match="requires gguf="):

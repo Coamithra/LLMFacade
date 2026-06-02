@@ -334,6 +334,14 @@ class LlamaCppServerProvider(Provider):
         Also derives ``self._http_base`` (server root for /health, /slots, etc.)
         by stripping a trailing ``/v1``."""
         client_kwargs: dict[str, Any] = {"api_key": "sk-noop", "base_url": openai_base}
+        if self._managed:
+            # We own the llama-swap process and may hard-kill it via interrupt().
+            # The SDK default (max_retries=2) would retry twice against the
+            # now-dead local port (~5s of backoff + connect timeouts) before
+            # raising, defeating instant cancel; a mid-request drop here means
+            # the backend crashed, which a retry can't recover anyway. External
+            # mode talks to a real remote server, so it keeps the default.
+            client_kwargs["max_retries"] = 0
         self._client = self._module.OpenAI(**client_kwargs)
         self._aclient = self._module.AsyncOpenAI(**client_kwargs)
 
