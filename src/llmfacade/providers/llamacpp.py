@@ -175,6 +175,8 @@ class LlamaCppServerProvider(Provider):
         flash_attn: str | None = None,
         mmproj_path: str | None = None,
         jinja: bool | None = None,
+        no_mmap: bool | None = None,
+        mlock: bool | None = None,
         # RUNTIME_KNOBS passthrough
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -232,6 +234,8 @@ class LlamaCppServerProvider(Provider):
             "flash_attn": flash_attn,
             "mmproj_path": mmproj_path,
             "jinja": jinja,
+            "no_mmap": no_mmap,
+            "mlock": mlock,
         }
         if not self._managed:
             # External mode: launch knobs are nonsensical (the server is
@@ -398,6 +402,8 @@ class LlamaCppServerProvider(Provider):
         flash_attn: str | None = None,
         mmproj_path: str | None = None,
         jinja: bool | None = None,
+        no_mmap: bool | None = None,
+        mlock: bool | None = None,
         # Existing args (subset of base Provider.new_model)
         capability_override: frozenset[str] | None = None,
         thinking_style: ThinkingStyle | str | None = None,
@@ -440,6 +446,8 @@ class LlamaCppServerProvider(Provider):
             "flash_attn": flash_attn,
             "mmproj_path": mmproj_path,
             "jinja": jinja,
+            "no_mmap": no_mmap,
+            "mlock": mlock,
         }
         nonnull_launch_keys = sorted(k for k, v in explicit_launch.items() if v is not None)
 
@@ -544,6 +552,8 @@ class LlamaCppServerProvider(Provider):
             flash_attn=merged.get("flash_attn"),
             mmproj_path=mmproj_value,
             jinja=bool(merged.get("jinja", True)),
+            no_mmap=bool(merged.get("no_mmap", False)),
+            mlock=bool(merged.get("mlock", False)),
         )
         assert self._supervisor is not None
         self._supervisor.register(entry)
@@ -1297,7 +1307,10 @@ class LlamaCppServerProvider(Provider):
         (capped by `_FIT_PARAMS_TIMEOUT_SECONDS`, currently 15s; the probe is
         normally sub-second once GPU is warm). `entry.extra_args` is
         intentionally NOT forwarded: those are llama-server-specific flags
-        that `llama-fit-params` will reject and exit non-zero."""
+        that `llama-fit-params` will reject and exit non-zero. `no_mmap` /
+        `mlock` are likewise NOT forwarded — they don't affect the VRAM fit,
+        and `--no-mmap` would force the probe to preload the whole model into
+        RAM, blowing the sub-second/15s-capped probe budget."""
         import shutil as _shutil
         import subprocess as _subprocess
 

@@ -85,6 +85,16 @@ def _build_llama_server_cmd(entry: _LaunchEntry) -> str:
         parts += ["--fit-target", ",".join(str(v) for v in entry.fit_target)]
     if entry.fit_ctx is not None:
         parts += ["--fit-ctx", str(entry.fit_ctx)]
+    if entry.no_mmap:
+        # Read the whole model into RAM up front instead of mmap'ing it, so a
+        # low-VRAM MoE with experts in system RAM doesn't demand-page them from
+        # disk mid-token. Boolean flag; requires the model to fit in RAM.
+        parts.append("--no-mmap")
+    if entry.mlock:
+        # Pin RAM-resident pages so the kernel can't page them back to disk on
+        # a long-running server (the managed-mode "day-3 slowdown" fix). Boolean
+        # flag; silently no-ops under Docker without IPC_LOCK + memlock ulimit.
+        parts.append("--mlock")
     parts.extend(entry.extra_args)
 
     quoted: list[str] = []

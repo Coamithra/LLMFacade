@@ -10,3 +10,5 @@ One file per topic. Date each entry and link any relevant issues/PRs/plans.
 |---|---|
 | [llamacpp-reasoning-tool-calling.md](llamacpp-reasoning-tool-calling.md) | Why reasoning vanishes on tool-using turns; the reasoning↔tool-calling tension; `--jinja` / `enable_thinking`; forced-tool_choice misrouting bug |
 | [qwen3.6-27b-12gb.md](qwen3.6-27b-12gb.md) | A 12 GB-friendly Qwen3.6-27B quant vs Gemma 4 `UD-IQ4_XS` — dense vs MoE, why `n_cpu_moe` doesn't apply, the quant-size ladder |
+| [gemma4-12b-12gb.md](gemma4-12b-12gb.md) | Gemma 4 12B (dense, multimodal) fits 12 GB at Q5/Q6 fully GPU-resident — no `n_cpu_moe`, no homebrew IQ2; quant ladder + facade config; may obsolete the 26B-A4B homebrew plan |
+| [llamacpp-low-vram-moe-flags.md](llamacpp-low-vram-moe-flags.md) | The 5-flag ladder for fast low-VRAM MoE (3→17 t/s): `n_cpu_moe`, `--no-mmap`, GPU-fill, TurboQuant KV, `--mlock`; the Docker `IPC_LOCK` gotcha; why speculative decoding backfires on MoE/SSM |

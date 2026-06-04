@@ -94,6 +94,20 @@ def test_anthropic_model_enum_applies_capabilities():
     m_haiku = p.new_model(AnthropicModel.HAIKU_4_5)
     assert m_haiku.model_id == "claude-haiku-4-5-20251001"
     assert "thinking" in m_haiku.get_capabilities()
+    # Bare Haiku underperforms with no reasoning, so the enum bakes in a budget
+    # thinking default plus the max_tokens headroom the API requires above it.
+    assert m_haiku.defaults["thinking"] == 4096
+    assert m_haiku.defaults["max_tokens"] == 8192
+
+    # An explicit kwarg still wins over the enum default. Note `thinking=None`
+    # reads as "unset" and keeps the default — turn thinking off with DISABLED.
+    from llmfacade.settings import ThinkingMode
+
+    m_fast = p.new_model(
+        AnthropicModel.HAIKU_4_5, thinking=ThinkingMode.DISABLED, max_tokens=512
+    )
+    assert m_fast.defaults["thinking"] is ThinkingMode.DISABLED
+    assert m_fast.defaults["max_tokens"] == 512
 
 
 def test_anthropic_opus_4_8_drops_sampling_and_thinking_budget():
