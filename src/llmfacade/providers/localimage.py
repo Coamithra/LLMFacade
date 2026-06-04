@@ -432,8 +432,16 @@ class LocalImageProvider(Provider):
     ) -> ImageResult:
         if not self._managed:
             return self._call_images_sync(
-                prompt, model, n, size, quality, background,
-                output_format, reference_images, save_dir, extra,
+                prompt,
+                model,
+                n,
+                size,
+                quality,
+                background,
+                output_format,
+                reference_images,
+                save_dir,
+                extra,
             )
         with self._gen_lock:
             target = self._resolve_managed_model(model)
@@ -441,8 +449,16 @@ class LocalImageProvider(Provider):
             base = self._supervisor.ensure_model(target)
             self._ensure_image_client(base.rstrip("/") + "/v1")
             return self._call_images_sync(
-                prompt, target, n, size, quality, background,
-                output_format, reference_images, save_dir, extra,
+                prompt,
+                target,
+                n,
+                size,
+                quality,
+                background,
+                output_format,
+                reference_images,
+                save_dir,
+                extra,
             )
 
     async def _agenerate_image_raw(
@@ -462,8 +478,16 @@ class LocalImageProvider(Provider):
     ) -> ImageResult:
         if not self._managed:
             return await self._call_images_async(
-                prompt, model, n, size, quality, background,
-                output_format, reference_images, save_dir, extra,
+                prompt,
+                model,
+                n,
+                size,
+                quality,
+                background,
+                output_format,
+                reference_images,
+                save_dir,
+                extra,
             )
         async with self._gen_alock:
             target = self._resolve_managed_model(model)
@@ -474,8 +498,16 @@ class LocalImageProvider(Provider):
             base = self._supervisor.ensure_model(target)
             self._ensure_image_client(base.rstrip("/") + "/v1")
             return await self._call_images_async(
-                prompt, target, n, size, quality, background,
-                output_format, reference_images, save_dir, extra,
+                prompt,
+                target,
+                n,
+                size,
+                quality,
+                background,
+                output_format,
+                reference_images,
+                save_dir,
+                extra,
             )
 
     def _call_images_sync(
