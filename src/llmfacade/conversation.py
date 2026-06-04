@@ -42,7 +42,7 @@ from llmfacade.provider import (
     _filter_unsupported,
     _validate_knobs,
 )
-from llmfacade.settings import ThinkingMode, is_budget_thinking
+from llmfacade.settings import DrySampler, ThinkingMode, is_budget_thinking
 from llmfacade.tools import Tool
 
 if TYPE_CHECKING:
@@ -186,6 +186,7 @@ class Conversation:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -217,6 +218,7 @@ class Conversation:
                 "top_k": top_k,
                 "min_p": min_p,
                 "repeat_penalty": repeat_penalty,
+                "dry": dry,
                 "effort": effort,
                 "thinking": thinking,
                 "output_format": output_format,
@@ -409,6 +411,7 @@ class Conversation:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -431,6 +434,7 @@ class Conversation:
             top_k=top_k,
             min_p=min_p,
             repeat_penalty=repeat_penalty,
+            dry=dry,
             effort=effort,
             thinking=thinking,
             output_format=output_format,
@@ -474,6 +478,7 @@ class Conversation:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -491,6 +496,7 @@ class Conversation:
             top_k=top_k,
             min_p=min_p,
             repeat_penalty=repeat_penalty,
+            dry=dry,
             effort=effort,
             thinking=thinking,
             output_format=output_format,
@@ -534,6 +540,7 @@ class Conversation:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -550,6 +557,7 @@ class Conversation:
             top_k=top_k,
             min_p=min_p,
             repeat_penalty=repeat_penalty,
+            dry=dry,
             effort=effort,
             thinking=thinking,
             output_format=output_format,
@@ -621,6 +629,7 @@ class Conversation:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -637,6 +646,7 @@ class Conversation:
             top_k=top_k,
             min_p=min_p,
             repeat_penalty=repeat_penalty,
+            dry=dry,
             effort=effort,
             thinking=thinking,
             output_format=output_format,
@@ -1339,11 +1349,20 @@ class Conversation:
 
 
 def _logsafe(v: Any) -> Any:
-    """Render Enum values as their .value for compact JSON; passthrough others."""
+    """Render Enum values as their .value and dataclass instances (e.g. a
+    ``DrySampler`` knob value) as a plain dict for compact JSON; passthrough
+    others."""
+    import dataclasses
     from enum import Enum
 
     if isinstance(v, Enum):
         return v.value
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        # asdict does not run nested values back through _logsafe, so this
+        # assumes the dataclass's fields are JSON primitives (true for
+        # DrySampler). A future dataclass knob with an Enum field would log the
+        # raw member here — recurse if that ever happens.
+        return dataclasses.asdict(v)
     return v
 
 

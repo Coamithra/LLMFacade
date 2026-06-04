@@ -25,6 +25,7 @@ not an attempt at faithful chunk-timing replay.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 from collections.abc import AsyncIterator, Iterator
@@ -64,6 +65,8 @@ def _normalize(v: Any) -> Any:
         return v
     if isinstance(v, Enum):
         return _normalize(v.value)
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        return _normalize(dataclasses.asdict(v))
     if isinstance(v, dict):
         return {k: _normalize(v[k]) for k in sorted(v.keys(), key=str)}
     if isinstance(v, (list, tuple)):

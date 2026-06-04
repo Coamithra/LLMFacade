@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -104,6 +105,40 @@ class EphemeralCacheTTL(Enum):
     ONE_HOUR = "1h"
 
 
+@dataclass(frozen=True, slots=True)
+class DrySampler:
+    """Configuration for llama.cpp's DRY ("Don't Repeat Yourself") sampler — an
+    n-gram-level repetition penalty that breaks paragraph/verbatim loops which
+    token-level ``repeat_penalty`` cannot. The value of the ``dry`` runtime knob
+    (llamacpp-only).
+
+    ``multiplier`` is the enabling parameter: ``0.0`` disables DRY, so a
+    ``DrySampler`` is only meaningful with ``multiplier > 0`` (it is required —
+    you build one to turn DRY on). Every other field defaults to llama.cpp's own
+    default; ``sequence_breakers=None`` omits the param entirely so the server
+    keeps its built-in breaker set (``["\\n", ":", "\\"", "*"]``). The llamacpp
+    provider maps these to the wire params ``dry_multiplier`` / ``dry_base`` /
+    ``dry_allowed_length`` / ``dry_penalty_last_n`` / ``dry_sequence_breakers``
+    via ``extra_body``, omitting any ``None`` field."""
+
+    multiplier: float
+    base: float = 1.75
+    allowed_length: int = 2
+    penalty_last_n: int = -1
+    sequence_breakers: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        # multiplier is the enabling parameter — a non-positive value (or a
+        # stray bool) would construct an object that silently disables the very
+        # thing it exists to turn on. Reject it so the misuse fails at the call
+        # site rather than as a no-op on the wire.
+        if isinstance(self.multiplier, bool) or self.multiplier <= 0:
+            raise ValueError(
+                f"DrySampler.multiplier must be a positive number (it enables DRY); "
+                f"got {self.multiplier!r}. Omit the dry knob to leave DRY off."
+            )
+
+
 # Every knob that a provider may accept as a per-request parameter. Each
 # provider's class-level SUPPORTS frozenset declares which subset it accepts.
 # Defaults can be set at provider, model, or conversation construction;
@@ -116,6 +151,7 @@ RUNTIME_KNOBS: frozenset[str] = frozenset(
         "top_k",
         "min_p",
         "repeat_penalty",
+        "dry",
         "effort",
         "thinking",
         "output_format",
@@ -166,6 +202,7 @@ __all__ = [
     "is_budget_thinking",
     "OutputFormat",
     "EphemeralCacheTTL",
+    "DrySampler",
     "RUNTIME_KNOBS",
     "LAUNCH_KNOBS",
 ]

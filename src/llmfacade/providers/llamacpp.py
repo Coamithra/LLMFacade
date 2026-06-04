@@ -37,7 +37,7 @@ from llmfacade.providers._launch import (
     validate_flash_attn,
 )
 from llmfacade.providers._swap_lifecycle import _LlamaSwapSupervisor
-from llmfacade.settings import OutputFormat, ThinkingMode, ThinkingStyle
+from llmfacade.settings import DrySampler, OutputFormat, ThinkingMode, ThinkingStyle
 
 if TYPE_CHECKING:
     from llmfacade.facade import LLM
@@ -130,6 +130,7 @@ class LlamaCppServerProvider(Provider):
             "top_k",
             "min_p",
             "repeat_penalty",
+            "dry",
             "thinking",
             "output_format",
             "tools",
@@ -184,6 +185,7 @@ class LlamaCppServerProvider(Provider):
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -275,6 +277,7 @@ class LlamaCppServerProvider(Provider):
             top_k=top_k,
             min_p=min_p,
             repeat_penalty=repeat_penalty,
+            dry=dry,
             effort=effort,
             thinking=thinking,
             output_format=output_format,
@@ -416,6 +419,7 @@ class LlamaCppServerProvider(Provider):
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -489,6 +493,7 @@ class LlamaCppServerProvider(Provider):
                 top_k=top_k,
                 min_p=min_p,
                 repeat_penalty=repeat_penalty,
+                dry=dry,
                 effort=effort,
                 thinking=thinking,
                 output_format=output_format,
@@ -575,6 +580,7 @@ class LlamaCppServerProvider(Provider):
             top_k=top_k,
             min_p=min_p,
             repeat_penalty=repeat_penalty,
+            dry=dry,
             effort=effort,
             thinking=thinking,
             output_format=output_format,
@@ -623,6 +629,13 @@ class LlamaCppServerProvider(Provider):
             if value is not None:
                 extra[key] = value
 
+        # DRY ("Don't Repeat Yourself") sampler: a DrySampler is unpacked into
+        # llama.cpp's dry_* wire params, also via extra_body. n-gram-level loop
+        # escape that token-level repeat_penalty can't break.
+        dry = req.settings.get("dry")
+        if dry is not None:
+            extra.update(self._dry_to_extra_body(dry))
+
         # Thinking control: a ThinkingMode maps to llama.cpp's
         # `chat_template_kwargs={"enable_thinking": bool}`, routed through
         # extra_body like the samplers above. The embedded chat template only
@@ -651,6 +664,32 @@ class LlamaCppServerProvider(Provider):
                 api_kwargs["response_format"] = {"type": "json_object"}
 
         return api_kwargs
+
+    @staticmethod
+    def _dry_to_extra_body(value: Any) -> dict[str, Any]:
+        """Map the ``dry`` knob value to llama.cpp's DRY wire params for
+        ``extra_body``. A ``DrySampler`` is unpacked into ``dry_multiplier`` /
+        ``dry_base`` / ``dry_allowed_length`` / ``dry_penalty_last_n`` /
+        ``dry_sequence_breakers``, omitting any field left ``None`` so the server
+        keeps its own default (only ``sequence_breakers`` is omittable; the
+        numeric fields always carry a value). ``DrySampler`` is the only accepted
+        form — anything else is a usage error (a raw dict is rejected rather than
+        forwarded, since an un-prefixed key would silently become a no-op wire
+        param)."""
+        if isinstance(value, DrySampler):
+            fields: dict[str, Any] = {
+                "dry_multiplier": value.multiplier,
+                "dry_base": value.base,
+                "dry_allowed_length": value.allowed_length,
+                "dry_penalty_last_n": value.penalty_last_n,
+                "dry_sequence_breakers": (
+                    list(value.sequence_breakers) if value.sequence_breakers is not None else None
+                ),
+            }
+            return {k: v for k, v in fields.items() if v is not None}
+        raise TypeError(
+            f"dry= expects a DrySampler for the llamacpp provider, got {type(value).__name__}."
+        )
 
     @staticmethod
     def _thinking_to_template_kwargs(value: Any) -> dict[str, Any] | None:

@@ -35,6 +35,7 @@ from llmfacade.models import (
 from llmfacade.provider import CompletionRequest, Provider, SystemBlock
 from llmfacade.settings import (
     RUNTIME_KNOBS,
+    DrySampler,
     EffortLevel,
     EphemeralCacheTTL,
     OutputFormat,
@@ -60,6 +61,7 @@ __all__ = [
     "ThinkingStyle",
     "OutputFormat",
     "EphemeralCacheTTL",
+    "DrySampler",
     # Tools
     "tool",
     "Tool",

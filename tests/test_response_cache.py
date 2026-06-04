@@ -67,6 +67,60 @@ def test_hash_changes_with_settings(mock_model):
     )
 
 
+def _req_with_settings(settings: dict):
+    from llmfacade.models import Message
+    from llmfacade.provider import CompletionRequest
+
+    return CompletionRequest(
+        model="m",
+        messages=[Message(role="user", content="hi")],
+        system_blocks=[],
+        tools=[],
+        stop=None,
+        settings=settings,
+        settings_source={k: "convo" for k in settings},
+    )
+
+
+def test_normalize_unwraps_drysampler_dataclass():
+    """A DrySampler knob value normalises to a plain sorted dict (not a repr
+    blob), so it hashes structurally and logs readably."""
+    from llmfacade import DrySampler
+    from llmfacade.cache import _normalize
+
+    norm = _normalize(DrySampler(multiplier=0.8, sequence_breakers=("\n",)))
+    assert norm == {
+        "allowed_length": 2,
+        "base": 1.75,
+        "multiplier": 0.8,
+        "penalty_last_n": -1,
+        "sequence_breakers": ["\n"],
+    }
+
+
+def test_hash_changes_with_dry_config():
+    from llmfacade import DrySampler
+
+    a = _req_with_settings({"dry": DrySampler(multiplier=0.8)})
+    b = _req_with_settings({"dry": DrySampler(multiplier=0.9)})
+    none = _req_with_settings({})
+    h_a = hash_fingerprint(fingerprint_request(a, "llamacpp"))
+    h_b = hash_fingerprint(fingerprint_request(b, "llamacpp"))
+    h_none = hash_fingerprint(fingerprint_request(none, "llamacpp"))
+    assert h_a != h_b  # different DRY configs → different keys
+    assert h_a != h_none  # DRY on vs off → different keys
+
+
+def test_hash_stable_for_equal_dry_config():
+    from llmfacade import DrySampler
+
+    a = _req_with_settings({"dry": DrySampler(multiplier=0.8, sequence_breakers=("\n",))})
+    b = _req_with_settings({"dry": DrySampler(multiplier=0.8, sequence_breakers=("\n",))})
+    assert hash_fingerprint(fingerprint_request(a, "llamacpp")) == hash_fingerprint(
+        fingerprint_request(b, "llamacpp")
+    )
+
+
 def test_hash_changes_with_system_block_cache_flag(mock_model):
     """Per the design choice: cache=True markers are part of the fingerprint
     even though they don't affect generation, so flipping caching gets fresh

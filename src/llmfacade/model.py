@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 from llmfacade.exceptions import UnsupportedFeature
 from llmfacade.provider import _validate_knobs
-from llmfacade.settings import ThinkingMode
+from llmfacade.settings import DrySampler, ThinkingMode
 
 if TYPE_CHECKING:
     from llmfacade.conversation import Conversation
@@ -35,6 +35,7 @@ class Model:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -61,6 +62,7 @@ class Model:
                 "top_k": top_k,
                 "min_p": min_p,
                 "repeat_penalty": repeat_penalty,
+                "dry": dry,
                 "effort": effort,
                 "thinking": thinking,
                 "output_format": output_format,
@@ -181,6 +183,7 @@ class Model:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -209,6 +212,7 @@ class Model:
             top_k=top_k,
             min_p=min_p,
             repeat_penalty=repeat_penalty,
+            dry=dry,
             effort=effort,
             thinking=thinking,
             output_format=output_format,
