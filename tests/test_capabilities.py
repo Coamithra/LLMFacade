@@ -103,9 +103,7 @@ def test_anthropic_model_enum_applies_capabilities():
     # reads as "unset" and keeps the default — turn thinking off with DISABLED.
     from llmfacade.settings import ThinkingMode
 
-    m_fast = p.new_model(
-        AnthropicModel.HAIKU_4_5, thinking=ThinkingMode.DISABLED, max_tokens=512
-    )
+    m_fast = p.new_model(AnthropicModel.HAIKU_4_5, thinking=ThinkingMode.DISABLED, max_tokens=512)
     assert m_fast.defaults["thinking"] is ThinkingMode.DISABLED
     assert m_fast.defaults["max_tokens"] == 512
 
@@ -243,18 +241,13 @@ def test_dry_cascades_and_per_call_wins():
     """`dry` cascades like any knob and a per-call value wholly replaces a
     higher-scope one. Driven against llamacpp (the only provider that supports
     it) in external mode so the gate doesn't reject the convo-scope default."""
+    from llmfacade.models import Message
     from llmfacade.providers.llamacpp import LlamaCppServerProvider
 
     p = LlamaCppServerProvider(base_url="http://invalid.local:0/v1")
     convo = p.new_model("qwen2.5").new_conversation(dry=DrySampler(multiplier=0.5))
     # Reach into the merged request without firing a provider call.
-    convo._history.append(_DRY_USER_MSG())
+    convo._history.append(Message(role="user", content="hi"))
     req = convo._build_request(stop=None, per_call={"dry": DrySampler(multiplier=0.9)})
     assert req.settings["dry"] == DrySampler(multiplier=0.9)
     assert req.settings_source["dry"] == "per_call"
-
-
-def _DRY_USER_MSG():
-    from llmfacade.models import Message
-
-    return Message(role="user", content="hi")

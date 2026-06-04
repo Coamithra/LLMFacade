@@ -127,6 +127,17 @@ class DrySampler:
     penalty_last_n: int = -1
     sequence_breakers: tuple[str, ...] | None = None
 
+    def __post_init__(self) -> None:
+        # multiplier is the enabling parameter — a non-positive value (or a
+        # stray bool) would construct an object that silently disables the very
+        # thing it exists to turn on. Reject it so the misuse fails at the call
+        # site rather than as a no-op on the wire.
+        if isinstance(self.multiplier, bool) or self.multiplier <= 0:
+            raise ValueError(
+                f"DrySampler.multiplier must be a positive number (it enables DRY); "
+                f"got {self.multiplier!r}. Omit the dry knob to leave DRY off."
+            )
+
 
 # Every knob that a provider may accept as a per-request parameter. Each
 # provider's class-level SUPPORTS frozenset declares which subset it accepts.

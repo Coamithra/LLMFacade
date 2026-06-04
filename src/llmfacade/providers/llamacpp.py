@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json as _json
 import warnings
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote as _urlquote
@@ -662,9 +662,10 @@ class LlamaCppServerProvider(Provider):
         ``dry_base`` / ``dry_allowed_length`` / ``dry_penalty_last_n`` /
         ``dry_sequence_breakers``, omitting any field left ``None`` so the server
         keeps its own default (only ``sequence_breakers`` is omittable; the
-        numeric fields always carry a value). A plain mapping is accepted
-        defensively — assumed already in the ``dry_*`` wire shape — and passed
-        through for its non-``None`` entries. Anything else is a usage error."""
+        numeric fields always carry a value). ``DrySampler`` is the only accepted
+        form — anything else is a usage error (a raw dict is rejected rather than
+        forwarded, since an un-prefixed key would silently become a no-op wire
+        param)."""
         if isinstance(value, DrySampler):
             fields: dict[str, Any] = {
                 "dry_multiplier": value.multiplier,
@@ -676,11 +677,8 @@ class LlamaCppServerProvider(Provider):
                 ),
             }
             return {k: v for k, v in fields.items() if v is not None}
-        if isinstance(value, Mapping):
-            return {k: v for k, v in value.items() if v is not None}
         raise TypeError(
-            "dry= expects a DrySampler (or a dry_* mapping) for the llamacpp "
-            f"provider, got {type(value).__name__}."
+            f"dry= expects a DrySampler for the llamacpp provider, got {type(value).__name__}."
         )
 
     @staticmethod

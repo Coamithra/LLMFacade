@@ -123,15 +123,21 @@ def test_build_kwargs_dry_coexists_with_other_samplers(
     assert kwargs["extra_body"]["dry_multiplier"] == 0.8
 
 
-def test_build_kwargs_dry_accepts_plain_mapping(
+def test_build_kwargs_dry_rejects_plain_dict(
     provider: LlamaCppServerProvider,
 ):
-    # Defensive passthrough: a dict already in the dry_* wire shape forwards
-    # its non-None entries verbatim.
-    kwargs = provider._build_kwargs(
-        _req(settings={"dry": {"dry_multiplier": 0.8, "dry_base": None}})
-    )
-    assert kwargs["extra_body"] == {"dry_multiplier": 0.8}
+    # DrySampler is the only accepted form; a raw dict is rejected rather than
+    # forwarded (an un-prefixed key would silently become a no-op wire param).
+    with pytest.raises(TypeError):
+        provider._build_kwargs(_req(settings={"dry": {"dry_multiplier": 0.8}}))
+
+
+def test_drysampler_rejects_nonpositive_or_bool_multiplier():
+    # multiplier is the enabling param; a non-positive value (or a stray bool)
+    # would build an object that silently disables DRY.
+    for bad in (0.0, -1.0, True):
+        with pytest.raises(ValueError):
+            DrySampler(multiplier=bad)
 
 
 def test_build_kwargs_output_format_json_sets_response_format(

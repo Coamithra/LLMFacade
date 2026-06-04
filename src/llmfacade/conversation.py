@@ -1358,6 +1358,10 @@ def _logsafe(v: Any) -> Any:
     if isinstance(v, Enum):
         return v.value
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        # asdict does not run nested values back through _logsafe, so this
+        # assumes the dataclass's fields are JSON primitives (true for
+        # DrySampler). A future dataclass knob with an Enum field would log the
+        # raw member here — recurse if that ever happens.
         return dataclasses.asdict(v)
     return v
 
