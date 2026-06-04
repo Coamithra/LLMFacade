@@ -83,9 +83,14 @@ class AnthropicModel(Enum):
 
     A member may also carry `defaults` — model-scope generation knobs applied by
     `new_model()` unless the caller passes their own value. Opus 4.8 defaults to
-    `effort=xhigh` + adaptive thinking (its recommended settings); pass `effort=`
-    / `thinking=` explicitly to override, or `thinking=ThinkingMode.DISABLED` to
-    turn thinking off."""
+    `effort=xhigh` + adaptive thinking (its recommended settings); Haiku 4.5
+    defaults to a 4096-token thinking budget with `max_tokens=8192` of headroom,
+    since bare Haiku (no reasoning) noticeably underperforms — Haiku rejects
+    `effort` and adaptive thinking, so a budget is the only quality lever, and it
+    needs `max_tokens` above the budget or the API 400s. Pass `effort=` /
+    `thinking=` / `max_tokens=` explicitly to override, or
+    `thinking=ThinkingMode.DISABLED` to turn thinking off (e.g. when you want
+    Haiku's raw speed back)."""
 
     OPUS_4_8 = (
         "claude-opus-4-8",
@@ -93,7 +98,11 @@ class AnthropicModel(Enum):
         {"effort": EffortLevel.XHIGH, "thinking": ThinkingMode.ADAPTIVE},
     )
     SONNET_4_6 = ("claude-sonnet-4-6", _SUPPORTS, {})
-    HAIKU_4_5 = ("claude-haiku-4-5-20251001", _SUPPORTS, {})
+    HAIKU_4_5 = (
+        "claude-haiku-4-5-20251001",
+        _SUPPORTS,
+        {"thinking": 4096, "max_tokens": 8192},
+    )
 
     def __init__(
         self,
@@ -214,8 +223,9 @@ class AnthropicProvider(Provider):
         passed.
 
         The member's `.defaults` (e.g. Opus 4.8's `effort=xhigh` + adaptive
-        thinking) are applied as model-scope defaults for any knob the caller
-        left unset; an explicit kwarg always wins."""
+        thinking, or Haiku 4.5's `thinking=4096` budget + `max_tokens=8192`) are
+        applied as model-scope defaults for any knob the caller left unset; an
+        explicit kwarg always wins."""
         if isinstance(model_id, AnthropicModel):
             if capability_override is None:
                 capability_override = model_id.capabilities
@@ -223,6 +233,8 @@ class AnthropicProvider(Provider):
                 effort = model_id.defaults.get("effort")
             if thinking is None:
                 thinking = model_id.defaults.get("thinking")
+            if max_tokens is None:
+                max_tokens = model_id.defaults.get("max_tokens")
             model_id = model_id.model_id
         return super().new_model(
             model_id,
