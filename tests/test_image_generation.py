@@ -202,6 +202,22 @@ def test_google_agenerate_image():
     assert result.images[0].data == b"AIMG"
 
 
+def test_google_warns_and_drops_n():
+    """Gemini-native emits one image per call; n>1 must warn and never leak into
+    the request (it has no such param). Pins the silent-drop so a future wiring
+    of n is a deliberate change."""
+    provider = GoogleProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.models.generate_content.return_value = _gemini_image_response(b"X")
+
+    with pytest.warns(UserWarning, match="n=4 is ignored"):
+        provider.generate_image("a dragon", n=4)
+
+    kwargs = provider._client.models.generate_content.call_args.kwargs
+    assert "n" not in kwargs
+    assert "n" not in kwargs["config"]
+
+
 # ---- local image -----------------------------------------------------------
 
 

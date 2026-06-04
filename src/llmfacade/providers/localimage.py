@@ -10,7 +10,7 @@ from llmfacade.exceptions import (
     ProviderNotInstalledError,
     RateLimitError,
 )
-from llmfacade.models import ImageBlock, ImageResult, apply_save_dir
+from llmfacade.models import ImageBlock, ImageResult, _apply_save_dir
 from llmfacade.provider import Provider
 from llmfacade.providers._openai_images import (
     build_edit_kwargs,
@@ -137,7 +137,7 @@ class LocalImageProvider(Provider):
             provider=self.NAME,
             fallback_media_type=media_type_for(output_format),
         )
-        return apply_save_dir(result, save_dir)
+        return _apply_save_dir(result, save_dir)
 
     async def agenerate_image(
         self,
@@ -174,4 +174,4 @@ class LocalImageProvider(Provider):
             provider=self.NAME,
             fallback_media_type=media_type_for(output_format),
         )
-        return apply_save_dir(result, save_dir)
+        return _apply_save_dir(result, save_dir)

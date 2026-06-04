@@ -172,7 +172,8 @@ class LLM:
         The single entry point: ``provider`` is e.g. ``"openai"``, ``"google"`` /
         ``"gemini"``, or ``"localimage"``. Hosted providers use the manager's
         ``api_keys`` / env; for ``"localimage"`` pass ``base_url`` (and optionally
-        ``api_key``). The provider is cached per ``(provider, base_url)``."""
+        ``api_key``). The provider is cached per ``(provider, base_url)`` (the
+        provider name is case-folded, matching ``new_provider``)."""
         return self._image_provider(provider, base_url, api_key).generate_image(
             prompt,
             model=model,

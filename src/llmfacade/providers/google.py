@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import warnings
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from llmfacade.models import (
     ToolResultBlock,
     ToolUseBlock,
     Usage,
-    apply_save_dir,
+    _apply_save_dir,
 )
 from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.settings import OutputFormat
@@ -455,6 +456,18 @@ class GoogleProvider(Provider):
             image_count=image_count,
         )
 
+    def _warn_image_arg_drops(self, n: int) -> None:
+        # Gemini-native image generation emits a single image per call and has no
+        # size / quality / background / output_format equivalents; only
+        # aspect_ratio maps (to image_config.aspect_ratio). Warn on n, the one
+        # whose silent drop actually changes what the caller gets back.
+        if n != 1:
+            warnings.warn(
+                f"Google (Gemini-native) image generation produces one image per call; "
+                f"n={n} is ignored.",
+                stacklevel=3,
+            )
+
     def generate_image(
         self,
         prompt: str,
@@ -470,6 +483,14 @@ class GoogleProvider(Provider):
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
+        """Generate an image with Gemini-native (``gemini-2.5-flash-image``).
+
+        Only ``prompt``, ``aspect_ratio`` (→ ``image_config.aspect_ratio``) and
+        ``reference_images`` (appended to ``contents`` as ``inline_data`` parts)
+        are honored; ``n`` / ``size`` / ``quality`` / ``background`` /
+        ``output_format`` have no Gemini-native equivalent and are ignored
+        (``n != 1`` warns). They are accepted for cross-provider uniformity."""
+        self._warn_image_arg_drops(n)
         model = model or self._DEFAULT_IMAGE_MODEL
         api_kwargs: dict[str, Any] = {
             "model": model,
@@ -481,7 +502,7 @@ class GoogleProvider(Provider):
         except Exception as e:
             self._reraise(e)
             raise
-        return apply_save_dir(self._parse_image_response(raw, model), save_dir)
+        return _apply_save_dir(self._parse_image_response(raw, model), save_dir)
 
     async def agenerate_image(
         self,
@@ -498,6 +519,7 @@ class GoogleProvider(Provider):
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
+        self._warn_image_arg_drops(n)
         model = model or self._DEFAULT_IMAGE_MODEL
         api_kwargs: dict[str, Any] = {
             "model": model,
@@ -509,7 +531,7 @@ class GoogleProvider(Provider):
         except Exception as e:
             self._reraise(e)
             raise
-        return apply_save_dir(self._parse_image_response(raw, model), save_dir)
+        return _apply_save_dir(self._parse_image_response(raw, model), save_dir)
 
     def _usage_from(self, raw: Any) -> Usage | None:
         um = getattr(raw, "usage_metadata", None)

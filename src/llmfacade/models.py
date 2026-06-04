@@ -202,7 +202,7 @@ class ImageResult:
         return written
 
 
-def apply_save_dir(result: ImageResult, save_dir: str | Path | None) -> ImageResult:
+def _apply_save_dir(result: ImageResult, save_dir: str | Path | None) -> ImageResult:
     """If ``save_dir`` is set, write ``result``'s images there and return a copy
     with ``paths`` populated; otherwise return ``result`` unchanged. Shared by
     the image-generating providers so ``save_dir=`` behaves identically."""

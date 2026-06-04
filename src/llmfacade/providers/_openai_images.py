@@ -55,6 +55,9 @@ def build_generate_kwargs(
     if request_b64:
         kwargs["response_format"] = "b64_json"
     if extra:
+        # `mask` is an edits-only concept (build_edit_kwargs pops it); on the
+        # plain generate path it would just ride along as an unused extra_body
+        # field. Callers pass it only with reference_images, so it never lands here.
         kwargs["extra_body"] = dict(extra)
     return kwargs
 

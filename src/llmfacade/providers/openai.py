@@ -26,7 +26,7 @@ from llmfacade.models import (
     ToolResultBlock,
     ToolUseBlock,
     Usage,
-    apply_save_dir,
+    _apply_save_dir,
 )
 from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.providers._openai_images import (
@@ -523,7 +523,7 @@ class OpenAIProvider(Provider):
         result = parse_images_response(
             raw, model=model, provider="openai", fallback_media_type=media_type_for(output_format)
         )
-        return apply_save_dir(result, save_dir)
+        return _apply_save_dir(result, save_dir)
 
     async def agenerate_image(
         self,
@@ -558,4 +558,4 @@ class OpenAIProvider(Provider):
         result = parse_images_response(
             raw, model=model, provider="openai", fallback_media_type=media_type_for(output_format)
         )
-        return apply_save_dir(result, save_dir)
+        return _apply_save_dir(result, save_dir)
