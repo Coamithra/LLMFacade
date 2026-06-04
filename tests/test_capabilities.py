@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from llmfacade import ThinkingMode, UnsupportedFeature
+from llmfacade import DrySampler, ThinkingMode, UnsupportedFeature
 
 from .conftest import MockProvider
 
@@ -217,3 +217,44 @@ def test_cascade_precedence(mock_provider):
     assert last.settings_source["temperature"] == "per_call"
     assert last.settings["max_tokens"] == 30
     assert last.settings_source["max_tokens"] == "convo"
+
+
+def test_dry_supported_by_llamacpp_only():
+    """The `dry` knob is llamacpp-specific: llamacpp declares it, the stock
+    hosted providers do not."""
+    from llmfacade.providers.anthropic import AnthropicProvider
+    from llmfacade.providers.llamacpp import LlamaCppServerProvider
+    from llmfacade.providers.openai import OpenAIProvider
+
+    assert "dry" in LlamaCppServerProvider.SUPPORTS
+    assert "dry" not in AnthropicProvider.SUPPORTS
+    assert "dry" not in OpenAIProvider.SUPPORTS
+
+
+def test_dry_on_unsupporting_model_raises(mock_model):
+    """MockProvider does not declare `dry`; setting it per-call hits the
+    capability gate and raises (mirrors the repeat_penalty case)."""
+    convo = mock_model.new_conversation()
+    with pytest.raises(UnsupportedFeature):
+        convo.send("hi", dry=DrySampler(multiplier=0.8))
+
+
+def test_dry_cascades_and_per_call_wins():
+    """`dry` cascades like any knob and a per-call value wholly replaces a
+    higher-scope one. Driven against llamacpp (the only provider that supports
+    it) in external mode so the gate doesn't reject the convo-scope default."""
+    from llmfacade.providers.llamacpp import LlamaCppServerProvider
+
+    p = LlamaCppServerProvider(base_url="http://invalid.local:0/v1")
+    convo = p.new_model("qwen2.5").new_conversation(dry=DrySampler(multiplier=0.5))
+    # Reach into the merged request without firing a provider call.
+    convo._history.append(_DRY_USER_MSG())
+    req = convo._build_request(stop=None, per_call={"dry": DrySampler(multiplier=0.9)})
+    assert req.settings["dry"] == DrySampler(multiplier=0.9)
+    assert req.settings_source["dry"] == "per_call"
+
+
+def _DRY_USER_MSG():
+    from llmfacade.models import Message
+
+    return Message(role="user", content="hi")

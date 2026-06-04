@@ -17,7 +17,7 @@ from llmfacade.exceptions import ProviderError
 from llmfacade.models import TextBlock, ThinkingBlock
 from llmfacade.provider import CompletionRequest
 from llmfacade.providers.llamacpp import LlamaCppServerProvider
-from llmfacade.settings import OutputFormat
+from llmfacade.settings import DrySampler, OutputFormat
 
 
 @tool
@@ -75,6 +75,63 @@ def test_build_kwargs_extra_body_omitted_when_no_llamacpp_knobs(
     kwargs = provider._build_kwargs(_req(settings={"temperature": 0.5}))
     assert "extra_body" not in kwargs
     assert kwargs["temperature"] == 0.5
+
+
+def test_build_kwargs_dry_minimal_uses_field_defaults(
+    provider: LlamaCppServerProvider,
+):
+    # multiplier-only DrySampler: the numeric fields carry their defaults and
+    # sequence_breakers is omitted (None) so the server keeps its own breakers.
+    kwargs = provider._build_kwargs(_req(settings={"dry": DrySampler(multiplier=0.8)}))
+    assert kwargs["extra_body"] == {
+        "dry_multiplier": 0.8,
+        "dry_base": 1.75,
+        "dry_allowed_length": 2,
+        "dry_penalty_last_n": -1,
+    }
+    assert "dry_sequence_breakers" not in kwargs["extra_body"]
+    assert "dry" not in kwargs
+
+
+def test_build_kwargs_dry_full_maps_all_fields(
+    provider: LlamaCppServerProvider,
+):
+    dry = DrySampler(
+        multiplier=0.9,
+        base=2.0,
+        allowed_length=3,
+        penalty_last_n=256,
+        sequence_breakers=("\n", "###"),
+    )
+    kwargs = provider._build_kwargs(_req(settings={"dry": dry}))
+    assert kwargs["extra_body"] == {
+        "dry_multiplier": 0.9,
+        "dry_base": 2.0,
+        "dry_allowed_length": 3,
+        "dry_penalty_last_n": 256,
+        "dry_sequence_breakers": ["\n", "###"],
+    }
+
+
+def test_build_kwargs_dry_coexists_with_other_samplers(
+    provider: LlamaCppServerProvider,
+):
+    kwargs = provider._build_kwargs(
+        _req(settings={"top_k": 40, "dry": DrySampler(multiplier=0.8)})
+    )
+    assert kwargs["extra_body"]["top_k"] == 40
+    assert kwargs["extra_body"]["dry_multiplier"] == 0.8
+
+
+def test_build_kwargs_dry_accepts_plain_mapping(
+    provider: LlamaCppServerProvider,
+):
+    # Defensive passthrough: a dict already in the dry_* wire shape forwards
+    # its non-None entries verbatim.
+    kwargs = provider._build_kwargs(
+        _req(settings={"dry": {"dry_multiplier": 0.8, "dry_base": None}})
+    )
+    assert kwargs["extra_body"] == {"dry_multiplier": 0.8}
 
 
 def test_build_kwargs_output_format_json_sets_response_format(

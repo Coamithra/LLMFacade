@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from llmfacade.exceptions import AuthenticationError, UnsupportedFeature
-from llmfacade.settings import RUNTIME_KNOBS, ThinkingMode
+from llmfacade.settings import RUNTIME_KNOBS, DrySampler, ThinkingMode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -133,6 +133,7 @@ class Provider:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -157,6 +158,7 @@ class Provider:
                 "top_k": top_k,
                 "min_p": min_p,
                 "repeat_penalty": repeat_penalty,
+                "dry": dry,
                 "effort": effort,
                 "thinking": thinking,
                 "output_format": output_format,
@@ -194,6 +196,7 @@ class Provider:
         top_k: int | None = None,
         min_p: float | None = None,
         repeat_penalty: float | None = None,
+        dry: DrySampler | None = None,
         effort: Any | None = None,
         thinking: int | ThinkingMode | str | None = None,
         output_format: Any | None = None,
@@ -213,6 +216,7 @@ class Provider:
             "top_k": top_k,
             "min_p": min_p,
             "repeat_penalty": repeat_penalty,
+            "dry": dry,
             "effort": effort,
             "thinking": thinking,
             "output_format": output_format,
