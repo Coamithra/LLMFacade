@@ -75,9 +75,13 @@ class _LaunchEntry:
     flash_attn: str | None = None
     mmproj_path: str | None = None
     jinja: bool = True
+    no_mmap: bool = False
+    mlock: bool = False
 
 
-_HASH_EXCLUDED_KEYS: frozenset[str] = frozenset({"fit", "fit_target", "fit_ctx"})
+_HASH_EXCLUDED_KEYS: frozenset[str] = frozenset(
+    {"fit", "fit_target", "fit_ctx", "no_mmap", "mlock"}
+)
 
 
 def canonical_launch_json(launch_config: dict[str, Any]) -> str:
@@ -89,7 +93,10 @@ def canonical_launch_json(launch_config: dict[str, Any]) -> str:
 
     The `fit*` knobs are excluded: they govern spawn-time VRAM fitting, not
     generation behaviour, so flipping `--fit on/off` mustn't change `model_id`
-    (and break slot-cache continuity for users on persisted slots)."""
+    (and break slot-cache continuity for users on persisted slots). `no_mmap`
+    and `mlock` are excluded for the same reason: they only change *where the
+    model's bytes live* (RAM vs mmap'd from disk, pinned vs pageable), never
+    *what the model emits*, so toggling them mustn't shift `model_id` either."""
     cleaned: dict[str, Any] = {}
     for k in sorted(launch_config):
         if k in _HASH_EXCLUDED_KEYS:
@@ -148,6 +155,8 @@ def default_provider_launch_defaults(llmfacade_dir: Path) -> dict[str, Any]:
         "fit_ctx": None,
         "mmproj_path": None,
         "jinja": True,
+        "no_mmap": False,
+        "mlock": False,
     }
 
 
