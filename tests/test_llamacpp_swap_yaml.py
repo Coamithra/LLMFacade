@@ -333,3 +333,36 @@ def test_derive_model_id_changes_with_jinja() -> None:
     a = derive_model_id({**base, "jinja": True}, name=None)
     b = derive_model_id({**base, "jinja": False}, name=None)
     assert a != b
+
+
+def test_render_no_mmap() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf", no_mmap=True)
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--no-mmap" in cmd
+
+
+def test_render_mlock() -> None:
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf", mlock=True)
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--mlock" in cmd
+
+
+def test_render_no_mmap_and_mlock_omitted_by_default() -> None:
+    """Both default `False` — neither flag may appear unless opted in. They force
+    a full RAM preload / page-pinning, unsafe to enable on a tight-RAM box."""
+    entry = _LaunchEntry(model_id="m", gguf="x.gguf")
+    cmd = _parse(_render_swap_yaml([entry]))["models"]["m"]["cmd"]
+    assert "--no-mmap" not in cmd
+    assert "--mlock" not in cmd
+
+
+def test_derive_model_id_ignores_no_mmap_and_mlock() -> None:
+    """no_mmap/mlock are output-neutral (they change where bytes live, not what
+    the model emits), so toggling them mustn't shift model_id — same treatment
+    as the fit knobs, to keep slot-cache continuity."""
+    base = {"gguf": "models/qwen.gguf", "context_size": 8192}
+    a = derive_model_id(base, name=None)
+    b = derive_model_id({**base, "no_mmap": True}, name=None)
+    c = derive_model_id({**base, "mlock": True}, name=None)
+    d = derive_model_id({**base, "no_mmap": True, "mlock": True}, name=None)
+    assert a == b == c == d

@@ -153,6 +153,8 @@ LAUNCH_KNOBS: frozenset[str] = frozenset(
         "flash_attn",
         "mmproj_path",
         "jinja",
+        "no_mmap",
+        "mlock",
     }
 )
 
