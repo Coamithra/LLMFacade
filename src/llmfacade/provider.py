@@ -10,9 +10,12 @@ from llmfacade.exceptions import AuthenticationError, UnsupportedFeature
 from llmfacade.settings import RUNTIME_KNOBS, ThinkingMode
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from llmfacade.facade import LLM
+    from llmfacade.image import ImageModel
     from llmfacade.model import Model
-    from llmfacade.models import Message, Response, StreamEvent
+    from llmfacade.models import ImageBlock, ImageResult, Message, Response, StreamEvent
     from llmfacade.tools import Tool
 
 
@@ -302,6 +305,76 @@ class Provider:
         estimate or backend version."""
         del model_id
         return None
+
+    # ---- Image generation --------------------------------------------------
+    # A separate surface from the chat hooks: image generation is a one-shot,
+    # not a stateful conversation, so it does not flow through CompletionRequest
+    # or the settings cascade. Providers that can generate images override these
+    # and declare the pure ``"image_generation"`` capability flag in SUPPORTS;
+    # the base raises so non-image providers (Anthropic, llamacpp) fail fast and
+    # ``is_available("image_generation")`` reads False for them.
+
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: str | Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        raise UnsupportedFeature("image_generation", self.NAME, model)
+
+    async def agenerate_image(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: str | Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        raise UnsupportedFeature("image_generation", self.NAME, model)
+
+    def new_image_model(
+        self,
+        model_id: str,
+        *,
+        capability_override: frozenset[str] | None = None,
+        n: int | None = None,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+    ) -> ImageModel:
+        """Bind ``model_id`` to this provider for image generation, with optional
+        per-model defaults. Mirrors ``new_model`` for the chat surface."""
+        from llmfacade.image import ImageModel
+
+        return ImageModel(
+            provider=self,
+            model_id=model_id,
+            capability_override=capability_override,
+            n=n,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+        )
 
     def _complete_raw(self, req: CompletionRequest) -> Response:
         raise NotImplementedError

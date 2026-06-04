@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 from typing import Any
 
 from llmfacade.exceptions import (
@@ -13,6 +14,8 @@ from llmfacade.exceptions import (
 from llmfacade.models import (
     ContentBlock,
     ImageBlock,
+    ImageResult,
+    ImageUsage,
     Message,
     Response,
     StreamEvent,
@@ -22,6 +25,7 @@ from llmfacade.models import (
     ToolResultBlock,
     ToolUseBlock,
     Usage,
+    apply_save_dir,
 )
 from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.settings import OutputFormat
@@ -40,6 +44,7 @@ class GoogleProvider(Provider):
             "tools",
             "tool_choice",
             "vision",
+            "image_generation",
         }
     )
 
@@ -380,6 +385,131 @@ class GoogleProvider(Provider):
             model=model,
             raw=raw,
         )
+
+    # ---- Image generation (Gemini-native, "Nano Banana") -------------------
+    # Imagen is being shut down per Google's Gemini API deprecations, so the
+    # only image path is gemini-2.5-flash-image via generate_content with
+    # response_modalities=["IMAGE"]. Reference images are passed as inline_data
+    # parts in `contents` (the same wire shape as vision input), which is what
+    # makes image-conditioned generation / editing work on the Developer API.
+
+    _DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"
+
+    def _image_contents(
+        self, prompt: str, reference_images: list[ImageBlock] | None
+    ) -> list[dict[str, Any]]:
+        parts: list[dict[str, Any]] = [{"text": prompt}]
+        for b in reference_images or []:
+            parts.append({"inline_data": {"mime_type": b.media_type, "data": b.to_base64()}})
+        return [{"role": "user", "parts": parts}]
+
+    def _image_config(
+        self, aspect_ratio: str | None, extra: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        config: dict[str, Any] = {"response_modalities": ["IMAGE"]}
+        if aspect_ratio is not None:
+            config["image_config"] = {"aspect_ratio": aspect_ratio}
+        if extra:
+            config.update(extra)
+        return config
+
+    def _parse_image_response(self, raw: Any, model: str) -> ImageResult:
+        images: list[ImageBlock] = []
+        for cand in getattr(raw, "candidates", []) or []:
+            content = getattr(cand, "content", None)
+            if content is None:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                inline = getattr(part, "inline_data", None)
+                if inline is None:
+                    continue
+                data = getattr(inline, "data", None)
+                if not data:
+                    continue
+                mime = getattr(inline, "mime_type", None) or "image/png"
+                block = (
+                    ImageBlock(data=data, media_type=mime)
+                    if isinstance(data, bytes)
+                    else ImageBlock.from_base64(data, media_type=mime)
+                )
+                images.append(block)
+        return ImageResult(
+            images=images,
+            usage=self._image_usage_from(raw, len(images)),
+            model=model,
+            provider=self.NAME,
+            raw=raw,
+        )
+
+    def _image_usage_from(self, raw: Any, image_count: int) -> ImageUsage:
+        um = getattr(raw, "usage_metadata", None)
+        if um is None:
+            return ImageUsage(image_count=image_count)
+        prompt = getattr(um, "prompt_token_count", 0) or 0
+        candidates = getattr(um, "candidates_token_count", 0) or 0
+        total = getattr(um, "total_token_count", 0) or 0
+        return ImageUsage(
+            input_tokens=prompt,
+            output_tokens=candidates,
+            total_tokens=total or (prompt + candidates),
+            image_count=image_count,
+        )
+
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: str | Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        model = model or self._DEFAULT_IMAGE_MODEL
+        api_kwargs: dict[str, Any] = {
+            "model": model,
+            "contents": self._image_contents(prompt, reference_images),
+            "config": self._image_config(aspect_ratio, extra),
+        }
+        try:
+            raw = self._client.models.generate_content(**api_kwargs)
+        except Exception as e:
+            self._reraise(e)
+            raise
+        return apply_save_dir(self._parse_image_response(raw, model), save_dir)
+
+    async def agenerate_image(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: str | Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        model = model or self._DEFAULT_IMAGE_MODEL
+        api_kwargs: dict[str, Any] = {
+            "model": model,
+            "contents": self._image_contents(prompt, reference_images),
+            "config": self._image_config(aspect_ratio, extra),
+        }
+        try:
+            raw = await self._client.aio.models.generate_content(**api_kwargs)
+        except Exception as e:
+            self._reraise(e)
+            raise
+        return apply_save_dir(self._parse_image_response(raw, model), save_dir)
 
     def _usage_from(self, raw: Any) -> Usage | None:
         um = getattr(raw, "usage_metadata", None)

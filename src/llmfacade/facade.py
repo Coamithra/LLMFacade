@@ -11,6 +11,7 @@ from llmfacade.exceptions import LLMError, ProviderNotInstalledError
 from llmfacade.providers import PROVIDER_REGISTRY
 
 if TYPE_CHECKING:
+    from llmfacade.models import ImageBlock, ImageResult
     from llmfacade.provider import Provider
 
 
@@ -43,6 +44,11 @@ class LLM:
         max_log_folders: int = 10,
     ):
         self.api_keys: dict[str, str] = dict(api_keys or {})
+        # Providers built by generate_image, cached per (name, base_url) so the
+        # SDK client is reused across calls. Image generation is a one-shot, so
+        # there's no Conversation/Model to hang the provider off — the manager
+        # holds it instead.
+        self._image_providers: dict[tuple[str, str | None], Provider] = {}
         self._max_log_folders = max(0, int(max_log_folders))
         self._run_dir_materialized = False
         if log_dir is False:
@@ -124,3 +130,91 @@ class LLM:
 
         provider_cls = getattr(module, class_name)
         return provider_cls(manager=self, **kwargs)
+
+    # ---- Image generation --------------------------------------------------
+
+    def _image_provider(
+        self, provider: str, base_url: str | None, api_key: str | None
+    ) -> Provider:
+        key = (provider.lower(), base_url)
+        cached = self._image_providers.get(key)
+        if cached is not None:
+            return cached
+        kwargs: dict[str, Any] = {}
+        if base_url is not None:
+            kwargs["base_url"] = base_url
+        if api_key is not None:
+            kwargs["api_key"] = api_key
+        built = self.new_provider(provider, **kwargs)
+        self._image_providers[key] = built
+        return built
+
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        provider: str,
+        model: str,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: Path | str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        """Generate image(s) through ``provider`` (resolved from the registry).
+
+        The single entry point: ``provider`` is e.g. ``"openai"``, ``"google"`` /
+        ``"gemini"``, or ``"localimage"``. Hosted providers use the manager's
+        ``api_keys`` / env; for ``"localimage"`` pass ``base_url`` (and optionally
+        ``api_key``). The provider is cached per ``(provider, base_url)``."""
+        return self._image_provider(provider, base_url, api_key).generate_image(
+            prompt,
+            model=model,
+            n=n,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            reference_images=reference_images,
+            save_dir=save_dir,
+            extra=extra,
+        )
+
+    async def agenerate_image(
+        self,
+        prompt: str,
+        *,
+        provider: str,
+        model: str,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: Path | str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        return await self._image_provider(provider, base_url, api_key).agenerate_image(
+            prompt,
+            model=model,
+            n=n,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            reference_images=reference_images,
+            save_dir=save_dir,
+            extra=extra,
+        )

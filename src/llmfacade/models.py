@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import mimetypes
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Union
 
@@ -148,3 +148,65 @@ class StreamEvent:
     done: bool = False
     usage: Usage | None = None
     finish_reason: str | None = None
+
+
+_EXT_BY_MEDIA_TYPE = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ImageUsage:
+    """Usage reported by an image-generation call. ``image_count`` is always
+    set; the token fields are populated only where the provider breaks them out
+    (OpenAI ``gpt-image-*``, Gemini-native ``usage_metadata``) and are ``0``
+    otherwise. No provider returns a dollar figure — derive cost from the token
+    counts and the model's published pricing."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    image_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ImageResult:
+    """Result of a ``generate_image`` call. ``images`` carries the generated
+    image bytes as :class:`ImageBlock` instances (so they round-trip straight
+    back into a vision request). ``paths`` is empty unless ``save_dir=`` was
+    passed (or :meth:`save` was called), in which case it lists the written
+    files in image order."""
+
+    images: list[ImageBlock]
+    usage: ImageUsage | None
+    model: str
+    provider: str
+    paths: list[Path] = field(default_factory=list)
+    raw: object = field(default=None, repr=False, compare=False)
+
+    def save(self, dest: str | Path, *, prefix: str = "image") -> list[Path]:
+        """Write each image into directory ``dest`` as ``<prefix>_<i><ext>``
+        (extension derived from the block's ``media_type``, defaulting to
+        ``.png``). Creates ``dest`` if needed. Returns the written paths."""
+        d = Path(dest)
+        d.mkdir(parents=True, exist_ok=True)
+        written: list[Path] = []
+        for i, block in enumerate(self.images):
+            ext = _EXT_BY_MEDIA_TYPE.get(block.media_type, ".png")
+            path = d / f"{prefix}_{i}{ext}"
+            path.write_bytes(block.data)
+            written.append(path)
+        return written
+
+
+def apply_save_dir(result: ImageResult, save_dir: str | Path | None) -> ImageResult:
+    """If ``save_dir`` is set, write ``result``'s images there and return a copy
+    with ``paths`` populated; otherwise return ``result`` unchanged. Shared by
+    the image-generating providers so ``save_dir=`` behaves identically."""
+    if save_dir is None:
+        return result
+    written = result.save(save_dir)
+    return replace(result, paths=written)

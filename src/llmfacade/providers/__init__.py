@@ -6,4 +6,5 @@ PROVIDER_REGISTRY: dict[str, tuple[str, str]] = {
     "google": ("llmfacade.providers.google", "GoogleProvider"),
     "gemini": ("llmfacade.providers.google", "GoogleProvider"),
     "llamacpp": ("llmfacade.providers.llamacpp", "LlamaCppServerProvider"),
+    "localimage": ("llmfacade.providers.localimage", "LocalImageProvider"),
 }

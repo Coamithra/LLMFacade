@@ -3,6 +3,7 @@ from __future__ import annotations
 import json as _json
 import warnings
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 from typing import Any
 
 from llmfacade.exceptions import (
@@ -15,6 +16,7 @@ from llmfacade.helpers import flatten_text_blocks
 from llmfacade.models import (
     ContentBlock,
     ImageBlock,
+    ImageResult,
     Message,
     Response,
     StreamEvent,
@@ -24,8 +26,15 @@ from llmfacade.models import (
     ToolResultBlock,
     ToolUseBlock,
     Usage,
+    apply_save_dir,
 )
 from llmfacade.provider import CompletionRequest, Provider
+from llmfacade.providers._openai_images import (
+    build_edit_kwargs,
+    build_generate_kwargs,
+    media_type_for,
+    parse_images_response,
+)
 from llmfacade.settings import EffortLevel, OutputFormat
 
 
@@ -61,6 +70,7 @@ class OpenAIProvider(Provider):
             "tools",
             "tool_choice",
             "vision",
+            "image_generation",
         }
     )
 
@@ -440,3 +450,112 @@ class OpenAIProvider(Provider):
             model=raw.model,
             raw=raw,
         )
+
+    # ---- Image generation --------------------------------------------------
+
+    def _image_kwargs(
+        self,
+        prompt: str,
+        model: str,
+        n: int,
+        size: str | None,
+        quality: str | None,
+        background: str | None,
+        output_format: str | None,
+        reference_images: list[ImageBlock] | None,
+        extra: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return ``("edit"|"generate", kwargs)``. Reference images route to the
+        edits endpoint. ``request_b64=False``: ``gpt-image-*`` always returns
+        base64 and rejects ``response_format``."""
+        if reference_images:
+            return "edit", build_edit_kwargs(
+                model=model,
+                prompt=prompt,
+                reference_images=reference_images,
+                n=n,
+                size=size,
+                extra=extra,
+                request_b64=False,
+            )
+        return "generate", build_generate_kwargs(
+            model=model,
+            prompt=prompt,
+            n=n,
+            size=size,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            extra=extra,
+            request_b64=False,
+        )
+
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: str | Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        model = model or "gpt-image-1"
+        endpoint, kwargs = self._image_kwargs(
+            prompt, model, n, size, quality, background, output_format, reference_images, extra
+        )
+        try:
+            if endpoint == "edit":
+                raw = self._client.images.edit(**kwargs)
+            else:
+                raw = self._client.images.generate(**kwargs)
+        except self._module.AuthenticationError as e:
+            raise AuthenticationError(str(e)) from e
+        except self._module.RateLimitError as e:
+            raise RateLimitError(str(e)) from e
+        except self._module.APIError as e:
+            raise ProviderError(str(e), original=e) from e
+        result = parse_images_response(
+            raw, model=model, provider="openai", fallback_media_type=media_type_for(output_format)
+        )
+        return apply_save_dir(result, save_dir)
+
+    async def agenerate_image(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: str | Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        model = model or "gpt-image-1"
+        endpoint, kwargs = self._image_kwargs(
+            prompt, model, n, size, quality, background, output_format, reference_images, extra
+        )
+        try:
+            if endpoint == "edit":
+                raw = await self._aclient.images.edit(**kwargs)
+            else:
+                raw = await self._aclient.images.generate(**kwargs)
+        except self._module.AuthenticationError as e:
+            raise AuthenticationError(str(e)) from e
+        except self._module.RateLimitError as e:
+            raise RateLimitError(str(e)) from e
+        except self._module.APIError as e:
+            raise ProviderError(str(e), original=e) from e
+        result = parse_images_response(
+            raw, model=model, provider="openai", fallback_media_type=media_type_for(output_format)
+        )
+        return apply_save_dir(result, save_dir)

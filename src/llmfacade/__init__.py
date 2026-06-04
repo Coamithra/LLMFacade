@@ -15,10 +15,13 @@ from llmfacade.exceptions import (
     UnsupportedFeature,
 )
 from llmfacade.facade import LLM
+from llmfacade.image import ImageModel
 from llmfacade.model import Model
 from llmfacade.models import (
     ContentBlock,
     ImageBlock,
+    ImageResult,
+    ImageUsage,
     Message,
     Response,
     StreamEvent,
@@ -45,6 +48,7 @@ __all__ = [
     "LLM",
     "Provider",
     "Model",
+    "ImageModel",
     "Conversation",
     "Snapshot",
     "SystemBlock",
@@ -71,6 +75,8 @@ __all__ = [
     "ToolResultBlock",
     "ThinkingBlock",
     "ToolCall",
+    "ImageResult",
+    "ImageUsage",
     # Cache
     "ResponseCache",
     # Exceptions
