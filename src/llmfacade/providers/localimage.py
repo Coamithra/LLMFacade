@@ -373,7 +373,11 @@ class LocalImageProvider(Provider):
             f"model=<id>; registered: {names!r}"
         )
 
-    # ---- generation ------------------------------------------------------
+    # ---- generation hooks ------------------------------------------------
+    # The base Provider.generate_image / agenerate_image are the audit-logging
+    # chokepoints; we implement the raw hooks. In managed mode the hook first
+    # ensures the right sd-server is running (swapping if needed) under a
+    # generation lock so a concurrent call can't swap the model out mid-request.
 
     def _image_kwargs(
         self,
@@ -411,7 +415,7 @@ class LocalImageProvider(Provider):
             request_b64=True,
         )
 
-    def generate_image(
+    def _generate_image_raw(
         self,
         prompt: str,
         *,
@@ -427,37 +431,21 @@ class LocalImageProvider(Provider):
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
         if not self._managed:
-            return self._run_generate(
-                prompt,
-                model,
-                n,
-                size,
-                quality,
-                background,
-                output_format,
-                reference_images,
-                save_dir,
-                extra,
+            return self._call_images_sync(
+                prompt, model, n, size, quality, background,
+                output_format, reference_images, save_dir, extra,
             )
         with self._gen_lock:
             target = self._resolve_managed_model(model)
             assert self._supervisor is not None
             base = self._supervisor.ensure_model(target)
             self._ensure_image_client(base.rstrip("/") + "/v1")
-            return self._run_generate(
-                prompt,
-                target,
-                n,
-                size,
-                quality,
-                background,
-                output_format,
-                reference_images,
-                save_dir,
-                extra,
+            return self._call_images_sync(
+                prompt, target, n, size, quality, background,
+                output_format, reference_images, save_dir, extra,
             )
 
-    async def agenerate_image(
+    async def _agenerate_image_raw(
         self,
         prompt: str,
         *,
@@ -473,17 +461,9 @@ class LocalImageProvider(Provider):
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
         if not self._managed:
-            return await self._arun_generate(
-                prompt,
-                model,
-                n,
-                size,
-                quality,
-                background,
-                output_format,
-                reference_images,
-                save_dir,
-                extra,
+            return await self._call_images_async(
+                prompt, model, n, size, quality, background,
+                output_format, reference_images, save_dir, extra,
             )
         async with self._gen_alock:
             target = self._resolve_managed_model(model)
@@ -493,20 +473,12 @@ class LocalImageProvider(Provider):
             # the async path.
             base = self._supervisor.ensure_model(target)
             self._ensure_image_client(base.rstrip("/") + "/v1")
-            return await self._arun_generate(
-                prompt,
-                target,
-                n,
-                size,
-                quality,
-                background,
-                output_format,
-                reference_images,
-                save_dir,
-                extra,
+            return await self._call_images_async(
+                prompt, target, n, size, quality, background,
+                output_format, reference_images, save_dir, extra,
             )
 
-    def _run_generate(
+    def _call_images_sync(
         self,
         prompt: str,
         model: str | None,
@@ -541,7 +513,7 @@ class LocalImageProvider(Provider):
         )
         return _apply_save_dir(result, save_dir)
 
-    async def _arun_generate(
+    async def _call_images_async(
         self,
         prompt: str,
         model: str | None,
