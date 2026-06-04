@@ -350,7 +350,6 @@ class Provider:
         )
         self._log_image_generation(
             prompt=prompt,
-            model=model,
             n=n,
             size=size,
             aspect_ratio=aspect_ratio,
@@ -392,7 +391,6 @@ class Provider:
         )
         self._log_image_generation(
             prompt=prompt,
-            model=model,
             n=n,
             size=size,
             aspect_ratio=aspect_ratio,
@@ -442,7 +440,6 @@ class Provider:
         self,
         *,
         prompt: str,
-        model: str | None,
         n: int,
         size: str | None,
         aspect_ratio: str | None,

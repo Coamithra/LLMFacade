@@ -104,6 +104,9 @@ def test_image_log_writes_html_sibling(tmp_path):
     assert html.count("<!DOCTYPE html>") == 1  # header written once
     assert html.count('<section class="gen">') == 2
     assert "a dragon" in html and "a fox" in html
+    # The CSS is emitted verbatim (not str.format'd), so it must use single
+    # braces — doubled braces would render as literal text and break styling.
+    assert "{{" not in html and "}}" not in html
 
 
 def test_image_log_records_save_dir_paths(tmp_path):
@@ -156,11 +159,11 @@ def test_image_log_disabled_when_provider_log_dir_false(tmp_path):
     llm = LLM(log_dir=tmp_path)
     provider = FakeImageProvider(manager=llm, log_dir=False)
 
-    provider.generate_image("a cat", model="fake-image-1")
+    result = provider.generate_image("a cat", model="fake-image-1")
 
-    # Provider opted out; the manager run dir is never even materialised for it.
-    runs = list(tmp_path.glob("llmfacade*"))
-    assert all(not (r / "images.jsonl").exists() for r in runs)
+    assert result.images[0].data == b"PNGDATA"  # still returned
+    # Provider opted out — no ledger written anywhere under the log root.
+    assert not list(tmp_path.rglob("images.jsonl"))
 
 
 def test_image_log_write_failure_is_swallowed(tmp_path, monkeypatch):

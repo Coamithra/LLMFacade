@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import html
 import json
+import threading
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,45 +36,50 @@ if TYPE_CHECKING:
 
 _LEDGER_NAME = "images.jsonl"
 
+# The ledger is shared across every image call in a run dir, so concurrent
+# generations from multiple threads can race on the (multi-write) HTML append.
+# A process-wide lock keeps each record's JSONL line and HTML section atomic.
+_WRITE_LOCK = threading.Lock()
+
 _HTML_HEAD = """\
 <!DOCTYPE html>
 <html lang="en">
 <meta charset="utf-8">
 <title>Image generation ledger</title>
 <style>
-:root {{
+:root {
   --bg: #fafafa; --fg: #1a1a1a; --muted: #6b6b6b; --accent: #8a4fff;
   --border: #e0e0e0; --code-bg: #f4f4f4;
-}}
-* {{ box-sizing: border-box; }}
-body {{
+}
+* { box-sizing: border-box; }
+body {
   margin: 0 auto; max-width: 940px; padding: 1.2rem;
   font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   color: var(--fg); background: var(--bg);
-}}
-h1 {{ font-size: 1.3rem; margin: 0 0 .25rem; }}
-.subtitle {{ color: var(--muted); margin: 0 0 1rem; font-size: .9rem; }}
-section.gen {{
+}
+h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+.subtitle { color: var(--muted); margin: 0 0 1rem; font-size: .9rem; }
+section.gen {
   border: 1px solid var(--border); border-left: 4px solid var(--accent);
   border-radius: 6px; margin: .65rem 0; padding: .55rem .85rem; background: white;
-}}
-section.gen > header {{
+}
+section.gen > header {
   font-size: .8rem; color: var(--muted); margin-bottom: .35rem;
   display: flex; gap: .55rem; align-items: center; flex-wrap: wrap;
-}}
-.badge {{
+}
+.badge {
   display: inline-block; background: var(--code-bg); padding: .05rem .45rem;
   border-radius: 3px; margin-right: .35rem; font-family: ui-monospace, monospace;
   font-size: .78rem;
-}}
-.prompt {{ white-space: pre-wrap; word-wrap: break-word; margin: .25rem 0; }}
-dl.kv {{
+}
+.prompt { white-space: pre-wrap; word-wrap: break-word; margin: .25rem 0; }
+dl.kv {
   display: grid; grid-template-columns: max-content 1fr; gap: .15rem .85rem;
   font-size: .85rem; margin: .25rem 0;
-}}
-dl.kv dt {{ color: var(--muted); font-family: ui-monospace, monospace; }}
-dl.kv dd {{ margin: 0; font-family: ui-monospace, monospace; word-break: break-word; }}
-.usage-line {{ font-size: .8rem; color: var(--muted); margin: .4rem 0 .1rem; }}
+}
+dl.kv dt { color: var(--muted); font-family: ui-monospace, monospace; }
+dl.kv dd { margin: 0; font-family: ui-monospace, monospace; word-break: break-word; }
+.usage-line { font-size: .8rem; color: var(--muted); margin: .4rem 0 .1rem; }
 </style>
 <h1>Image generation ledger</h1>
 <p class="subtitle">Audit trail of image API spend for this run.</p>
@@ -153,10 +159,11 @@ def log_image_generation(path: Path, record: dict[str, Any]) -> None:
     sibling. Best-effort: any failure is swallowed with a warning so a logging
     problem never prevents returning the generated image."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
-        _append_html(path.with_suffix(".html"), record)
+        with _WRITE_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, default=str) + "\n")
+            _append_html(path.with_suffix(".html"), record)
     except Exception as e:  # noqa: BLE001 - logging must never break generation
         warnings.warn(f"image-generation logging failed: {e}", stacklevel=2)
 
