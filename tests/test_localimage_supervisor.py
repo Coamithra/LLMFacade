@@ -210,6 +210,9 @@ def test_ready_timeout_raises(
     supervisor.register(_entry("flux"))
     with pytest.raises(ProviderError, match="did not become ready"):
         supervisor.ensure_model("flux")
+    # _cleanup_after_failure must leave no stale state behind.
+    assert supervisor.is_started is False
+    assert not supervisor.pid_file.exists()
 
 
 def test_proc_dies_before_ready_raises(
@@ -220,6 +223,8 @@ def test_proc_dies_before_ready_raises(
     supervisor.register(_entry("flux"))
     with pytest.raises(ProviderError, match="exited before becoming ready"):
         supervisor.ensure_model("flux")
+    assert supervisor.is_started is False
+    assert not supervisor.pid_file.exists()
 
 
 # ---- pidfile + shutdown ---------------------------------------------------
@@ -255,3 +260,45 @@ def test_shutdown_is_idempotent_and_unlinks_pidfile(
     assert proc.terminate_called is True
     assert not supervisor.pid_file.exists()
     assert supervisor.is_started is False
+
+
+def test_respawn_after_shutdown_rearms_cleanup(
+    monkeypatch: pytest.MonkeyPatch, supervisor: sl._SdServerSupervisor
+) -> None:
+    proc1 = _FakeProc(pid=1)
+    proc2 = _FakeProc(pid=2)
+    _patch_spawn(monkeypatch, procs=[proc1, proc2], httpx=_FakeHttpx([200]))
+    supervisor.register(_entry("flux"))
+
+    supervisor.ensure_model("flux")
+    supervisor.shutdown()
+    assert supervisor._shutdown_done is True
+
+    supervisor.ensure_model("flux")  # respawn after shutdown
+    assert supervisor._shutdown_done is False  # cleanup latch re-armed
+    assert supervisor.is_started is True
+
+    supervisor.shutdown()  # a fresh shutdown now actually tears the respawn down
+    assert proc2.terminate_called is True
+
+
+def test_signal_handlers_installed_once_across_swaps(
+    monkeypatch: pytest.MonkeyPatch, supervisor: sl._SdServerSupervisor
+) -> None:
+    """Regression: re-registering signal handlers on every swap would store our
+    own handler as the 'prior' one and recurse on the next signal. Handlers must
+    install exactly once per supervisor."""
+    registered: list[int] = []
+    monkeypatch.setattr(sl.signal, "signal", lambda sig, handler: registered.append(sig))
+    proc_a = _FakeProc(pid=1)
+    proc_b = _FakeProc(pid=2)
+    _patch_spawn(monkeypatch, procs=[proc_a, proc_b], httpx=_FakeHttpx([200]))
+    supervisor.register(_entry("flux"))
+    supervisor.register(_entry("sdxl"))
+
+    supervisor.ensure_model("flux")
+    first = list(registered)
+    supervisor.ensure_model("sdxl")  # swap must not re-register
+
+    assert registered == first  # no further signal.signal calls on the swap
+    assert supervisor._signal_handlers_installed is True

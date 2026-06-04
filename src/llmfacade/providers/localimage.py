@@ -180,8 +180,15 @@ class LocalImageProvider(Provider):
             self._build_image_clients(self._base_url or "")
 
     def _build_image_clients(self, openai_base: str) -> None:
-        self._client = self._module.OpenAI(base_url=openai_base, api_key=self._api_key)
-        self._aclient = self._module.AsyncOpenAI(base_url=openai_base, api_key=self._api_key)
+        client_kwargs: dict[str, Any] = {"base_url": openai_base, "api_key": self._api_key}
+        if self._managed:
+            # We own the sd-server and may stop it out from under an in-flight
+            # request during a swap. Retrying against the now-dead local port
+            # adds no value (backoff + connect timeout each); fail fast instead.
+            # External mode talks to a real server, so it keeps the SDK default.
+            client_kwargs["max_retries"] = 0
+        self._client = self._module.OpenAI(**client_kwargs)
+        self._aclient = self._module.AsyncOpenAI(**client_kwargs)
         self._client_base = openai_base
 
     def _ensure_image_client(self, openai_base: str) -> None:

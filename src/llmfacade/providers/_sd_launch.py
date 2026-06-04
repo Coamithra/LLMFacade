@@ -104,6 +104,9 @@ def canonical_sd_launch_json(launch_config: dict[str, Any]) -> str:
         if v is None:
             continue
         if (k in _FILE_PATH_KNOBS or k in _DIR_PATH_KNOBS) and isinstance(v, str):
+            # The provider already existence-checks and resolves these before
+            # calling us, so this is idempotent on that path; the OSError
+            # suppression only matters for direct/test use of this module.
             with contextlib.suppress(OSError):
                 v = str(Path(v).resolve())
         if isinstance(v, tuple):

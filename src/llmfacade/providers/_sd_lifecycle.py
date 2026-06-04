@@ -22,6 +22,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -92,6 +93,7 @@ class _SdServerSupervisor:
         self._session_uuid: str = uuid.uuid4().hex
         self._prior_signal_handlers: dict[int, Any] = {}
         self._atexit_registered = False
+        self._signal_handlers_installed = False
         self._shutdown_done = False
 
     # --- accessors ---------------------------------------------------------
@@ -200,6 +202,9 @@ class _SdServerSupervisor:
         self._anchor = anchor
         self._port = port
         self._current_model_id = entry.model_id
+        # A respawn after an explicit shutdown() must be cleaned up again, so
+        # re-arm the idempotency latch (atexit/shutdown become effective once more).
+        self._shutdown_done = False
         self._write_pid_file()
         self._install_exit_hooks()
 
@@ -312,14 +317,20 @@ class _SdServerSupervisor:
     # --- exit hooks --------------------------------------------------------
 
     def _install_exit_hooks(self) -> None:
+        # Install once per supervisor, not on every swap: re-running this would
+        # re-read our own handler as the "prior" one and chain to itself on the
+        # next signal (infinite recursion). `_spawn_locked` calls it each spawn.
         if not self._atexit_registered:
             atexit.register(self.shutdown)
             self._atexit_registered = True
+        if self._signal_handlers_installed:
+            return
         # signal.signal() only works on the main thread. If driven from a worker
         # (asyncio.to_thread, a background thread), skip — atexit still covers
         # normal exit.
         if threading.current_thread() is not threading.main_thread():
             return
+        self._signal_handlers_installed = True
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(ValueError, OSError, AttributeError):
                 prior = signal.getsignal(sig)
@@ -337,8 +348,6 @@ class _SdServerSupervisor:
         if prior == signal.SIG_DFL:
             if signum == signal.SIGINT:
                 raise KeyboardInterrupt
-            import sys
-
             if sys.platform == "win32":
                 raise SystemExit(128 + signum)
             os.kill(os.getpid(), signum)
