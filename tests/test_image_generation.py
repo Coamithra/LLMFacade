@@ -20,7 +20,7 @@ from llmfacade import (
     ImageResult,
     ImageUsage,
 )
-from llmfacade.exceptions import LLMError, ProviderError, UnsupportedFeature
+from llmfacade.exceptions import ProviderError, UnsupportedFeature
 from llmfacade.providers.anthropic import AnthropicProvider
 from llmfacade.providers.google import GoogleProvider
 from llmfacade.providers.llamacpp import LlamaCppServerProvider
@@ -221,9 +221,12 @@ def test_google_warns_and_drops_n():
 # ---- local image -----------------------------------------------------------
 
 
-def test_localimage_requires_base_url():
-    with pytest.raises(LLMError, match="base_url"):
-        LocalImageProvider()
+def test_localimage_no_base_url_is_managed():
+    # Omitting base_url selects managed mode (it used to raise); a supervisor is
+    # created and external-only behaviour no longer applies.
+    provider = LocalImageProvider()
+    assert provider._managed is True
+    assert provider._supervisor is not None
 
 
 def test_localimage_requests_b64_and_parses():
@@ -268,6 +271,136 @@ def test_localimage_model_omitted_when_none():
     provider.generate_image("x")
 
     assert "model" not in provider._client.images.generate.call_args.kwargs
+
+
+# ---- localimage managed mode ----------------------------------------------
+
+
+def _managed_provider_with_model(tmp_path, name="flux", **launch):
+    """Build a managed LocalImageProvider with one registered model whose
+    diffusion_model file actually exists (existence is checked at registration)."""
+    model_file = tmp_path / f"{name}.safetensors"
+    model_file.write_bytes(b"weights")
+    provider = LocalImageProvider(llmfacade_dir=tmp_path / ".llmfacade")
+    provider.new_image_model(diffusion_model=str(model_file), name=name, **launch)
+    return provider
+
+
+def test_localimage_external_provider_rejects_launch_knobs():
+    with pytest.raises(UnsupportedFeature, match="managed mode"):
+        LocalImageProvider(base_url="http://127.0.0.1:1234/v1", diffusion_fa=True)
+
+
+def test_localimage_external_new_image_model_rejects_launch_knobs():
+    provider = LocalImageProvider(base_url="http://127.0.0.1:1234/v1")
+    with pytest.raises(UnsupportedFeature, match="managed mode"):
+        provider.new_image_model("flux", diffusion_model="/x/flux.safetensors")
+
+
+def test_localimage_external_new_image_model_rejects_name():
+    provider = LocalImageProvider(base_url="http://127.0.0.1:1234/v1")
+    with pytest.raises(UnsupportedFeature, match="managed-mode kwarg"):
+        provider.new_image_model("flux", name="y")
+
+
+def test_localimage_managed_new_image_model_registers(tmp_path):
+    provider = _managed_provider_with_model(tmp_path, name="flux")
+    entries = provider._supervisor.entries
+    assert len(entries) == 1
+    assert entries[0].model_id == "flux"
+    assert entries[0].diffusion_model.endswith("flux.safetensors")
+
+
+def test_localimage_managed_requires_model_source(tmp_path):
+    provider = LocalImageProvider(llmfacade_dir=tmp_path / ".llmfacade")
+    with pytest.raises(ValueError, match="requires model"):
+        provider.new_image_model(name="x")
+
+
+def test_localimage_managed_missing_file_raises(tmp_path):
+    provider = LocalImageProvider(llmfacade_dir=tmp_path / ".llmfacade")
+    with pytest.raises(FileNotFoundError, match="diffusion_model"):
+        provider.new_image_model(diffusion_model=str(tmp_path / "missing.safetensors"))
+
+
+def test_localimage_managed_generate_routes_through_supervisor(tmp_path, monkeypatch):
+    provider = _managed_provider_with_model(tmp_path, name="flux")
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        provider._supervisor,
+        "ensure_model",
+        lambda mid: calls.append(mid) or "http://127.0.0.1:9000",
+    )
+    # Pre-seed a stub client at the URL the supervisor will return so no rebuild
+    # (and no real openai client / network) happens.
+    provider._client = MagicMock()
+    provider._client.images.generate.return_value = _openai_image_response(b"FLUX")
+    provider._client_base = "http://127.0.0.1:9000/v1"
+
+    result = provider.generate_image("a fox", model="flux")
+
+    assert calls == ["flux"]
+    assert result.images[0].data == b"FLUX"
+    assert result.model == "flux"
+
+
+def test_localimage_managed_infers_single_model(tmp_path, monkeypatch):
+    provider = _managed_provider_with_model(tmp_path, name="flux")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        provider._supervisor,
+        "ensure_model",
+        lambda mid: calls.append(mid) or "http://127.0.0.1:9000",
+    )
+    provider._client = MagicMock()
+    provider._client.images.generate.return_value = _openai_image_response(b"X")
+    provider._client_base = "http://127.0.0.1:9000/v1"
+
+    provider.generate_image("x")  # no model= → inferred from the single registration
+
+    assert calls == ["flux"]
+
+
+def test_localimage_managed_multi_model_requires_model(tmp_path):
+    provider = _managed_provider_with_model(tmp_path, name="flux")
+    second = tmp_path / "sdxl.safetensors"
+    second.write_bytes(b"w")
+    provider.new_image_model(diffusion_model=str(second), name="sdxl")
+
+    with pytest.raises(ValueError, match="multi-model provider requires"):
+        provider.generate_image("x")
+
+
+def test_localimage_managed_rebuilds_client_on_new_port(tmp_path, monkeypatch):
+    provider = _managed_provider_with_model(tmp_path, name="flux")
+    monkeypatch.setattr(provider._supervisor, "ensure_model", lambda mid: "http://127.0.0.1:9000")
+
+    built: list[str] = []
+
+    def fake_build(openai_base):
+        built.append(openai_base)
+        provider._client = MagicMock()
+        provider._client.images.generate.return_value = _openai_image_response(b"X")
+        provider._client_base = openai_base
+
+    monkeypatch.setattr(provider, "_build_image_clients", fake_build)
+    provider.generate_image("x", model="flux")
+
+    assert built == ["http://127.0.0.1:9000/v1"]
+
+
+def test_localimage_shutdown_calls_supervisor(tmp_path, monkeypatch):
+    provider = _managed_provider_with_model(tmp_path, name="flux")
+    called: list[bool] = []
+    monkeypatch.setattr(provider._supervisor, "shutdown", lambda: called.append(True))
+    provider.shutdown()
+    assert called == [True]
+
+
+def test_localimage_external_shutdown_is_noop():
+    provider = LocalImageProvider(base_url="http://127.0.0.1:1234/v1")
+    provider.shutdown()  # must not raise (no supervisor in external mode)
 
 
 # ---- ImageResult.save ------------------------------------------------------
