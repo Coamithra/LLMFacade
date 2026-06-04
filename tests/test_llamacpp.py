@@ -1849,6 +1849,89 @@ def test_new_model_does_not_forward_jinja_to_fit_params(
     assert "--jinja" not in seen_argv["argv"]
 
 
+# ---- no_mmap / mlock memory-residency launch knobs ------------------------
+
+
+def test_external_mode_rejects_no_mmap_in_init() -> None:
+    with pytest.raises(UnsupportedFeature, match="no_mmap"):
+        LlamaCppServerProvider(base_url="http://x:0/v1", no_mmap=True)
+
+
+def test_external_mode_rejects_no_mmap_in_new_model() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    with pytest.raises(UnsupportedFeature, match="no_mmap"):
+        p.new_model("qwen", no_mmap=True)
+
+
+def test_external_mode_rejects_mlock_in_init() -> None:
+    with pytest.raises(UnsupportedFeature, match="mlock"):
+        LlamaCppServerProvider(base_url="http://x:0/v1", mlock=True)
+
+
+def test_external_mode_rejects_mlock_in_new_model() -> None:
+    p = LlamaCppServerProvider(base_url="http://x:0/v1")
+    with pytest.raises(UnsupportedFeature, match="mlock"):
+        p.new_model("qwen", mlock=True)
+
+
+def test_managed_mode_no_mmap_mlock_default_false(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].no_mmap is False  # type: ignore[union-attr]
+    assert p._supervisor.entries[0].mlock is False  # type: ignore[union-attr]
+
+
+def test_managed_mode_no_mmap_mlock_provider_default_cascades(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", no_mmap=True, mlock=True)
+    p.new_model(gguf=str(gguf))
+    assert p._supervisor.entries[0].no_mmap is True  # type: ignore[union-attr]
+    assert p._supervisor.entries[0].mlock is True  # type: ignore[union-attr]
+
+
+def test_managed_mode_no_mmap_model_overrides_provider(tmp_path: Path) -> None:
+    gguf = tmp_path / "q.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", no_mmap=True)
+    p.new_model(gguf=str(gguf), no_mmap=False)
+    assert p._supervisor.entries[0].no_mmap is False  # type: ignore[union-attr]
+
+
+def test_new_model_does_not_forward_no_mmap_mlock_to_fit_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--no-mmap`/`--mlock` govern memory residency, not VRAM layout. fit-params
+    would reject them, and `--no-mmap` would force the probe to preload the whole
+    model into RAM — so neither is forwarded to the estimate."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+
+    seen_argv: dict[str, Any] = {}
+
+    class _FakeOk:
+        returncode = 0
+        stdout = "-c 4096 -ngl 32"
+        stderr = ""
+
+    def fake_run(argv: list[str], **_kw: Any) -> _FakeOk:
+        seen_argv["argv"] = argv
+        return _FakeOk()
+
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_shutil, "which", lambda b: "/usr/local/bin/" + b)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    p.new_model(gguf=str(gguf), name="m", no_mmap=True, mlock=True)
+    assert "--no-mmap" not in seen_argv["argv"]
+    assert "--mlock" not in seen_argv["argv"]
+
+
 # ---- thinking_style auto-detect / override / log surfacing / warning ------
 
 

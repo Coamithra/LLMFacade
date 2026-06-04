@@ -468,7 +468,7 @@ class GoogleProvider(Provider):
                 stacklevel=3,
             )
 
-    def generate_image(
+    def _generate_image_raw(
         self,
         prompt: str,
         *,
@@ -504,7 +504,7 @@ class GoogleProvider(Provider):
             raise
         return _apply_save_dir(self._parse_image_response(raw, model), save_dir)
 
-    async def agenerate_image(
+    async def _agenerate_image_raw(
         self,
         prompt: str,
         *,

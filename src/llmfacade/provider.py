@@ -333,7 +333,37 @@ class Provider:
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
-        raise UnsupportedFeature("image_generation", self.NAME, model)
+        """Generate image(s) and log the call to the run-dir image ledger.
+
+        Template method: the provider work lives in ``_generate_image_raw`` (the
+        base raises ``UnsupportedFeature`` there, so non-image providers fail
+        fast); logging is shared here so every entry point — direct,
+        ``ImageModel.generate``, ``LLM.generate_image`` — is audited once."""
+        result = self._generate_image_raw(
+            prompt,
+            model=model,
+            n=n,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            reference_images=reference_images,
+            save_dir=save_dir,
+            extra=extra,
+        )
+        self._log_image_generation(
+            prompt=prompt,
+            n=n,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            reference_images=reference_images,
+            result=result,
+        )
+        return result
 
     async def agenerate_image(
         self,
@@ -350,7 +380,102 @@ class Provider:
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
+        result = await self._agenerate_image_raw(
+            prompt,
+            model=model,
+            n=n,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            reference_images=reference_images,
+            save_dir=save_dir,
+            extra=extra,
+        )
+        self._log_image_generation(
+            prompt=prompt,
+            n=n,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            reference_images=reference_images,
+            result=result,
+        )
+        return result
+
+    def _generate_image_raw(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: str | Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
         raise UnsupportedFeature("image_generation", self.NAME, model)
+
+    async def _agenerate_image_raw(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        n: int = 1,
+        size: str | None = None,
+        aspect_ratio: str | None = None,
+        quality: str | None = None,
+        background: str | None = None,
+        output_format: str | None = None,
+        reference_images: list[ImageBlock] | None = None,
+        save_dir: str | Path | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> ImageResult:
+        raise UnsupportedFeature("image_generation", self.NAME, model)
+
+    def _log_image_generation(
+        self,
+        *,
+        prompt: str,
+        n: int,
+        size: str | None,
+        aspect_ratio: str | None,
+        quality: str | None,
+        background: str | None,
+        output_format: str | None,
+        reference_images: list[ImageBlock] | None,
+        result: ImageResult,
+    ) -> None:
+        from llmfacade._image_log import (
+            build_image_record,
+            log_image_generation,
+            resolve_image_log_path,
+        )
+
+        path = resolve_image_log_path(self)
+        if path is None:
+            return
+        record = build_image_record(
+            prompt=prompt,
+            model=result.model,
+            provider=result.provider,
+            n=n,
+            size=size,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            reference_images=reference_images,
+            result=result,
+        )
+        log_image_generation(path, record)
 
     def new_image_model(
         self,
