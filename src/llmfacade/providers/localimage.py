@@ -102,7 +102,7 @@ class LocalImageProvider(Provider):
             request_b64=True,
         )
 
-    def generate_image(
+    def _generate_image_raw(
         self,
         prompt: str,
         *,
@@ -139,7 +139,7 @@ class LocalImageProvider(Provider):
         )
         return _apply_save_dir(result, save_dir)
 
-    async def agenerate_image(
+    async def _agenerate_image_raw(
         self,
         prompt: str,
         *,
