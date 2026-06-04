@@ -29,7 +29,8 @@ room left for KV** — no expert spill, no `n_cpu_moe`, no homebrew IQ2 quant. T
 - This is the **same crux as the Qwen3.6-27B note**: on a dense model the facade's
   `n_cpu_moe` knob is a **no-op** (there are no expert weights to bury in RAM). The
   difference from Qwen is that here it *doesn't matter* — the whole model fits on the GPU,
-  so you never need to offload anything. See `docs/learnings/qwen3.6-27b-12gb.md`. [S0]
+  so you never need to offload anything. See `docs/learnings/qwen3.6-27b-12gb.md` and
+  CLAUDE.md → llama.cpp quirks (`n_cpu_moe` semantics). [S0]
 
 ## Finding 2 — Architecture (12 GB-relevant bits)
 
@@ -56,7 +57,7 @@ card (the same budget as the homebrew plan), leaving the remainder for KV + comp
 | `Q8_0` | 12.7 GB | No (over the card by itself) |
 | `UD-Q6_K_XL` | 10.7 GB | Tight — only with quantized KV + small ctx |
 | **`Q6_K`** | **9.79 GB** | ✅ ~1 GB for KV (modest ctx) |
-| **`Q5_K_M` / `UD-Q5_K_XL`** | **8.41 / 8.61 GB** | ✅ ~2.3 GB for KV — comfortable |
+| **`Q5_K_M` / `UD-Q5_K_XL`** | **8.41 / 8.61 GB** | ✅ ~2.3–2.5 GB for KV — comfortable |
 | **`UD-Q4_K_XL`** (Unsloth pick) | **7.37 GB** | ✅ ~3.5 GB headroom |
 | `Q4_K_M` / `Q4_K_S` | 7.12 / 6.76 GB | ✅ |
 | `IQ4_NL` / `IQ4_XS` | 6.72 / 6.38 GB | ✅ lots of room (long ctx OK) |
@@ -70,7 +71,9 @@ images costs almost nothing against the VRAM budget.
 ## Finding 4 — Vendor VRAM guidance
 
 Unsloth's run-locally page [S4]:
-- **4-bit: "7–8 GB"**, 8-bit: "13–14 GB", BF16: 25 GB.
+- **4-bit: "7–8 GB"**, 8-bit: "13–14 GB", BF16: 25 GB. (These are total runtime
+  footprint — weights + KV + compute overhead — so they run a bit above the raw GGUF file
+  sizes in Finding 3; e.g. 8-bit's 13–14 GB vs the 12.7 GB `Q8_0` file.)
 - Recommended starting quant: **`UD-Q4_K_XL`**.
 - Thinking control: `--chat-template-kwargs '{"enable_thinking":false}'` (the
   `TEMPLATE_KWARG` style the facade auto-detects; needs `--jinja`).
@@ -103,7 +106,8 @@ provider.new_model(
     # NO n_cpu_moe — dense model, it's a no-op
     cache_type_k="q8_0", cache_type_v="q8_0",
     jinja=True,                # required for Gemma 4 enable_thinking + correct tool calls
-    flash_attn="on",           # Gemma 4 'auto' silently disables flash on f16 KV (~2x cost)
+    flash_attn="on",           # here also forced by the quantized V cache; explicit anyway
+                               #   because Gemma 4 'auto' disables flash on f16 KV (~2x cost)
     mmproj_path="C:/Models/mmproj-F16.gguf",  # only if you want vision; ~122 MB
     fit=True, fit_ctx=16384,   # safety net, floored at the chosen context
 )
