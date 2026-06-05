@@ -174,6 +174,7 @@ class _StreamBuffers:
     mirror what ``_finalize_stream`` reads off the inline stream loops."""
 
     text: list[str] = field(default_factory=list)
+    thinking_text: list[str] = field(default_factory=list)
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: Any = None
@@ -182,6 +183,8 @@ class _StreamBuffers:
     def absorb(self, ev: StreamEvent) -> None:
         if ev.text_delta:
             self.text.append(ev.text_delta)
+        if ev.thinking_delta:
+            self.thinking_text.append(ev.thinking_delta)
         if ev.thinking_block is not None:
             self.thinking_blocks.append(ev.thinking_block)
         if ev.tool_call_delta:
@@ -192,11 +195,21 @@ class _StreamBuffers:
             self.finish_reason = ev.finish_reason
 
 
-def _detection_text(text_buf: list[str], tool_calls: list[ToolCall]) -> str:
-    """Build the buffer the repetition detector scans: assistant text plus any
-    streamed tool-call arguments (so a looping tool-args stream is caught the
-    same way as looping prose)."""
-    parts = list(text_buf)
+def _detection_text(
+    thinking_buf: list[str], text_buf: list[str], tool_calls: list[ToolCall]
+) -> str:
+    """Build the buffer the repetition detector scans: the model's reasoning /
+    thinking stream, then assistant text, then any streamed tool-call arguments
+    — so a loop in any of the three is caught the same way as looping prose.
+
+    The detector is a *suffix* scan, so during a thinking-only phase the suffix
+    is the reasoning stream (a looping chain-of-thought is caught live, before
+    it burns the whole budget); once text starts the suffix is the text and the
+    reasoning sits as a harmless prefix. Reasoning is accumulated from the
+    token-by-token ``thinking_delta`` events, never the consolidated
+    ``thinking_block`` (which arrives all-at-once only after the loop has
+    already happened and would double-count the deltas)."""
+    parts = list(thinking_buf) + list(text_buf)
     for tc in tool_calls:
         if tc.raw_arguments:
             parts.append(tc.raw_arguments)
@@ -211,10 +224,13 @@ _DRY_ESCALATION_STEP = 0.5
 
 
 def _detect_in_buffers(
-    text_buf: list[str], tool_calls: list[ToolCall], guard: RepetitionGuard
+    thinking_buf: list[str],
+    text_buf: list[str],
+    tool_calls: list[ToolCall],
+    guard: RepetitionGuard,
 ) -> str | None:
     return detect_repetition_loop(
-        _detection_text(text_buf, tool_calls),
+        _detection_text(thinking_buf, text_buf, tool_calls),
         tail_chars=guard.tail_chars,
         max_period=guard.max_period,
         min_reps_floor=guard.min_reps_floor,
@@ -714,6 +730,7 @@ class Conversation:
             return
 
         text_buf: list[str] = []
+        thinking_buf: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
@@ -732,6 +749,8 @@ class Conversation:
             for ev in stream_iter:
                 if ev.text_delta:
                     text_buf.append(ev.text_delta)
+                if ev.thinking_delta:
+                    thinking_buf.append(ev.thinking_delta)
                 if ev.thinking_block is not None:
                     thinking_blocks.append(ev.thinking_block)
                 if ev.tool_call_delta:
@@ -744,18 +763,24 @@ class Conversation:
                 if guard is not None:
                     if ev.text_delta:
                         chars_since_check += len(ev.text_delta)
+                    if ev.thinking_delta:
+                        chars_since_check += len(ev.thinking_delta)
                     if ev.tool_call_delta:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
-                        repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
+                        repetition_detail = _detect_in_buffers(
+                            thinking_buf, text_buf, tool_calls, guard
+                        )
                         if repetition_detail:
                             break
             else:
                 # Natural completion: flush a final check so a short-but-complete
                 # loop that never crossed the cadence is still caught.
                 if guard is not None and chars_since_check > 0:
-                    repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
+                    repetition_detail = _detect_in_buffers(
+                        thinking_buf, text_buf, tool_calls, guard
+                    )
         finally:
             if repetition_detail is not None:
                 _close_stream(stream_iter)
@@ -773,7 +798,7 @@ class Conversation:
             raise RepetitionLoopError(
                 repetition_detail,
                 attempts=1,
-                partial_text=_detection_text(text_buf, tool_calls),
+                partial_text=_detection_text(thinking_buf, text_buf, tool_calls),
             )
 
     async def astream(
@@ -839,6 +864,7 @@ class Conversation:
             return
 
         text_buf: list[str] = []
+        thinking_buf: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
         last_usage = None
@@ -850,6 +876,8 @@ class Conversation:
             async for ev in stream_iter:
                 if ev.text_delta:
                     text_buf.append(ev.text_delta)
+                if ev.thinking_delta:
+                    thinking_buf.append(ev.thinking_delta)
                 if ev.thinking_block is not None:
                     thinking_blocks.append(ev.thinking_block)
                 if ev.tool_call_delta:
@@ -862,18 +890,24 @@ class Conversation:
                 if guard is not None:
                     if ev.text_delta:
                         chars_since_check += len(ev.text_delta)
+                    if ev.thinking_delta:
+                        chars_since_check += len(ev.thinking_delta)
                     if ev.tool_call_delta:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
-                        repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
+                        repetition_detail = _detect_in_buffers(
+                            thinking_buf, text_buf, tool_calls, guard
+                        )
                         if repetition_detail:
                             break
             else:
                 # Natural completion: flush a final check so a short-but-complete
                 # loop that never crossed the cadence is still caught.
                 if guard is not None and chars_since_check > 0:
-                    repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
+                    repetition_detail = _detect_in_buffers(
+                        thinking_buf, text_buf, tool_calls, guard
+                    )
         finally:
             if repetition_detail is not None:
                 await _aclose_stream(stream_iter)
@@ -891,7 +925,7 @@ class Conversation:
             raise RepetitionLoopError(
                 repetition_detail,
                 attempts=1,
-                partial_text=_detection_text(text_buf, tool_calls),
+                partial_text=_detection_text(thinking_buf, text_buf, tool_calls),
             )
 
     # ---- llama-server slot save/restore (external mode only) -------------
@@ -1139,7 +1173,9 @@ class Conversation:
             last_detail or "repetition loop",
             attempts=attempts,
             partial_text=(
-                _detection_text(last_buffers.text, last_buffers.tool_calls)
+                _detection_text(
+                    last_buffers.thinking_text, last_buffers.text, last_buffers.tool_calls
+                )
                 if last_buffers is not None
                 else ""
             ),
@@ -1162,7 +1198,9 @@ class Conversation:
             last_detail or "repetition loop",
             attempts=attempts,
             partial_text=(
-                _detection_text(last_buffers.text, last_buffers.tool_calls)
+                _detection_text(
+                    last_buffers.thinking_text, last_buffers.text, last_buffers.tool_calls
+                )
                 if last_buffers is not None
                 else ""
             ),
@@ -1183,11 +1221,13 @@ class Conversation:
                 buf.absorb(ev)
                 if ev.text_delta:
                     chars_since_check += len(ev.text_delta)
+                if ev.thinking_delta:
+                    chars_since_check += len(ev.thinking_delta)
                 if ev.tool_call_delta:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
                     if detail:
                         break
             else:
@@ -1196,7 +1236,7 @@ class Conversation:
                 # loop (e.g. a model that repeats a brief phrase then hits a
                 # low max_tokens) isn't missed.
                 if chars_since_check > 0:
-                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
         finally:
             _close_stream(stream_iter)
         return detail, buf
@@ -1214,16 +1254,18 @@ class Conversation:
                 buf.absorb(ev)
                 if ev.text_delta:
                     chars_since_check += len(ev.text_delta)
+                if ev.thinking_delta:
+                    chars_since_check += len(ev.thinking_delta)
                 if ev.tool_call_delta:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
                     if detail:
                         break
             else:
                 if chars_since_check > 0:
-                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
         finally:
             await _aclose_stream(stream_iter)
         return detail, buf

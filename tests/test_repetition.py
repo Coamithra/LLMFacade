@@ -137,11 +137,17 @@ class LoopingProvider(Provider):
         loop_attempts: int = 1,
         loop_reps: int = 100,
         clean_text: str = "All good.",
+        thinking_loop_attempts: int = 0,
+        thinking_reps: int = 100,
+        clean_thinking: str = "",
         **knobs,
     ):
         self.loop_attempts = loop_attempts
         self.loop_reps = loop_reps
         self.clean_text = clean_text
+        self.thinking_loop_attempts = thinking_loop_attempts
+        self.thinking_reps = thinking_reps
+        self.clean_thinking = clean_thinking
         self.stream_count = 0
         self.complete_count = 0
         self.reqs: list[CompletionRequest] = []
@@ -157,11 +163,17 @@ class LoopingProvider(Provider):
     _USAGE = Usage(prompt_tokens=5, completion_tokens=50, total_tokens=55)
 
     def _body_events(self, attempt: int) -> list[StreamEvent]:
-        events: list[StreamEvent]
+        events: list[StreamEvent] = []
+        # Reasoning stream comes first (as real providers emit it), so a
+        # looping chain-of-thought is caught before any text is produced.
+        if attempt < self.thinking_loop_attempts:
+            events += [StreamEvent(thinking_delta="reason ") for _ in range(self.thinking_reps)]
+        elif self.clean_thinking:
+            events.append(StreamEvent(thinking_delta=self.clean_thinking))
         if attempt < self.loop_attempts:
-            events = [StreamEvent(text_delta="spam ") for _ in range(self.loop_reps)]
+            events += [StreamEvent(text_delta="spam ") for _ in range(self.loop_reps)]
         else:
-            events = [StreamEvent(text_delta=self.clean_text)]
+            events.append(StreamEvent(text_delta=self.clean_text))
         events.append(StreamEvent(done=True, usage=self._USAGE, finish_reason="stop"))
         return events
 
@@ -357,6 +369,64 @@ def test_astream_aborts_and_raises():
     with pytest.raises(RepetitionLoopError):
         asyncio.run(run())
     assert convo.history == []
+
+
+# ---------------------------------------------------------------------------
+# Thinking / reasoning loops
+# ---------------------------------------------------------------------------
+
+
+def test_send_catches_thinking_loop():
+    # The model loops inside its reasoning stream on attempt 0 (no visible text
+    # yet); the guard must catch it mid-thinking and retry to a clean body.
+    p = LoopingProvider(loop_attempts=0, thinking_loop_attempts=1)
+    convo = _convo(p, repetition_detection=RepetitionGuard(retries=2))
+    resp = convo.send("hi")
+    assert resp.text == "All good."
+    assert p.stream_count == 2  # attempt 0 looped in thinking, attempt 1 clean
+
+
+def test_send_thinking_loop_exhausts():
+    p = LoopingProvider(loop_attempts=0, thinking_loop_attempts=99)
+    convo = _convo(p, repetition_detection=RepetitionGuard(retries=2))
+    with pytest.raises(RepetitionLoopError) as ei:
+        convo.send("hi")
+    assert ei.value.attempts == 3
+    assert "reason" in ei.value.partial_text  # the looping reasoning is captured
+    assert convo.history == []  # rolled back on failure
+
+
+def test_stream_aborts_on_thinking_loop():
+    p = LoopingProvider(loop_attempts=0, thinking_loop_attempts=99)
+    convo = _convo(p, repetition_detection=RepetitionGuard(retries=2))
+    seen = []
+    with pytest.raises(RepetitionLoopError):
+        for ev in convo.stream("hi"):
+            if ev.thinking_delta:
+                seen.append(ev.thinking_delta)
+    assert seen  # some looping reasoning deltas were yielded before the abort
+    assert convo.history == []
+
+
+def test_clean_thinking_not_flagged():
+    # A short, non-repeating reasoning preamble must not false-positive.
+    p = LoopingProvider(
+        loop_attempts=0,
+        thinking_loop_attempts=0,
+        clean_thinking="Let me work through this step by step before answering. ",
+    )
+    convo = _convo(p, repetition_detection=RepetitionGuard(retries=2))
+    resp = convo.send("hi")
+    assert resp.text == "All good."
+    assert p.stream_count == 1  # no loop -> no retry
+
+
+def test_asend_catches_thinking_loop():
+    p = LoopingProvider(loop_attempts=0, thinking_loop_attempts=1)
+    convo = _convo(p, repetition_detection=RepetitionGuard(retries=2))
+    resp = asyncio.run(convo.asend("hi"))
+    assert resp.text == "All good."
+    assert p.stream_count == 2
 
 
 # ---------------------------------------------------------------------------
