@@ -22,6 +22,7 @@ from llmfacade.models import (
     StreamEvent,
     TextBlock,
     ThinkingBlock,
+    ToolArgsDelta,
     ToolCall,
     ToolResultBlock,
     ToolUseBlock,
@@ -294,6 +295,14 @@ class OpenAIProvider(Provider):
                         slot["name"] = fn.name
                     if getattr(fn, "arguments", None):
                         slot["args"] += fn.arguments
+                        yield StreamEvent(
+                            tool_args_delta=ToolArgsDelta(
+                                index=idx,
+                                fragment=fn.arguments,
+                                id=slot["id"],
+                                name=slot["name"],
+                            )
+                        )
             choice_finish = getattr(choice, "finish_reason", None)
             if choice_finish is not None:
                 state["finish_reason"] = choice_finish

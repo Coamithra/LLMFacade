@@ -178,7 +178,7 @@ def test_build_kwargs_stop_passed_through(provider: LlamaCppServerProvider):
 
 
 class _FakeFn:
-    def __init__(self, name: str, arguments: str):
+    def __init__(self, name: str | None, arguments: str | None):
         self.name = name
         self.arguments = arguments
 
@@ -481,6 +481,150 @@ def test_stream_reasoning_only_still_flushes_block(monkeypatch, provider: LlamaC
     tblocks = [e.thinking_block for e in events if e.thinking_block is not None]
     assert len(tblocks) == 1
     assert tblocks[0].text == "just thinking"
+
+
+# ---- streaming tool-call argument fragments -------------------------------
+
+
+class _FakeStreamToolCall:
+    """A streamed tool-call delta: ``id``/``name`` arrive on the first chunk
+    only, ``arguments`` arrives in fragments across chunks (the SDK shape)."""
+
+    def __init__(
+        self,
+        *,
+        index: int,
+        id: str | None = None,
+        name: str | None = None,
+        arguments: str | None = None,
+    ):
+        self.index = index
+        self.id = id
+        self.function = _FakeFn(name, arguments) if (name or arguments) else None
+
+
+def test_stream_emits_tool_args_fragments(monkeypatch, provider: LlamaCppServerProvider):
+    """Each ``fn.arguments`` chunk is forwarded as a ``tool_args_delta`` in order;
+    joining the fragments reconstructs the full args string, and exactly one
+    terminal ``tool_call_delta`` follows with the parsed input."""
+    chunks = [
+        _FakeStreamChunk(
+            choices=[
+                _FakeStreamChoice(
+                    delta=_FakeDelta(
+                        tool_calls=[
+                            _FakeStreamToolCall(index=0, id="c1", name="lookup", arguments='{"id"')
+                        ]
+                    )
+                )
+            ]
+        ),
+        _FakeStreamChunk(
+            choices=[
+                _FakeStreamChoice(
+                    delta=_FakeDelta(tool_calls=[_FakeStreamToolCall(index=0, arguments=": 7}")])
+                )
+            ]
+        ),
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(), finish_reason="tool_calls")],
+            usage=_FakeUsage(prompt=5, completion=3),
+        ),
+    ]
+    monkeypatch.setattr(provider._client.chat.completions, "create", lambda **_kw: iter(chunks))
+    events = list(provider._stream_raw(_req()))
+
+    frags = [e.tool_args_delta for e in events if e.tool_args_delta is not None]
+    assert [f.fragment for f in frags] == ['{"id"', ": 7}"]
+    assert all(f.index == 0 for f in frags)
+    assert frags[0].id == "c1" and frags[0].name == "lookup"
+    assert "".join(f.fragment for f in frags) == '{"id": 7}'
+
+    calls = [e.tool_call_delta for e in events if e.tool_call_delta is not None]
+    assert len(calls) == 1
+    assert calls[0].input == {"id": 7}
+    assert calls[0].raw_arguments is None
+
+
+def test_stream_malformed_tool_args_roundtrip(monkeypatch, provider: LlamaCppServerProvider):
+    """Truncated streamed args: joined fragments equal the terminal call's
+    ``raw_arguments`` and ``input`` is empty."""
+    chunks = [
+        _FakeStreamChunk(
+            choices=[
+                _FakeStreamChoice(
+                    delta=_FakeDelta(
+                        tool_calls=[
+                            _FakeStreamToolCall(
+                                index=0, id="c1", name="lookup", arguments='{"id": '
+                            )
+                        ]
+                    )
+                )
+            ]
+        ),
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(), finish_reason="tool_calls")],
+            usage=_FakeUsage(prompt=5, completion=3),
+        ),
+    ]
+    monkeypatch.setattr(provider._client.chat.completions, "create", lambda **_kw: iter(chunks))
+    events = list(provider._stream_raw(_req()))
+
+    frags = [e.tool_args_delta for e in events if e.tool_args_delta is not None]
+    call = next(e.tool_call_delta for e in events if e.tool_call_delta is not None)
+    assert call.input == {}
+    assert call.raw_arguments == '{"id": '
+    assert "".join(f.fragment for f in frags) == call.raw_arguments
+
+
+def test_stream_two_tool_calls_keep_distinct_indices(
+    monkeypatch, provider: LlamaCppServerProvider
+):
+    """Two concurrently-streamed tool calls keep their own index/id/name on each
+    fragment even though id/name arrive only on the first chunk."""
+    chunks = [
+        _FakeStreamChunk(
+            choices=[
+                _FakeStreamChoice(
+                    delta=_FakeDelta(
+                        tool_calls=[
+                            _FakeStreamToolCall(index=0, id="c0", name="a", arguments='{"x"'),
+                            _FakeStreamToolCall(index=1, id="c1", name="b", arguments='{"y"'),
+                        ]
+                    )
+                )
+            ]
+        ),
+        _FakeStreamChunk(
+            choices=[
+                _FakeStreamChoice(
+                    delta=_FakeDelta(
+                        tool_calls=[
+                            _FakeStreamToolCall(index=0, arguments=": 1}"),
+                            _FakeStreamToolCall(index=1, arguments=": 2}"),
+                        ]
+                    )
+                )
+            ]
+        ),
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(), finish_reason="tool_calls")],
+            usage=_FakeUsage(prompt=5, completion=4),
+        ),
+    ]
+    monkeypatch.setattr(provider._client.chat.completions, "create", lambda **_kw: iter(chunks))
+    events = list(provider._stream_raw(_req()))
+
+    frags = [e.tool_args_delta for e in events if e.tool_args_delta is not None]
+    by_index: dict[int, list] = {}
+    for f in frags:
+        by_index.setdefault(f.index, []).append(f)
+
+    assert "".join(f.fragment for f in by_index[0]) == '{"x": 1}'
+    assert "".join(f.fragment for f in by_index[1]) == '{"y": 2}'
+    assert {f.id for f in by_index[0]} == {"c0"} and {f.name for f in by_index[0]} == {"a"}
+    assert {f.id for f in by_index[1]} == {"c1"} and {f.name for f in by_index[1]} == {"b"}
 
 
 # ---- introspection (mocked httpx) ----------------------------------------
