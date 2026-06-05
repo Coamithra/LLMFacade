@@ -205,6 +205,22 @@ def _detection_text(text_buf: list[str], tool_calls: list[ToolCall]) -> str:
     return "".join(parts)
 
 
+# DRY-multiplier added per retry when ``RepetitionGuard.escalate_dry`` is on and
+# no ``dry`` is already set (so attempt 1 enables DRY at this strength).
+_DRY_ESCALATION_STEP = 0.5
+
+
+def _detect_in_buffers(
+    text_buf: list[str], tool_calls: list[ToolCall], guard: RepetitionGuard
+) -> str | None:
+    return detect_repetition_loop(
+        _detection_text(text_buf, tool_calls),
+        tail_chars=guard.tail_chars,
+        max_period=guard.max_period,
+        min_reps_floor=guard.min_reps_floor,
+    )
+
+
 def _close_stream(stream_iter: Any) -> None:
     """Eagerly close a provider stream iterator so the underlying HTTP
     connection is released on an early (repetition) break. Best-effort: a
@@ -732,14 +748,14 @@ class Conversation:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
-                        repetition_detail = detect_repetition_loop(
-                            _detection_text(text_buf, tool_calls),
-                            tail_chars=guard.tail_chars,
-                            max_period=guard.max_period,
-                            min_reps_floor=guard.min_reps_floor,
-                        )
+                        repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
                         if repetition_detail:
                             break
+            else:
+                # Natural completion: flush a final check so a short-but-complete
+                # loop that never crossed the cadence is still caught.
+                if guard is not None and chars_since_check > 0:
+                    repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
         finally:
             if repetition_detail is not None:
                 _close_stream(stream_iter)
@@ -752,6 +768,7 @@ class Conversation:
                 )
                 if resp is not None:
                     self._cache_store(cache_key, cache_fp, resp)
+                _close_stream(stream_iter)
         if repetition_detail is not None:
             raise RepetitionLoopError(
                 repetition_detail,
@@ -849,14 +866,14 @@ class Conversation:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
-                        repetition_detail = detect_repetition_loop(
-                            _detection_text(text_buf, tool_calls),
-                            tail_chars=guard.tail_chars,
-                            max_period=guard.max_period,
-                            min_reps_floor=guard.min_reps_floor,
-                        )
+                        repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
                         if repetition_detail:
                             break
+            else:
+                # Natural completion: flush a final check so a short-but-complete
+                # loop that never crossed the cadence is still caught.
+                if guard is not None and chars_since_check > 0:
+                    repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
         finally:
             if repetition_detail is not None:
                 await _aclose_stream(stream_iter)
@@ -869,6 +886,7 @@ class Conversation:
                 )
                 if resp is not None:
                     self._cache_store(cache_key, cache_fp, resp)
+                await _aclose_stream(stream_iter)
         if repetition_detail is not None:
             raise RepetitionLoopError(
                 repetition_detail,
@@ -1169,14 +1187,16 @@ class Conversation:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = detect_repetition_loop(
-                        _detection_text(buf.text, buf.tool_calls),
-                        tail_chars=guard.tail_chars,
-                        max_period=guard.max_period,
-                        min_reps_floor=guard.min_reps_floor,
-                    )
+                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
                     if detail:
                         break
+            else:
+                # Stream ended naturally without crossing the cadence on its
+                # last bytes: flush one final check so a short-but-complete
+                # loop (e.g. a model that repeats a brief phrase then hits a
+                # low max_tokens) isn't missed.
+                if chars_since_check > 0:
+                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
         finally:
             _close_stream(stream_iter)
         return detail, buf
@@ -1198,14 +1218,12 @@ class Conversation:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = detect_repetition_loop(
-                        _detection_text(buf.text, buf.tool_calls),
-                        tail_chars=guard.tail_chars,
-                        max_period=guard.max_period,
-                        min_reps_floor=guard.min_reps_floor,
-                    )
+                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
                     if detail:
                         break
+            else:
+                if chars_since_check > 0:
+                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
         finally:
             await _aclose_stream(stream_iter)
         return detail, buf
@@ -1260,13 +1278,15 @@ class Conversation:
         changed = False
         if guard.escalate_repeat_penalty is not None and "repeat_penalty" in supports:
             base = out.get("repeat_penalty")
+            # 1.0 is llama.cpp's neutral repeat_penalty (no penalty); escalate
+            # upward from there when no numeric value is already in effect.
             base = base if isinstance(base, (int, float)) and not isinstance(base, bool) else 1.0
             out["repeat_penalty"] = round(base + guard.escalate_repeat_penalty * attempt, 4)
             changed = True
         if guard.escalate_dry and "dry" in supports:
             existing = out.get("dry")
             base_mult = existing.multiplier if isinstance(existing, DrySampler) else 0.0
-            new_mult = round(base_mult + 0.5 * attempt, 4)
+            new_mult = round(base_mult + _DRY_ESCALATION_STEP * attempt, 4)
             if new_mult > 0:
                 out["dry"] = (
                     dataclasses.replace(existing, multiplier=new_mult)

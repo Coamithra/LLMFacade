@@ -131,8 +131,16 @@ class LoopingProvider(Provider):
     NAME = "looping"
     SUPPORTS = frozenset({"max_tokens", "temperature", "repeat_penalty", "dry", "tools"})
 
-    def __init__(self, *, loop_attempts: int = 1, clean_text: str = "All good.", **knobs):
+    def __init__(
+        self,
+        *,
+        loop_attempts: int = 1,
+        loop_reps: int = 100,
+        clean_text: str = "All good.",
+        **knobs,
+    ):
         self.loop_attempts = loop_attempts
+        self.loop_reps = loop_reps
         self.clean_text = clean_text
         self.stream_count = 0
         self.complete_count = 0
@@ -151,7 +159,7 @@ class LoopingProvider(Provider):
     def _body_events(self, attempt: int) -> list[StreamEvent]:
         events: list[StreamEvent]
         if attempt < self.loop_attempts:
-            events = [StreamEvent(text_delta="spam ") for _ in range(100)]
+            events = [StreamEvent(text_delta="spam ") for _ in range(self.loop_reps)]
         else:
             events = [StreamEvent(text_delta=self.clean_text)]
         events.append(StreamEvent(done=True, usage=self._USAGE, finish_reason="stop"))
@@ -213,6 +221,25 @@ def test_send_retries_then_succeeds():
     assert p.stream_count == 2  # attempt 0 looped, attempt 1 clean
     assert convo.history[-1].role == "assistant"
     assert convo.history[-1].content[0].text == "All good."
+
+
+def test_send_catches_short_loop_below_check_every():
+    # A complete degenerate loop shorter than check_every (64) chars must still
+    # be caught by the post-stream final flush. "spam "*6 = 30 chars.
+    p = LoopingProvider(loop_attempts=1, loop_reps=6)
+    convo = _convo(p, repetition_detection=RepetitionGuard(retries=2))
+    resp = convo.send("hi")
+    assert resp.text == "All good."
+    assert p.stream_count == 2  # short loop on attempt 0 detected, retried clean
+
+
+def test_stream_catches_short_loop_below_check_every():
+    p = LoopingProvider(loop_attempts=99, loop_reps=6)
+    convo = _convo(p, repetition_detection=RepetitionGuard(retries=2))
+    with pytest.raises(RepetitionLoopError):
+        for _ev in convo.stream("hi"):
+            pass
+    assert convo.history == []
 
 
 def test_send_raises_after_retries_exhausted():
