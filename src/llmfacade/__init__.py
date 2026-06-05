@@ -11,6 +11,7 @@ from llmfacade.exceptions import (
     ProviderError,
     ProviderNotInstalledError,
     RateLimitError,
+    RepetitionLoopError,
     ToolIterationLimitError,
     UnsupportedFeature,
 )
@@ -33,6 +34,7 @@ from llmfacade.models import (
     Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider, SystemBlock
+from llmfacade.repetition import RepetitionGuard
 from llmfacade.settings import (
     RUNTIME_KNOBS,
     DrySampler,
@@ -62,6 +64,7 @@ __all__ = [
     "OutputFormat",
     "EphemeralCacheTTL",
     "DrySampler",
+    "RepetitionGuard",
     # Tools
     "tool",
     "Tool",
@@ -92,6 +95,7 @@ __all__ = [
     "UnsupportedFeature",
     "ToolIterationLimitError",
     "ConversationStateError",
+    "RepetitionLoopError",
     # Helpers
     "helpers",
     # Misc

@@ -29,6 +29,7 @@ class Model:
         log_dir: Any | None = None,
         cache_dir: Any | None = None,
         cache_mode: str | None = None,
+        repetition_detection: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -51,6 +52,7 @@ class Model:
         self._log_dir_override = log_dir
         self._cache_dir_override = cache_dir
         self._cache_mode_override = cache_mode
+        self._repetition_override = repetition_detection
         self._supports: frozenset[str] = (
             capability_override if capability_override is not None else provider.SUPPORTS
         )
@@ -177,6 +179,7 @@ class Model:
         log_max_message_lines: int | None = None,
         cache_dir: Any | None = None,
         cache_mode: str | None = None,
+        repetition_detection: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -206,6 +209,7 @@ class Model:
             log_max_message_lines=log_max_message_lines,
             cache_dir=cache_dir,
             cache_mode=cache_mode,
+            repetition_detection=repetition_detection,
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
