@@ -168,7 +168,10 @@ def _block_to_dict(b: ContentBlock) -> dict[str, Any]:
             "data_b64": base64.b64encode(b.data).decode("ascii"),
         }
     if isinstance(b, ToolUseBlock):
-        return {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+        d: dict[str, Any] = {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+        if b.raw_arguments is not None:
+            d["raw_arguments"] = b.raw_arguments
+        return d
     if isinstance(b, ToolResultBlock):
         if isinstance(b.content, str):
             content: Any = b.content
@@ -202,7 +205,9 @@ def _dict_to_block(d: dict[str, Any]) -> ContentBlock:
             media_type=d["media_type"],
         )
     if t == "tool_use":
-        return ToolUseBlock(id=d["id"], name=d["name"], input=d["input"])
+        return ToolUseBlock(
+            id=d["id"], name=d["name"], input=d["input"], raw_arguments=d.get("raw_arguments")
+        )
     if t == "tool_result":
         raw = d["content"]
         content: str | list[TextBlock | ImageBlock]
@@ -239,7 +244,15 @@ def _serialize_response(resp: Response) -> dict[str, Any]:
     return {
         "text": resp.text,
         "blocks": [_block_to_dict(b) for b in resp.blocks],
-        "tool_calls": [{"id": c.id, "name": c.name, "input": c.input} for c in resp.tool_calls],
+        "tool_calls": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "input": c.input,
+                **({"raw_arguments": c.raw_arguments} if c.raw_arguments is not None else {}),
+            }
+            for c in resp.tool_calls
+        ],
         "thinking": resp.thinking,
         "usage": (
             None
@@ -263,7 +276,13 @@ def _deserialize_response(d: dict[str, Any]) -> Response:
         text=d["text"],
         blocks=[_dict_to_block(b) for b in d["blocks"]],
         tool_calls=[
-            ToolCall(id=c["id"], name=c["name"], input=c["input"]) for c in d["tool_calls"]
+            ToolCall(
+                id=c["id"],
+                name=c["name"],
+                input=c["input"],
+                raw_arguments=c.get("raw_arguments"),
+            )
+            for c in d["tool_calls"]
         ],
         thinking=d.get("thinking"),
         usage=(None if d.get("usage") is None else Usage(**d["usage"])),
