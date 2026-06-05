@@ -891,7 +891,14 @@ class Conversation:
         if text_buf:
             blocks.append(TextBlock(text))
         for call in tool_calls:
-            blocks.append(ToolUseBlock(id=call.id, name=call.name, input=call.input))
+            blocks.append(
+                ToolUseBlock(
+                    id=call.id,
+                    name=call.name,
+                    input=call.input,
+                    raw_arguments=call.raw_arguments,
+                )
+            )
         if not blocks:
             return None
         self._history.append(Message(role="assistant", content=blocks))
@@ -1163,7 +1170,17 @@ class Conversation:
             "model": resp.model,
             "text": _abbreviate_text(resp.text, max_lines),
             "tool_calls": [
-                {"id": c.id, "name": c.name, "input": c.input} for c in resp.tool_calls
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "input": c.input,
+                    **(
+                        {"raw_arguments": _abbreviate_text(c.raw_arguments, max_lines)}
+                        if c.raw_arguments is not None
+                        else {}
+                    ),
+                }
+                for c in resp.tool_calls
             ],
             "thinking": (
                 _abbreviate_text(resp.thinking, max_lines) if resp.thinking else resp.thinking

@@ -14,7 +14,7 @@ import pytest
 
 from llmfacade import Message, tool
 from llmfacade.exceptions import ProviderError
-from llmfacade.models import TextBlock, ThinkingBlock
+from llmfacade.models import TextBlock, ThinkingBlock, ToolUseBlock
 from llmfacade.provider import CompletionRequest
 from llmfacade.providers.llamacpp import LlamaCppServerProvider
 from llmfacade.settings import DrySampler, OutputFormat
@@ -299,6 +299,36 @@ def test_complete_tool_call_roundtrip(monkeypatch, provider: LlamaCppServerProvi
     assert call.name == "get_weather"
     assert call.input == {"city": "Paris"}
     assert call.id == "call-1"
+    # A successful parse leaves raw_arguments unset.
+    assert call.raw_arguments is None
+
+
+def test_complete_truncated_tool_call_preserves_raw_arguments(
+    monkeypatch, provider: LlamaCppServerProvider
+):
+    """A tool call truncated mid-JSON (e.g. hit the token limit) keeps its raw
+    arguments string so the failed call is not silently lost from logs."""
+    truncated = '{"city": "Paris", "details": {"foo": "bar' * 50  # never closes
+    fake = _FakeResponse(
+        content="",
+        finish_reason="length",
+        tool_calls=[
+            _FakeToolCall(id="call-x", name="get_weather", arguments=truncated),
+        ],
+    )
+    monkeypatch.setattr(
+        provider._client.chat.completions,
+        "create",
+        lambda **_kw: fake,
+    )
+    resp = provider._complete_raw(_req(tools=[get_weather]))
+    call = resp.tool_calls[0]
+    assert call.input == {}  # unparseable -> empty parsed input
+    assert call.raw_arguments == truncated  # but the raw string survives
+    # The same on the matching ToolUseBlock in resp.blocks.
+    tool_blocks = [b for b in resp.blocks if isinstance(b, ToolUseBlock)]
+    assert len(tool_blocks) == 1
+    assert tool_blocks[0].raw_arguments == truncated
 
 
 # ---- reasoning capture ----------------------------------------------------

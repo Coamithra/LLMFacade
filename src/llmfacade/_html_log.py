@@ -208,11 +208,19 @@ def _render_block(block: ContentBlock, *, max_lines: int | None = None) -> str:
             args = json.dumps(block.input, indent=2, default=str)
         except Exception:
             args = repr(block.input)
+        raw_html = ""
+        if block.raw_arguments is not None:
+            raw_html = (
+                '  <div class="tool-raw"><em>unparsed arguments '
+                "(tool call failed to parse — likely truncated):</em>\n"
+                f"  <pre>{_escape(_abbreviate_text(block.raw_arguments, max_lines))}</pre></div>\n"
+            )
         return (
             '<div class="tool-use">\n'
             f'  <span class="name">{_escape(block.name)}</span>'
             f"  <small>id={_escape(block.id)}</small>\n"
             f"  <pre>{_escape(_abbreviate_text(args, max_lines))}</pre>\n"
+            f"{raw_html}"
             "</div>\n"
         )
     if isinstance(block, ToolResultBlock):

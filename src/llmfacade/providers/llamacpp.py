@@ -862,11 +862,16 @@ class LlamaCppServerProvider(Provider):
                         continue
                     try:
                         parsed = _json.loads(slot["args"] or "{}")
+                        unparsed = None
                     except _json.JSONDecodeError:
                         parsed = {}
+                        unparsed = slot["args"]
                     yield StreamEvent(
                         tool_call_delta=ToolCall(
-                            id=slot["id"], name=slot["name"] or "", input=parsed
+                            id=slot["id"],
+                            name=slot["name"] or "",
+                            input=parsed,
+                            raw_arguments=unparsed,
                         )
                     )
                 tool_buf.clear()
@@ -984,12 +989,21 @@ class LlamaCppServerProvider(Provider):
             blocks.append(TextBlock(text))
         tool_calls: list[ToolCall] = []
         for tc in getattr(msg, "tool_calls", None) or []:
+            raw_args = tc.function.arguments
             try:
-                args = _json.loads(tc.function.arguments)
+                args = _json.loads(raw_args)
+                unparsed = None
             except _json.JSONDecodeError:
+                # Truncated/runaway tool call (e.g. hit the token limit mid-JSON).
+                # Keep the raw string so the failed call is still visible in logs.
                 args = {}
-            blocks.append(ToolUseBlock(id=tc.id, name=tc.function.name, input=args))
-            tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, input=args))
+                unparsed = raw_args
+            blocks.append(
+                ToolUseBlock(id=tc.id, name=tc.function.name, input=args, raw_arguments=unparsed)
+            )
+            tool_calls.append(
+                ToolCall(id=tc.id, name=tc.function.name, input=args, raw_arguments=unparsed)
+            )
 
         usage = None
         if raw.usage:

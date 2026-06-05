@@ -40,6 +40,11 @@ class ToolUseBlock:
     id: str
     name: str
     input: dict[str, Any]
+    # Raw, unparsed arguments string as the model emitted it. Populated only when
+    # the provider could not parse the arguments into ``input`` (e.g. a truncated
+    # tool call that hit the token limit mid-JSON, leaving ``input`` empty). Kept
+    # so the failed call's actual content is not silently lost from logs.
+    raw_arguments: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +108,9 @@ class ToolCall:
     id: str
     name: str
     input: dict[str, Any]
+    # See ``ToolUseBlock.raw_arguments``: the model's raw arguments string,
+    # populated only when parsing into ``input`` failed.
+    raw_arguments: str | None = None
     _fn: Callable[..., Any] | None = field(default=None, repr=False, compare=False)
 
     def invoke(self) -> Any:
