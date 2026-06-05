@@ -114,3 +114,90 @@ def test_openai_reasoning_tokens_extracted():
     assert (
         _openai_reasoning_tokens(SimpleNamespace(completion_tokens_details=SimpleNamespace())) == 0
     )
+
+
+# ---- streaming tool-call argument fragments -------------------------------
+
+
+def _tc_delta(index, *, id=None, name=None, arguments=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        index=index,
+        id=id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _chunk(*tool_calls, content=None, finish_reason=None, usage=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=content, tool_calls=list(tool_calls) or None),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=usage,
+    )
+
+
+def test_openai_stream_emits_tool_args_fragments(monkeypatch, openai_provider: OpenAIProvider):
+    """Each ``fn.arguments`` chunk is forwarded as a ``tool_args_delta`` in order;
+    concatenating the fragments reconstructs the full args, and the terminal
+    ``tool_call_delta`` still carries the parsed input."""
+    from types import SimpleNamespace
+
+    chunks = [
+        _chunk(_tc_delta(0, id="call_1", name="search", arguments='{"q": ')),
+        _chunk(_tc_delta(0, arguments='"cats"')),
+        _chunk(_tc_delta(0, arguments="}")),
+        _chunk(
+            content=None,
+            finish_reason="tool_calls",
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+        ),
+    ]
+    monkeypatch.setattr(
+        openai_provider._client.chat.completions, "create", lambda **_kw: iter(chunks)
+    )
+
+    events = list(openai_provider._stream_raw(_req()))
+
+    frags = [e.tool_args_delta for e in events if e.tool_args_delta is not None]
+    assert [f.fragment for f in frags] == ['{"q": ', '"cats"', "}"]
+    assert all(f.index == 0 for f in frags)
+    assert frags[0].id == "call_1" and frags[0].name == "search"
+    assert "".join(f.fragment for f in frags) == '{"q": "cats"}'
+
+    calls = [e.tool_call_delta for e in events if e.tool_call_delta is not None]
+    assert len(calls) == 1
+    assert calls[0].input == {"q": "cats"}
+    assert calls[0].raw_arguments is None
+
+
+def test_openai_stream_malformed_tool_args_roundtrip(monkeypatch, openai_provider: OpenAIProvider):
+    """Truncated streamed args: the joined fragments equal the terminal call's
+    ``raw_arguments`` and ``input`` is empty (ties into raw_arguments)."""
+    from types import SimpleNamespace
+
+    chunks = [
+        _chunk(_tc_delta(0, id="call_1", name="search", arguments='{"q": "ca')),
+        _chunk(
+            content=None,
+            finish_reason="tool_calls",
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+        ),
+    ]
+    monkeypatch.setattr(
+        openai_provider._client.chat.completions, "create", lambda **_kw: iter(chunks)
+    )
+
+    events = list(openai_provider._stream_raw(_req()))
+    frags = [e.tool_args_delta for e in events if e.tool_args_delta is not None]
+    call = next(e.tool_call_delta for e in events if e.tool_call_delta is not None)
+
+    assert call.input == {}
+    assert call.raw_arguments == '{"q": "ca'
+    assert "".join(f.fragment for f in frags) == call.raw_arguments

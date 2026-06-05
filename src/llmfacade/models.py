@@ -136,6 +136,30 @@ class ToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolArgsDelta:
+    """A raw fragment of a tool call's arguments string, forwarded live during
+    streaming before the JSON has closed or parsed. Emitted by ``stream`` /
+    ``astream`` *in addition to* the terminal :class:`ToolCall`
+    (``StreamEvent.tool_call_delta``) so a consumer can watch a tool call being
+    written, the same way ``text_delta`` / ``thinking_delta`` already stream.
+
+    ``index`` is the tool call's 0-based position within the turn; ``fragment``
+    is the verbatim arguments-string chunk from the provider. Concatenating all
+    ``fragment``s for one ``index`` reconstructs the exact raw arguments string
+    (which equals the terminal call's ``raw_arguments`` when parsing fails).
+    ``id`` / ``name`` are filled once the provider has emitted them (usually on
+    the first fragment). Interpreting partial fragments is the caller's job —
+    llmfacade only forwards them. Google has no fragments to forward (its
+    function-call args arrive structured, not as a JSON string stream), so it
+    emits only the terminal ``tool_call_delta``."""
+
+    index: int
+    fragment: str
+    id: str | None = None
+    name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Response:
     text: str
     blocks: list[ContentBlock]
@@ -151,6 +175,7 @@ class Response:
 class StreamEvent:
     text_delta: str | None = None
     tool_call_delta: ToolCall | None = None
+    tool_args_delta: ToolArgsDelta | None = None
     thinking_delta: str | None = None
     thinking_block: ThinkingBlock | None = None
     done: bool = False

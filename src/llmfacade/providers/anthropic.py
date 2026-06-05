@@ -20,6 +20,7 @@ from llmfacade.models import (
     StreamEvent,
     TextBlock,
     ThinkingBlock,
+    ToolArgsDelta,
     ToolCall,
     ToolResultBlock,
     ToolUseBlock,
@@ -420,10 +421,13 @@ class AnthropicProvider(Provider):
             block = getattr(event, "content_block", None)
             block_type = getattr(block, "type", None) if block is not None else None
             if block_type == "tool_use":
+                tool_index = state.get("tool_count", 0)
+                state["tool_count"] = tool_index + 1
                 state["current_tool"] = {
                     "id": getattr(block, "id", ""),
                     "name": getattr(block, "name", ""),
                     "input_json": "",
+                    "index": tool_index,
                 }
             elif block_type == "thinking":
                 state["current_thinking"] = {"text": "", "signature": None}
@@ -449,7 +453,16 @@ class AnthropicProvider(Provider):
                     state["current_thinking"]["signature"] or ""
                 ) + (getattr(delta, "signature", "") or "")
             elif d_type == "input_json_delta" and state["current_tool"] is not None:
-                state["current_tool"]["input_json"] += getattr(delta, "partial_json", "")
+                fragment = getattr(delta, "partial_json", "")
+                state["current_tool"]["input_json"] += fragment
+                yield StreamEvent(
+                    tool_args_delta=ToolArgsDelta(
+                        index=state["current_tool"]["index"],
+                        fragment=fragment,
+                        id=state["current_tool"]["id"] or None,
+                        name=state["current_tool"]["name"] or None,
+                    )
+                )
         elif event_type == "content_block_stop":
             if state["current_tool"] is not None:
                 try:

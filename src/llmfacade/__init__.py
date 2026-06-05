@@ -27,6 +27,7 @@ from llmfacade.models import (
     StreamEvent,
     TextBlock,
     ThinkingBlock,
+    ToolArgsDelta,
     ToolCall,
     ToolResultBlock,
     ToolUseBlock,
@@ -77,6 +78,7 @@ __all__ = [
     "ToolResultBlock",
     "ThinkingBlock",
     "ToolCall",
+    "ToolArgsDelta",
     "ImageResult",
     "ImageUsage",
     # Cache
