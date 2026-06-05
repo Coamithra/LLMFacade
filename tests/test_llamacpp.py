@@ -178,7 +178,7 @@ def test_build_kwargs_stop_passed_through(provider: LlamaCppServerProvider):
 
 
 class _FakeFn:
-    def __init__(self, name: str, arguments: str):
+    def __init__(self, name: str | None, arguments: str | None):
         self.name = name
         self.arguments = arguments
 
@@ -576,6 +576,55 @@ def test_stream_malformed_tool_args_roundtrip(monkeypatch, provider: LlamaCppSer
     assert call.input == {}
     assert call.raw_arguments == '{"id": '
     assert "".join(f.fragment for f in frags) == call.raw_arguments
+
+
+def test_stream_two_tool_calls_keep_distinct_indices(
+    monkeypatch, provider: LlamaCppServerProvider
+):
+    """Two concurrently-streamed tool calls keep their own index/id/name on each
+    fragment even though id/name arrive only on the first chunk."""
+    chunks = [
+        _FakeStreamChunk(
+            choices=[
+                _FakeStreamChoice(
+                    delta=_FakeDelta(
+                        tool_calls=[
+                            _FakeStreamToolCall(index=0, id="c0", name="a", arguments='{"x"'),
+                            _FakeStreamToolCall(index=1, id="c1", name="b", arguments='{"y"'),
+                        ]
+                    )
+                )
+            ]
+        ),
+        _FakeStreamChunk(
+            choices=[
+                _FakeStreamChoice(
+                    delta=_FakeDelta(
+                        tool_calls=[
+                            _FakeStreamToolCall(index=0, arguments=": 1}"),
+                            _FakeStreamToolCall(index=1, arguments=": 2}"),
+                        ]
+                    )
+                )
+            ]
+        ),
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(), finish_reason="tool_calls")],
+            usage=_FakeUsage(prompt=5, completion=4),
+        ),
+    ]
+    monkeypatch.setattr(provider._client.chat.completions, "create", lambda **_kw: iter(chunks))
+    events = list(provider._stream_raw(_req()))
+
+    frags = [e.tool_args_delta for e in events if e.tool_args_delta is not None]
+    by_index: dict[int, list] = {}
+    for f in frags:
+        by_index.setdefault(f.index, []).append(f)
+
+    assert "".join(f.fragment for f in by_index[0]) == '{"x": 1}'
+    assert "".join(f.fragment for f in by_index[1]) == '{"y": 2}'
+    assert {f.id for f in by_index[0]} == {"c0"} and {f.name for f in by_index[0]} == {"a"}
+    assert {f.id for f in by_index[1]} == {"c1"} and {f.name for f in by_index[1]} == {"b"}
 
 
 # ---- introspection (mocked httpx) ----------------------------------------

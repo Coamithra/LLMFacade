@@ -465,15 +465,19 @@ class AnthropicProvider(Provider):
                 )
         elif event_type == "content_block_stop":
             if state["current_tool"] is not None:
+                raw = state["current_tool"]["input_json"]
                 try:
-                    parsed = _json.loads(state["current_tool"]["input_json"] or "{}")
+                    parsed = _json.loads(raw or "{}")
+                    unparsed = None
                 except _json.JSONDecodeError:
                     parsed = {}
+                    unparsed = raw
                 yield StreamEvent(
                     tool_call_delta=ToolCall(
                         id=state["current_tool"]["id"],
                         name=state["current_tool"]["name"],
                         input=parsed,
+                        raw_arguments=unparsed,
                     )
                 )
                 state["current_tool"] = None

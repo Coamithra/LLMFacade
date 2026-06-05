@@ -82,8 +82,10 @@ def test_stream_two_tool_calls_get_distinct_indices():
     ]
 
 
-def test_stream_malformed_tool_args_yields_empty_input():
-    """Truncated JSON: fragments still arrive, terminal call has empty input."""
+def test_stream_malformed_tool_args_roundtrip():
+    """Truncated JSON: fragments still arrive, and the terminal call has empty
+    input with raw_arguments == the joined fragments (parity with the other
+    providers' streamed-parse-failure behaviour)."""
     events = _drive(
         [
             _start(id="tu_1", name="search"),
@@ -93,5 +95,21 @@ def test_stream_malformed_tool_args_yields_empty_input():
     )
     frags = [e.tool_args_delta for e in events if e.tool_args_delta is not None]
     call = next(e.tool_call_delta for e in events if e.tool_call_delta is not None)
-    assert "".join(f.fragment for f in frags) == '{"q": "ca'
     assert call.input == {}
+    assert call.raw_arguments == '{"q": "ca'
+    assert "".join(f.fragment for f in frags) == call.raw_arguments
+
+
+def test_stream_empty_id_and_name_coerced_to_none():
+    """A tool_use start with empty id/name (the SDK can emit these) yields
+    fragments whose id/name are normalised to None rather than empty strings."""
+    events = _drive(
+        [
+            _start(id="", name=""),
+            _json_delta("{}"),
+            _stop(),
+        ]
+    )
+    frag = next(e.tool_args_delta for e in events if e.tool_args_delta is not None)
+    assert frag.id is None
+    assert frag.name is None

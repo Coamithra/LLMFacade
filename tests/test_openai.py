@@ -201,3 +201,37 @@ def test_openai_stream_malformed_tool_args_roundtrip(monkeypatch, openai_provide
     assert call.input == {}
     assert call.raw_arguments == '{"q": "ca'
     assert "".join(f.fragment for f in frags) == call.raw_arguments
+
+
+def test_openai_stream_two_tool_calls_keep_distinct_indices(
+    monkeypatch, openai_provider: OpenAIProvider
+):
+    """Two concurrently-streamed tool calls keep their own index, id and name on
+    every fragment even though id/name arrive only on the first chunk."""
+    from types import SimpleNamespace
+
+    chunks = [
+        _chunk(_tc_delta(0, id="c0", name="a", arguments='{"x"')),
+        _chunk(_tc_delta(1, id="c1", name="b", arguments='{"y"')),
+        _chunk(_tc_delta(0, arguments=": 1}")),
+        _chunk(_tc_delta(1, arguments=": 2}")),
+        _chunk(
+            content=None,
+            finish_reason="tool_calls",
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+        ),
+    ]
+    monkeypatch.setattr(
+        openai_provider._client.chat.completions, "create", lambda **_kw: iter(chunks)
+    )
+
+    events = list(openai_provider._stream_raw(_req()))
+    frags = [e.tool_args_delta for e in events if e.tool_args_delta is not None]
+    by_index: dict[int, list] = {}
+    for f in frags:
+        by_index.setdefault(f.index, []).append(f)
+
+    assert "".join(f.fragment for f in by_index[0]) == '{"x": 1}'
+    assert "".join(f.fragment for f in by_index[1]) == '{"y": 2}'
+    assert {f.id for f in by_index[0]} == {"c0"} and {f.name for f in by_index[0]} == {"a"}
+    assert {f.id for f in by_index[1]} == {"c1"} and {f.name for f in by_index[1]} == {"b"}
