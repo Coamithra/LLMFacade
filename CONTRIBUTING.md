@@ -4,6 +4,23 @@ Step-by-step workflow for picking up and completing any card from the [LLMFacade
 
 ---
 
+## Quick ship (no card / small change)
+
+Not every change is a Trello card. For a quick fix or doc tweak that doesn't warrant the full runbook below, the default ship flow is **PR + auto self-merge**:
+
+```
+git checkout -b <prefix>/<short-name>     # off main
+git add <files> && git commit -m "..."     # only the files you touched
+git push -u origin <branch>
+gh pr create --fill                        # PR record + URL, no clicking
+gh pr merge --merge                        # self-merge (see note); use --merge, not --squash
+git checkout main && git pull origin main  # fast-forward local main to the merge
+```
+
+**No approval needed.** `main` is an unprotected branch on this solo public repo, so GitHub disabling the "Approve" button on your *own* PR is irrelevant — a required review only applies under a branch-protection rule, and this repo has none. Don't stop to ask the user to approve or open the PR by hand. (If the user says "just merge / direct", skip the PR entirely and fast-forward `main`.) The full card runbook (Phase 6) uses this same merge step inside the worktree flow.
+
+---
+
 ## Worktree Quick Reference
 
 All work happens in an isolated **git worktree** under `.trees/`. This lets multiple agents work on different cards simultaneously without interfering with each other. The root checkout stays on `main` — never switch it to a feature branch.
@@ -97,7 +114,7 @@ Dig into the problem before proposing solutions. Use `/research` for topics that
 
 26. **Re-run lint + unit tests** — Make sure the merge didn't break anything: `ruff check src/`, `pytest`
 27. **Return to the root checkout** — `cd` back to the project root (where `main` is checked out). Remaining steps run from here
-28. **Merge to main** — `git merge <branch> && git push`
+28. **Open a PR and self-merge** — `gh pr create --fill` then `gh pr merge --merge` (real merge commit, not `--squash`, so the branch's commits stay reachable and step 29's `git branch -d` still works), then `git pull origin main` to fast-forward the root checkout. **No approval needed** — `main` is unprotected on this solo repo, so GitHub disabling "Approve" on your own PR is irrelevant; a required review only applies under a branch-protection rule, which there is none. The PR is a record/URL with no extra ceremony — don't wait on a human to approve. (Direct `git merge <branch> && git push` is the fallback if `gh` is unavailable.)
 29. **Clean up the worktree and branch**
     ```
     git worktree remove .trees/<branch>
