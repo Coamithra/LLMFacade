@@ -126,6 +126,7 @@ class Provider:
         log_dir: Any | None = None,
         cache_dir: Any | None = None,
         cache_mode: str | None = None,
+        repetition_detection: Any | None = None,
         # Generation defaults (subset of RUNTIME_KNOBS). Each is gated by SUPPORTS.
         temperature: float | None = None,
         max_tokens: int | None = None,
@@ -150,6 +151,7 @@ class Provider:
         self._log_dir_override = log_dir
         self._cache_dir_override = cache_dir
         self._cache_mode_override = cache_mode
+        self._repetition_override = repetition_detection
         self._defaults = _validate_knobs(
             {
                 "temperature": temperature,
@@ -190,6 +192,7 @@ class Provider:
         log_dir: Any | None = None,
         cache_dir: Any | None = None,
         cache_mode: str | None = None,
+        repetition_detection: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -234,6 +237,7 @@ class Provider:
             log_dir=log_dir,
             cache_dir=cache_dir,
             cache_mode=cache_mode,
+            repetition_detection=repetition_detection,
             **defaults,
         )
 

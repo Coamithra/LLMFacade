@@ -71,3 +71,22 @@ class CacheMissError(LLMError):
     Raised by ``Conversation.send`` / ``stream`` (and async variants) when
     ``cache_mode='replay_only'`` is in effect and the request fingerprint is
     not present in the cache directory. No provider call is made."""
+
+
+class RepetitionLoopError(LLMError):
+    """A model fell into a degenerate repetition loop and did not recover.
+
+    Raised by ``Conversation.send`` / ``asend`` (after exhausting the
+    ``RepetitionGuard``'s retries) and by ``stream`` / ``astream`` (on the first
+    mid-stream detection) when ``repetition_detection`` is enabled. Carries the
+    human-readable hit ``detail``, the number of ``attempts`` made, and the
+    ``partial_text`` of the final (aborted) attempt."""
+
+    def __init__(self, detail: str, *, attempts: int, partial_text: str):
+        self.detail = detail
+        self.attempts = attempts
+        self.partial_text = partial_text
+        super().__init__(
+            f"Model fell into a repetition loop and did not recover after "
+            f"{attempts} attempt(s): {detail}"
+        )

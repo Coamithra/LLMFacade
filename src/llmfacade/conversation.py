@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import json
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,7 @@ from llmfacade.exceptions import (
     CacheMissError,
     ConversationStateError,
     ProviderError,
+    RepetitionLoopError,
     UnsupportedFeature,
 )
 from llmfacade.helpers import _abbreviate_text, _dump_message, _dump_usage, _log_default
@@ -41,6 +43,12 @@ from llmfacade.provider import (
     SystemBlock,
     _filter_unsupported,
     _validate_knobs,
+)
+from llmfacade.repetition import (
+    RepetitionGuard,
+    coerce_repetition_guard,
+    detect_repetition_loop,
+    resolve_repetition_guard,
 )
 from llmfacade.settings import DrySampler, ThinkingMode, is_budget_thinking
 from llmfacade.tools import Tool
@@ -159,6 +167,80 @@ def _coerce_system_blocks(
     return out
 
 
+@dataclass
+class _StreamBuffers:
+    """Mutable accumulator for a single streamed attempt, used by the
+    repetition guard. ``absorb`` folds in one ``StreamEvent``; the fields
+    mirror what ``_finalize_stream`` reads off the inline stream loops."""
+
+    text: list[str] = field(default_factory=list)
+    thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: Any = None
+    finish_reason: str | None = None
+
+    def absorb(self, ev: StreamEvent) -> None:
+        if ev.text_delta:
+            self.text.append(ev.text_delta)
+        if ev.thinking_block is not None:
+            self.thinking_blocks.append(ev.thinking_block)
+        if ev.tool_call_delta:
+            self.tool_calls.append(ev.tool_call_delta)
+        if ev.usage is not None:
+            self.usage = ev.usage
+        if ev.finish_reason is not None:
+            self.finish_reason = ev.finish_reason
+
+
+def _detection_text(text_buf: list[str], tool_calls: list[ToolCall]) -> str:
+    """Build the buffer the repetition detector scans: assistant text plus any
+    streamed tool-call arguments (so a looping tool-args stream is caught the
+    same way as looping prose)."""
+    parts = list(text_buf)
+    for tc in tool_calls:
+        if tc.raw_arguments:
+            parts.append(tc.raw_arguments)
+        elif tc.input:
+            parts.append(json.dumps(tc.input, default=str, sort_keys=True))
+    return "".join(parts)
+
+
+# DRY-multiplier added per retry when ``RepetitionGuard.escalate_dry`` is on and
+# no ``dry`` is already set (so attempt 1 enables DRY at this strength).
+_DRY_ESCALATION_STEP = 0.5
+
+
+def _detect_in_buffers(
+    text_buf: list[str], tool_calls: list[ToolCall], guard: RepetitionGuard
+) -> str | None:
+    return detect_repetition_loop(
+        _detection_text(text_buf, tool_calls),
+        tail_chars=guard.tail_chars,
+        max_period=guard.max_period,
+        min_reps_floor=guard.min_reps_floor,
+    )
+
+
+def _close_stream(stream_iter: Any) -> None:
+    """Eagerly close a provider stream iterator so the underlying HTTP
+    connection is released on an early (repetition) break. Best-effort: a
+    plain iterator without ``close`` is fine to leave to GC."""
+    close = getattr(stream_iter, "close", None)
+    if close is not None:
+        with contextlib.suppress(Exception):
+            close()
+
+
+async def _aclose_stream(stream_iter: Any) -> None:
+    """Async equivalent of ``_close_stream`` (prefers ``aclose``)."""
+    aclose = getattr(stream_iter, "aclose", None)
+    if aclose is not None:
+        with contextlib.suppress(Exception):
+            await aclose()
+        return
+    _close_stream(stream_iter)
+
+
 class Conversation:
     """A stateful chat session against one Model.
 
@@ -180,6 +262,7 @@ class Conversation:
         log_max_message_lines: int | None = None,
         cache_dir: Any | None = None,
         cache_mode: str | None = None,
+        repetition_detection: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -258,6 +341,12 @@ class Conversation:
         self._cache: ResponseCache | None = resolve_cache(
             convo_cache_dir=cache_dir,
             convo_cache_mode=cache_mode,
+            model=model,
+        )
+
+        self._repetition_override = repetition_detection
+        self._repetition_guard: RepetitionGuard | None = resolve_repetition_guard(
+            convo_repetition=repetition_detection,
             model=model,
         )
 
@@ -351,13 +440,16 @@ class Conversation:
         log_max_message_lines: int | None = None,
         cache_dir: Any | None = None,
         cache_mode: str | None = None,
+        repetition_detection: Any | None = None,
     ) -> Conversation:
         """Deep-copy history, system blocks, tools, and defaults into a fresh
         conversation. The clone resolves its own log path through the same
         cascade as a fresh ``new_conversation`` call: pass ``log_dir=False``
         or ``log_path=False`` to disable logging on the clone. The cache
         cascade is re-resolved the same way; pass ``cache_dir=`` /
-        ``cache_mode=`` to override what was on the source."""
+        ``cache_mode=`` to override what was on the source. ``repetition_detection``
+        likewise re-resolves through the cascade; pass it to override the
+        source's convo-scope guard (``False`` disables)."""
         clone = Conversation.__new__(Conversation)
         clone._model = self._model
         clone.name = name or f"{self.name}-clone"
@@ -394,6 +486,11 @@ class Conversation:
             convo_cache_mode=cache_mode,
             model=self._model,
         )
+        clone._repetition_override = repetition_detection
+        clone._repetition_guard = resolve_repetition_guard(
+            convo_repetition=repetition_detection,
+            model=self._model,
+        )
         if clone._log_path is not None:
             clone._log_path.parent.mkdir(parents=True, exist_ok=True)
             clone._write_settings_header()
@@ -405,6 +502,7 @@ class Conversation:
         *,
         tool_choice: str | None = None,
         stop: list[str] | None = None,
+        repetition_detection: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -426,7 +524,12 @@ class Conversation:
         If the response includes tool calls, the caller is responsible for
         executing them and appending results via ``add_tool_result`` before
         the next ``send`` / ``stream`` call. The convenience helpers in
-        ``llmfacade.helpers`` automate that loop for ``@tool``-bound funcs."""
+        ``llmfacade.helpers`` automate that loop for ``@tool``-bound funcs.
+
+        When a ``RepetitionGuard`` is in effect (via ``repetition_detection``
+        here or any cascade scope) the round-trip runs under the hood as a
+        stream so a degenerate repetition loop is caught mid-generation and the
+        whole call is transparently restarted; see ``RepetitionGuard``."""
         per_call = self._collect_per_call(
             temperature=temperature,
             max_tokens=max_tokens,
@@ -445,7 +548,9 @@ class Conversation:
             beta_headers=beta_headers,
             tool_choice=tool_choice,
         )
+        guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
+        guard_snap = self.snapshot() if guard is not None else None
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
@@ -459,7 +564,15 @@ class Conversation:
             self._history.append(Message(role="assistant", content=list(cached.blocks)))
             return cached
 
-        resp = self._model.provider._complete_raw(req)
+        if guard is None:
+            resp = self._model.provider._complete_raw(req)
+        else:
+            try:
+                resp = self._guarded_complete(req, guard)
+            except RepetitionLoopError:
+                if guard_snap is not None:
+                    self.rollback(guard_snap)
+                raise
         self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
@@ -472,6 +585,7 @@ class Conversation:
         *,
         tool_choice: str | None = None,
         stop: list[str] | None = None,
+        repetition_detection: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -507,7 +621,9 @@ class Conversation:
             beta_headers=beta_headers,
             tool_choice=tool_choice,
         )
+        guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
+        guard_snap = self.snapshot() if guard is not None else None
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
@@ -521,7 +637,15 @@ class Conversation:
             self._history.append(Message(role="assistant", content=list(cached.blocks)))
             return cached
 
-        resp = await self._model.provider._acomplete_raw(req)
+        if guard is None:
+            resp = await self._model.provider._acomplete_raw(req)
+        else:
+            try:
+                resp = await self._aguarded_complete(req, guard)
+            except RepetitionLoopError:
+                if guard_snap is not None:
+                    self.rollback(guard_snap)
+                raise
         self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
@@ -534,6 +658,7 @@ class Conversation:
         *,
         tool_choice: str | None = None,
         stop: list[str] | None = None,
+        repetition_detection: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -568,7 +693,9 @@ class Conversation:
             beta_headers=beta_headers,
             tool_choice=tool_choice,
         )
+        guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
+        guard_snap = self.snapshot() if guard is not None else None
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
@@ -591,13 +718,18 @@ class Conversation:
         tool_calls: list[ToolCall] = []
         last_usage = None
         last_finish_reason: str | None = None
+        repetition_detail: str | None = None
+        chars_since_check = 0
+        stream_iter = self._model.provider._stream_raw(req)
         # Use try/finally so a consumer that breaks out of the iterator early
         # (break, exception, generator close) still gets the partial assistant
         # turn appended to history. Otherwise the user message recorded above
         # would be left dangling with no reply, breaking strict role
-        # alternation on the next call.
+        # alternation on the next call. The repetition-abort branch is the
+        # exception: it discards the partial and rolls the convo back, then
+        # raises after the finally.
         try:
-            for ev in self._model.provider._stream_raw(req):
+            for ev in stream_iter:
                 if ev.text_delta:
                     text_buf.append(ev.text_delta)
                 if ev.thinking_block is not None:
@@ -609,13 +741,40 @@ class Conversation:
                 if ev.finish_reason is not None:
                     last_finish_reason = ev.finish_reason
                 yield ev
+                if guard is not None:
+                    if ev.text_delta:
+                        chars_since_check += len(ev.text_delta)
+                    if ev.tool_call_delta:
+                        chars_since_check += guard.check_every
+                    if chars_since_check >= guard.check_every:
+                        chars_since_check = 0
+                        repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
+                        if repetition_detail:
+                            break
+            else:
+                # Natural completion: flush a final check so a short-but-complete
+                # loop that never crossed the cadence is still caught.
+                if guard is not None and chars_since_check > 0:
+                    repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
         finally:
-            self._record_turn_boundary(last_usage, msg_count_at_send)
-            resp = self._finalize_stream(
-                req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
+            if repetition_detail is not None:
+                _close_stream(stream_iter)
+                if guard_snap is not None:
+                    self.rollback(guard_snap)
+            else:
+                self._record_turn_boundary(last_usage, msg_count_at_send)
+                resp = self._finalize_stream(
+                    req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
+                )
+                if resp is not None:
+                    self._cache_store(cache_key, cache_fp, resp)
+                _close_stream(stream_iter)
+        if repetition_detail is not None:
+            raise RepetitionLoopError(
+                repetition_detail,
+                attempts=1,
+                partial_text=_detection_text(text_buf, tool_calls),
             )
-            if resp is not None:
-                self._cache_store(cache_key, cache_fp, resp)
 
     async def astream(
         self,
@@ -623,6 +782,7 @@ class Conversation:
         *,
         tool_choice: str | None = None,
         stop: list[str] | None = None,
+        repetition_detection: Any | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -657,7 +817,9 @@ class Conversation:
             beta_headers=beta_headers,
             tool_choice=tool_choice,
         )
+        guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
+        guard_snap = self.snapshot() if guard is not None else None
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
@@ -681,8 +843,11 @@ class Conversation:
         tool_calls: list[ToolCall] = []
         last_usage = None
         last_finish_reason: str | None = None
+        repetition_detail: str | None = None
+        chars_since_check = 0
+        stream_iter = self._model.provider._astream_raw(req)
         try:
-            async for ev in self._model.provider._astream_raw(req):
+            async for ev in stream_iter:
                 if ev.text_delta:
                     text_buf.append(ev.text_delta)
                 if ev.thinking_block is not None:
@@ -694,13 +859,40 @@ class Conversation:
                 if ev.finish_reason is not None:
                     last_finish_reason = ev.finish_reason
                 yield ev
+                if guard is not None:
+                    if ev.text_delta:
+                        chars_since_check += len(ev.text_delta)
+                    if ev.tool_call_delta:
+                        chars_since_check += guard.check_every
+                    if chars_since_check >= guard.check_every:
+                        chars_since_check = 0
+                        repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
+                        if repetition_detail:
+                            break
+            else:
+                # Natural completion: flush a final check so a short-but-complete
+                # loop that never crossed the cadence is still caught.
+                if guard is not None and chars_since_check > 0:
+                    repetition_detail = _detect_in_buffers(text_buf, tool_calls, guard)
         finally:
-            self._record_turn_boundary(last_usage, msg_count_at_send)
-            resp = self._finalize_stream(
-                req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
+            if repetition_detail is not None:
+                await _aclose_stream(stream_iter)
+                if guard_snap is not None:
+                    self.rollback(guard_snap)
+            else:
+                self._record_turn_boundary(last_usage, msg_count_at_send)
+                resp = self._finalize_stream(
+                    req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
+                )
+                if resp is not None:
+                    self._cache_store(cache_key, cache_fp, resp)
+                await _aclose_stream(stream_iter)
+        if repetition_detail is not None:
+            raise RepetitionLoopError(
+                repetition_detail,
+                attempts=1,
+                partial_text=_detection_text(text_buf, tool_calls),
             )
-            if resp is not None:
-                self._cache_store(cache_key, cache_fp, resp)
 
     # ---- llama-server slot save/restore (external mode only) -------------
 
@@ -914,6 +1106,195 @@ class Conversation:
         )
         self._log_response(req, resp)
         return resp
+
+    # ---- repetition-loop guard -------------------------------------------
+
+    def _effective_guard(self, per_call: Any) -> RepetitionGuard | None:
+        """Resolve the active ``RepetitionGuard`` for a send/stream call.
+
+        A per-call ``repetition_detection`` value (anything but ``None``)
+        overrides the convo-resolved default; ``None`` defers to it."""
+        if per_call is None:
+            return self._repetition_guard
+        return coerce_repetition_guard(per_call)
+
+    def _guarded_complete(self, req: CompletionRequest, guard: RepetitionGuard) -> Response:
+        """Run ``req`` under the repetition guard and return the first attempt
+        that does not loop. Drives the provider's stream hook so a loop is
+        caught mid-generation; on a hit, discards the attempt and restarts with
+        escalated anti-repetition samplers, up to ``guard.retries`` times. Does
+        not touch history — the caller appends the returned ``Response``."""
+        attempts = guard.retries + 1
+        last_detail: str | None = None
+        last_buffers: _StreamBuffers | None = None
+        for attempt in range(attempts):
+            attempt_req = self._escalated_request(req, guard, attempt)
+            detail, buffers = self._drive_guarded_stream(attempt_req, guard)
+            if detail is None:
+                return self._build_response_from_stream(req, buffers)
+            last_detail, last_buffers = detail, buffers
+        if guard.on_exhausted == "return_last" and last_buffers is not None:
+            return self._build_response_from_stream(req, last_buffers)
+        raise RepetitionLoopError(
+            last_detail or "repetition loop",
+            attempts=attempts,
+            partial_text=(
+                _detection_text(last_buffers.text, last_buffers.tool_calls)
+                if last_buffers is not None
+                else ""
+            ),
+        )
+
+    async def _aguarded_complete(self, req: CompletionRequest, guard: RepetitionGuard) -> Response:
+        """Async equivalent of ``_guarded_complete``."""
+        attempts = guard.retries + 1
+        last_detail: str | None = None
+        last_buffers: _StreamBuffers | None = None
+        for attempt in range(attempts):
+            attempt_req = self._escalated_request(req, guard, attempt)
+            detail, buffers = await self._adrive_guarded_stream(attempt_req, guard)
+            if detail is None:
+                return self._build_response_from_stream(req, buffers)
+            last_detail, last_buffers = detail, buffers
+        if guard.on_exhausted == "return_last" and last_buffers is not None:
+            return self._build_response_from_stream(req, last_buffers)
+        raise RepetitionLoopError(
+            last_detail or "repetition loop",
+            attempts=attempts,
+            partial_text=(
+                _detection_text(last_buffers.text, last_buffers.tool_calls)
+                if last_buffers is not None
+                else ""
+            ),
+        )
+
+    def _drive_guarded_stream(
+        self, req: CompletionRequest, guard: RepetitionGuard
+    ) -> tuple[str | None, _StreamBuffers]:
+        """Consume one provider stream, running the detector every
+        ``guard.check_every`` chars. Returns ``(hit_detail_or_None, buffers)``;
+        a non-None detail means a loop was detected and the stream was aborted."""
+        buf = _StreamBuffers()
+        chars_since_check = 0
+        detail: str | None = None
+        stream_iter = self._model.provider._stream_raw(req)
+        try:
+            for ev in stream_iter:
+                buf.absorb(ev)
+                if ev.text_delta:
+                    chars_since_check += len(ev.text_delta)
+                if ev.tool_call_delta:
+                    chars_since_check += guard.check_every
+                if chars_since_check >= guard.check_every:
+                    chars_since_check = 0
+                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
+                    if detail:
+                        break
+            else:
+                # Stream ended naturally without crossing the cadence on its
+                # last bytes: flush one final check so a short-but-complete
+                # loop (e.g. a model that repeats a brief phrase then hits a
+                # low max_tokens) isn't missed.
+                if chars_since_check > 0:
+                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
+        finally:
+            _close_stream(stream_iter)
+        return detail, buf
+
+    async def _adrive_guarded_stream(
+        self, req: CompletionRequest, guard: RepetitionGuard
+    ) -> tuple[str | None, _StreamBuffers]:
+        """Async equivalent of ``_drive_guarded_stream``."""
+        buf = _StreamBuffers()
+        chars_since_check = 0
+        detail: str | None = None
+        stream_iter = self._model.provider._astream_raw(req)
+        try:
+            async for ev in stream_iter:
+                buf.absorb(ev)
+                if ev.text_delta:
+                    chars_since_check += len(ev.text_delta)
+                if ev.tool_call_delta:
+                    chars_since_check += guard.check_every
+                if chars_since_check >= guard.check_every:
+                    chars_since_check = 0
+                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
+                    if detail:
+                        break
+            else:
+                if chars_since_check > 0:
+                    detail = _detect_in_buffers(buf.text, buf.tool_calls, guard)
+        finally:
+            await _aclose_stream(stream_iter)
+        return detail, buf
+
+    def _build_response_from_stream(self, req: CompletionRequest, buf: _StreamBuffers) -> Response:
+        """Assemble a ``Response`` from stream buffers without touching history
+        (the guarded send appends it itself, after caching). Mirrors the block
+        ordering of ``_finalize_stream``."""
+        blocks: list[ContentBlock] = list(buf.thinking_blocks)
+        text = "".join(buf.text)
+        if buf.text:
+            blocks.append(TextBlock(text))
+        for call in buf.tool_calls:
+            blocks.append(
+                ToolUseBlock(
+                    id=call.id,
+                    name=call.name,
+                    input=call.input,
+                    raw_arguments=call.raw_arguments,
+                )
+            )
+        thinking_text = "".join(b.text for b in buf.thinking_blocks if not b.encrypted) or None
+        return Response(
+            text=text,
+            blocks=blocks,
+            tool_calls=list(buf.tool_calls),
+            thinking=thinking_text,
+            usage=buf.usage,
+            finish_reason=buf.finish_reason,
+            model=req.model,
+        )
+
+    def _escalated_request(
+        self, req: CompletionRequest, guard: RepetitionGuard, attempt: int
+    ) -> CompletionRequest:
+        """Return ``req`` for the first attempt, or a copy with anti-repetition
+        samplers nudged up for a retry. Escalation only touches knobs the model
+        actually supports, so it is a no-op on providers without
+        ``repeat_penalty`` / ``dry`` (e.g. hosted APIs)."""
+        if attempt == 0:
+            return req
+        new_settings = self._escalate_settings(req.settings, guard, attempt)
+        if new_settings is req.settings:
+            return req
+        return dataclasses.replace(req, settings=new_settings)
+
+    def _escalate_settings(
+        self, settings: dict[str, Any], guard: RepetitionGuard, attempt: int
+    ) -> dict[str, Any]:
+        supports = self._model._supports
+        out = dict(settings)
+        changed = False
+        if guard.escalate_repeat_penalty is not None and "repeat_penalty" in supports:
+            base = out.get("repeat_penalty")
+            # 1.0 is llama.cpp's neutral repeat_penalty (no penalty); escalate
+            # upward from there when no numeric value is already in effect.
+            base = base if isinstance(base, (int, float)) and not isinstance(base, bool) else 1.0
+            out["repeat_penalty"] = round(base + guard.escalate_repeat_penalty * attempt, 4)
+            changed = True
+        if guard.escalate_dry and "dry" in supports:
+            existing = out.get("dry")
+            base_mult = existing.multiplier if isinstance(existing, DrySampler) else 0.0
+            new_mult = round(base_mult + _DRY_ESCALATION_STEP * attempt, 4)
+            if new_mult > 0:
+                out["dry"] = (
+                    dataclasses.replace(existing, multiplier=new_mult)
+                    if isinstance(existing, DrySampler)
+                    else DrySampler(multiplier=new_mult)
+                )
+                changed = True
+        return out if changed else settings
 
     # ---- response cache --------------------------------------------------
 
