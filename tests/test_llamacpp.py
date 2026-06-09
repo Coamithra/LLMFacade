@@ -332,6 +332,28 @@ def test_complete_truncated_tool_call_preserves_raw_arguments(
     assert tool_blocks[0].raw_arguments == truncated
 
 
+def test_complete_empty_choices_raises_provider_error(
+    monkeypatch, provider: LlamaCppServerProvider
+):
+    """A 200 with an empty choices list (a known OpenAI-compat quirk) must
+    surface as ProviderError, not bare IndexError — _parse_response runs
+    outside the SDK-error try/except in _complete_raw."""
+    fake = _FakeResponse(model="qwen2.5")
+    fake.choices = []
+    monkeypatch.setattr(provider._client.chat.completions, "create", lambda **_kw: fake)
+    with pytest.raises(ProviderError, match="no choices"):
+        provider._complete_raw(_req())
+
+
+def test_parse_response_none_choices_raises_provider_error(
+    provider: LlamaCppServerProvider,
+):
+    from types import SimpleNamespace
+
+    with pytest.raises(ProviderError, match="no choices"):
+        provider._parse_response(SimpleNamespace(choices=None))
+
+
 # ---- reasoning capture ----------------------------------------------------
 
 
@@ -1722,6 +1744,42 @@ async def test_managed_asave_slot_routes_through_upstream(
     ]
 
 
+def test_unload_url_quotes_slashed_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slashed author/model-style id must be %2F-escaped in the unload URL,
+    matching _resolve_introspection_target — unquoted it parses as extra path
+    segments, 404s, and masquerades as 'llama-swap not detected'."""
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    p.unload("Qwen/Qwen2.5-3B")
+    assert p._http.calls == [
+        {
+            "method": "POST",
+            "path": "/api/models/unload/Qwen%2FQwen2.5-3B",
+            "params": None,
+            "json": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_aunload_url_quotes_slashed_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    await p.aunload("Qwen/Qwen2.5-3B")
+    assert p._ahttp.calls[0]["path"] == "/api/models/unload/Qwen%2FQwen2.5-3B"
+
+
+def test_unload_plain_model_id_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    p.unload("qwen-fast")
+    assert p._http.calls[0]["path"] == "/api/models/unload/qwen-fast"
+
+
 @pytest.mark.asyncio
 async def test_model_aslots_passes_model_id_to_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1746,6 +1804,102 @@ async def test_model_ahealth_against_non_llamacpp_provider_raises_unsupported() 
     m = Model(provider=fake_provider, model_id="x")  # type: ignore[arg-type]
     with pytest.raises(UnsupportedFeature, match="ahealth"):
         await m.ahealth()
+
+
+# ---- async paths offload _ensure_supervised off the event loop ------------
+#
+# _ensure_supervised is fully synchronous (threading.Lock + subprocess spawn +
+# sleep-polling readiness in _swap_lifecycle); the async surfaces must run it
+# via asyncio.to_thread so the first managed-mode async call doesn't block the
+# event loop for seconds. The internal lock makes the cross-thread call safe.
+
+
+class _AsyncIterStream:
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = list(chunks)
+
+    def __aiter__(self) -> _AsyncIterStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_acomplete_runs_ensure_supervised_off_the_loop(
+    monkeypatch, provider: LlamaCppServerProvider
+) -> None:
+    import threading
+
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        provider,
+        "_ensure_supervised",
+        lambda: seen.setdefault("thread", threading.current_thread()),
+    )
+
+    async def fake_create(**_kw: Any) -> _FakeResponse:
+        return _FakeResponse(content="hi")
+
+    monkeypatch.setattr(provider._aclient.chat.completions, "create", fake_create)
+    resp = await provider._acomplete_raw(_req())
+    assert resp.text == "hi"
+    assert seen["thread"] is not threading.current_thread()
+
+
+@pytest.mark.asyncio
+async def test_astream_runs_ensure_supervised_off_the_loop(
+    monkeypatch, provider: LlamaCppServerProvider
+) -> None:
+    import threading
+
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        provider,
+        "_ensure_supervised",
+        lambda: seen.setdefault("thread", threading.current_thread()),
+    )
+    chunks = [
+        _FakeStreamChunk(choices=[_FakeStreamChoice(delta=_FakeDelta(content="hi"))]),
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(), finish_reason="stop")],
+            usage=_FakeUsage(prompt=5, completion=2),
+        ),
+    ]
+
+    async def fake_create(**_kw: Any) -> _AsyncIterStream:
+        return _AsyncIterStream(chunks)
+
+    monkeypatch.setattr(provider._aclient.chat.completions, "create", fake_create)
+    events = [e async for e in provider._astream_raw(_req())]
+    assert any(e.text_delta == "hi" for e in events)
+    assert seen["thread"] is not threading.current_thread()
+
+
+@pytest.mark.asyncio
+async def test_async_introspection_awaits_ensure_supervised_via_to_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spy on asyncio.to_thread: the async introspection wrappers must route
+    _ensure_supervised through it (delegating so behaviour is unchanged)."""
+    import asyncio as _asyncio
+
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "m")
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body={"status": "ok"}))
+
+    offloaded: list[Any] = []
+    orig_to_thread = _asyncio.to_thread
+
+    async def spy(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        offloaded.append(fn)
+        return await orig_to_thread(fn, *args, **kwargs)
+
+    monkeypatch.setattr(_asyncio, "to_thread", spy)
+    await p.ahealth(model="m")
+    await p.aunload("m")
+    assert offloaded.count(p._ensure_supervised) == 2
 
 
 # ---- mmproj_path (managed-mode vision launch knob) -----------------------
