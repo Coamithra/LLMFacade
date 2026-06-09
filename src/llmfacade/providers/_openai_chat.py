@@ -160,13 +160,14 @@ def message_to_api(m: Message, *, provider_label: str) -> list[dict[str, Any]]:
         else:
             if has_image:
                 # stacklevel walks out of the shared helper to the provider's
-                # request-entry frame: message_to_api -> provider._message_to_api
-                # -> chat_messages -> _build_kwargs -> _complete_raw/_stream_raw.
+                # request-entry frame: message_to_api (1) -> provider's
+                # _message_to_api (2) -> chat_messages (3) -> _build_kwargs (4)
+                # -> _complete_raw/_stream_raw (5).
                 warnings.warn(
                     f"{provider_label}: dropping image block(s) on {m.role!r} "
                     f"message; the Chat Completions API only accepts images on "
                     f"user messages.",
-                    stacklevel=6,
+                    stacklevel=5,
                 )
             out["content"] = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
     else:
