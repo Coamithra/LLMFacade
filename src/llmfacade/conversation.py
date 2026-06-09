@@ -1352,8 +1352,9 @@ class Conversation:
         as normal."""
         if self._cache is None:
             return None, None, None
-        provider_name = self._model.provider.NAME
-        fp = fingerprint_request(req, provider_name)
+        provider = self._model.provider
+        provider_name = provider.NAME
+        fp = fingerprint_request(req, provider_name, base_url=provider._base_url)
         key = hash_fingerprint(fp)
         cached = self._cache.get(provider_name, self._model.model_id, key)
         if cached is not None:
