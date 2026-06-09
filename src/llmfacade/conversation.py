@@ -177,6 +177,10 @@ class _StreamBuffers:
     thinking_text: list[str] = field(default_factory=list)
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # Streamed tool-call argument fragments per tool-call index, scanned by
+    # the repetition detector (never used for history-building — the terminal
+    # tool_call_delta stays the source of truth there).
+    tool_args: dict[int, list[str]] = field(default_factory=dict)
     usage: Any = None
     finish_reason: str | None = None
 
@@ -189,6 +193,10 @@ class _StreamBuffers:
             self.thinking_blocks.append(ev.thinking_block)
         if ev.tool_call_delta:
             self.tool_calls.append(ev.tool_call_delta)
+        if ev.tool_args_delta is not None:
+            self.tool_args.setdefault(ev.tool_args_delta.index, []).append(
+                ev.tool_args_delta.fragment
+            )
         if ev.usage is not None:
             self.usage = ev.usage
         if ev.finish_reason is not None:
@@ -196,7 +204,10 @@ class _StreamBuffers:
 
 
 def _detection_text(
-    thinking_buf: list[str], text_buf: list[str], tool_calls: list[ToolCall]
+    thinking_buf: list[str],
+    text_buf: list[str],
+    tool_calls: list[ToolCall],
+    tool_args: dict[int, list[str]] | None = None,
 ) -> str:
     """Build the buffer the repetition detector scans: the model's reasoning /
     thinking stream, then assistant text, then any streamed tool-call arguments
@@ -208,13 +219,30 @@ def _detection_text(
     reasoning sits as a harmless prefix. Reasoning is accumulated from the
     token-by-token ``thinking_delta`` events, never the consolidated
     ``thinking_block`` (which arrives all-at-once only after the loop has
-    already happened and would double-count the deltas)."""
+    already happened and would double-count the deltas).
+
+    ``tool_args`` carries the live ``tool_args_delta`` fragments per tool-call
+    index, so an in-flight argument loop is scanned before the terminal
+    ``tool_call_delta`` exists. A call whose fragments were streamed uses
+    those fragments *instead of* the terminal call's arguments (they are the
+    same string — adding both would double-count); a call with no fragments
+    (e.g. Google, which emits none) falls back to the terminal call's raw or
+    parsed args as before."""
     parts = list(thinking_buf) + list(text_buf)
-    for tc in tool_calls:
-        if tc.raw_arguments:
+    tool_args = tool_args or {}
+    for i, tc in enumerate(tool_calls):
+        frags = tool_args.get(i)
+        if frags:
+            parts.append("".join(frags))
+        elif tc.raw_arguments:
             parts.append(tc.raw_arguments)
         elif tc.input:
             parts.append(json.dumps(tc.input, default=str, sort_keys=True))
+    # In-flight calls: fragments streamed for an index whose terminal
+    # tool_call_delta has not arrived yet.
+    for i in sorted(tool_args):
+        if i >= len(tool_calls):
+            parts.append("".join(tool_args[i]))
     return "".join(parts)
 
 
@@ -227,10 +255,11 @@ def _detect_in_buffers(
     thinking_buf: list[str],
     text_buf: list[str],
     tool_calls: list[ToolCall],
+    tool_args: dict[int, list[str]],
     guard: RepetitionGuard,
 ) -> str | None:
     return detect_repetition_loop(
-        _detection_text(thinking_buf, text_buf, tool_calls),
+        _detection_text(thinking_buf, text_buf, tool_calls, tool_args),
         tail_chars=guard.tail_chars,
         max_period=guard.max_period,
         min_reps_floor=guard.min_reps_floor,
@@ -748,6 +777,7 @@ class Conversation:
         thinking_buf: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
+        tool_args_frags: dict[int, list[str]] = {}
         last_usage = None
         last_finish_reason: str | None = None
         repetition_detail: str | None = None
@@ -781,12 +811,17 @@ class Conversation:
                         chars_since_check += len(ev.text_delta)
                     if ev.thinking_delta:
                         chars_since_check += len(ev.thinking_delta)
+                    if ev.tool_args_delta is not None:
+                        tool_args_frags.setdefault(ev.tool_args_delta.index, []).append(
+                            ev.tool_args_delta.fragment
+                        )
+                        chars_since_check += len(ev.tool_args_delta.fragment)
                     if ev.tool_call_delta:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
                         repetition_detail = _detect_in_buffers(
-                            thinking_buf, text_buf, tool_calls, guard
+                            thinking_buf, text_buf, tool_calls, tool_args_frags, guard
                         )
                         if repetition_detail:
                             break
@@ -796,7 +831,7 @@ class Conversation:
                 completed = True
                 if guard is not None and chars_since_check > 0:
                     repetition_detail = _detect_in_buffers(
-                        thinking_buf, text_buf, tool_calls, guard
+                        thinking_buf, text_buf, tool_calls, tool_args_frags, guard
                     )
         finally:
             if repetition_detail is not None:
@@ -818,7 +853,7 @@ class Conversation:
             raise RepetitionLoopError(
                 repetition_detail,
                 attempts=1,
-                partial_text=_detection_text(thinking_buf, text_buf, tool_calls),
+                partial_text=_detection_text(thinking_buf, text_buf, tool_calls, tool_args_frags),
             )
 
     async def astream(
@@ -891,6 +926,7 @@ class Conversation:
         thinking_buf: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
+        tool_args_frags: dict[int, list[str]] = {}
         last_usage = None
         last_finish_reason: str | None = None
         repetition_detail: str | None = None
@@ -917,12 +953,17 @@ class Conversation:
                         chars_since_check += len(ev.text_delta)
                     if ev.thinking_delta:
                         chars_since_check += len(ev.thinking_delta)
+                    if ev.tool_args_delta is not None:
+                        tool_args_frags.setdefault(ev.tool_args_delta.index, []).append(
+                            ev.tool_args_delta.fragment
+                        )
+                        chars_since_check += len(ev.tool_args_delta.fragment)
                     if ev.tool_call_delta:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
                         repetition_detail = _detect_in_buffers(
-                            thinking_buf, text_buf, tool_calls, guard
+                            thinking_buf, text_buf, tool_calls, tool_args_frags, guard
                         )
                         if repetition_detail:
                             break
@@ -932,7 +973,7 @@ class Conversation:
                 completed = True
                 if guard is not None and chars_since_check > 0:
                     repetition_detail = _detect_in_buffers(
-                        thinking_buf, text_buf, tool_calls, guard
+                        thinking_buf, text_buf, tool_calls, tool_args_frags, guard
                     )
         finally:
             if repetition_detail is not None:
@@ -952,7 +993,7 @@ class Conversation:
             raise RepetitionLoopError(
                 repetition_detail,
                 attempts=1,
-                partial_text=_detection_text(thinking_buf, text_buf, tool_calls),
+                partial_text=_detection_text(thinking_buf, text_buf, tool_calls, tool_args_frags),
             )
 
     # ---- llama-server slot save/restore (external mode only) -------------
@@ -1201,7 +1242,10 @@ class Conversation:
             attempts=attempts,
             partial_text=(
                 _detection_text(
-                    last_buffers.thinking_text, last_buffers.text, last_buffers.tool_calls
+                    last_buffers.thinking_text,
+                    last_buffers.text,
+                    last_buffers.tool_calls,
+                    last_buffers.tool_args,
                 )
                 if last_buffers is not None
                 else ""
@@ -1226,7 +1270,10 @@ class Conversation:
             attempts=attempts,
             partial_text=(
                 _detection_text(
-                    last_buffers.thinking_text, last_buffers.text, last_buffers.tool_calls
+                    last_buffers.thinking_text,
+                    last_buffers.text,
+                    last_buffers.tool_calls,
+                    last_buffers.tool_args,
                 )
                 if last_buffers is not None
                 else ""
@@ -1250,11 +1297,15 @@ class Conversation:
                     chars_since_check += len(ev.text_delta)
                 if ev.thinking_delta:
                     chars_since_check += len(ev.thinking_delta)
+                if ev.tool_args_delta is not None:
+                    chars_since_check += len(ev.tool_args_delta.fragment)
                 if ev.tool_call_delta:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(
+                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
+                    )
                     if detail:
                         break
             else:
@@ -1263,7 +1314,9 @@ class Conversation:
                 # loop (e.g. a model that repeats a brief phrase then hits a
                 # low max_tokens) isn't missed.
                 if chars_since_check > 0:
-                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(
+                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
+                    )
         finally:
             _close_stream(stream_iter)
         return detail, buf
@@ -1283,16 +1336,22 @@ class Conversation:
                     chars_since_check += len(ev.text_delta)
                 if ev.thinking_delta:
                     chars_since_check += len(ev.thinking_delta)
+                if ev.tool_args_delta is not None:
+                    chars_since_check += len(ev.tool_args_delta.fragment)
                 if ev.tool_call_delta:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(
+                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
+                    )
                     if detail:
                         break
             else:
                 if chars_since_check > 0:
-                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(
+                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
+                    )
         finally:
             await _aclose_stream(stream_iter)
         return detail, buf
