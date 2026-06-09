@@ -12,6 +12,7 @@ from llmfacade.exceptions import (
     ProviderNotInstalledError,
     RateLimitError,
 )
+from llmfacade.helpers import flatten_text_blocks
 from llmfacade.models import (
     ContentBlock,
     ImageBlock,
@@ -279,7 +280,9 @@ class GoogleProvider(Provider):
             blocks = m.content if isinstance(m.content, list) else []
             for b in blocks:
                 if isinstance(b, ToolResultBlock):
-                    text = b.content if isinstance(b.content, str) else ""
+                    text = (
+                        b.content if isinstance(b.content, str) else flatten_text_blocks(b.content)
+                    )
                     fn_name = b.name or (
                         (tool_id_to_name or {}).get(b.tool_use_id) or b.tool_use_id
                     )
@@ -573,9 +576,21 @@ class GoogleProvider(Provider):
         )
 
     def _reraise(self, e: Exception) -> None:
-        err_name = type(e).__name__.lower()
-        if "authentication" in err_name or "permission" in err_name:
+        # google-genai raises APIError/ClientError/ServerError, whose type names
+        # carry no auth/rate keywords — classify on the structured fields the SDK
+        # exposes (APIError.code is the HTTP status, APIError.status is the
+        # gRPC-style status string). getattr-defensive so any exception works.
+        code = getattr(e, "code", None)
+        status = str(getattr(e, "status", None) or "").upper()
+        if code in (401, 403) or status in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
             raise AuthenticationError(str(e)) from e
-        if "resource_exhausted" in err_name or "rate" in err_name:
+        if code == 429 or status == "RESOURCE_EXHAUSTED":
             raise RateLimitError(str(e)) from e
+        if code is None and status == "":
+            # Non-APIError exception: fall back to message keywords.
+            msg = str(e).lower()
+            if "unauthenticated" in msg or "permission" in msg or "api key" in msg:
+                raise AuthenticationError(str(e)) from e
+            if "resource_exhausted" in msg or "rate limit" in msg or "quota" in msg:
+                raise RateLimitError(str(e)) from e
         raise ProviderError(str(e), original=e) from e
