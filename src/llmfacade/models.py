@@ -274,13 +274,19 @@ class ImageResult:
     def save(self, dest: str | Path, *, prefix: str = "image") -> list[Path]:
         """Write each image into directory ``dest`` as ``<prefix>_<i><ext>``
         (extension derived from the block's ``media_type``, defaulting to
-        ``.png``). Creates ``dest`` if needed. Returns the written paths."""
+        ``.png``). Creates ``dest`` if needed. Never overwrites: indexing
+        starts at the first contiguous block of free names, so a second save
+        into the same directory continues numbering after the first instead
+        of clobbering it. Returns the written paths."""
         d = Path(dest)
         d.mkdir(parents=True, exist_ok=True)
+        exts = [_EXT_BY_MEDIA_TYPE.get(block.media_type, ".png") for block in self.images]
+        start = 0
+        while any((d / f"{prefix}_{start + i}{ext}").exists() for i, ext in enumerate(exts)):
+            start += 1
         written: list[Path] = []
-        for i, block in enumerate(self.images):
-            ext = _EXT_BY_MEDIA_TYPE.get(block.media_type, ".png")
-            path = d / f"{prefix}_{i}{ext}"
+        for i, (block, ext) in enumerate(zip(self.images, exts, strict=True)):
+            path = d / f"{prefix}_{start + i}{ext}"
             path.write_bytes(block.data)
             written.append(path)
         return written
