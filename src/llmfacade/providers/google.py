@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 import warnings
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,7 @@ from llmfacade.models import (
     ImageResult,
     ImageUsage,
     Message,
+    ReferenceImage,
     Response,
     StreamEvent,
     TextBlock,
@@ -27,6 +28,7 @@ from llmfacade.models import (
     ToolUseBlock,
     Usage,
     _apply_save_dir,
+    normalize_reference_images,
 )
 from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.settings import OutputFormat
@@ -397,11 +399,27 @@ class GoogleProvider(Provider):
     _DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"
 
     def _image_contents(
-        self, prompt: str, reference_images: list[ImageBlock] | None
+        self, prompt: str, reference_images: Sequence[ReferenceImage] | None
     ) -> list[dict[str, Any]]:
-        parts: list[dict[str, Any]] = [{"text": prompt}]
-        for b in reference_images or []:
-            parts.append({"inline_data": {"mime_type": b.media_type, "data": b.to_base64()}})
+        pairs = normalize_reference_images(reference_images)
+
+        def inline(b: ImageBlock) -> dict[str, Any]:
+            return {"inline_data": {"mime_type": b.media_type, "data": b.to_base64()}}
+
+        if not any(label for label, _ in pairs):
+            # Unlabeled bag: keep the prompt-first shape (byte-for-byte back-compat).
+            parts: list[dict[str, Any]] = [{"text": prompt}]
+            parts.extend(inline(b) for _, b in pairs)
+            return [{"role": "user", "parts": parts}]
+
+        # Labeled: establish each identity (the label text part) before its image,
+        # then give the instruction last — true entity->image binding.
+        parts = []
+        for label, b in pairs:
+            if label:
+                parts.append({"text": label})
+            parts.append(inline(b))
+        parts.append({"text": prompt})
         return [{"role": "user", "parts": parts}]
 
     def _image_config(
@@ -479,7 +497,7 @@ class GoogleProvider(Provider):
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -515,7 +533,7 @@ class GoogleProvider(Provider):
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:

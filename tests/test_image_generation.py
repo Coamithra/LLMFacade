@@ -19,8 +19,10 @@ from llmfacade import (
     ImageModel,
     ImageResult,
     ImageUsage,
+    LabeledImage,
 )
 from llmfacade.exceptions import ProviderError, UnsupportedFeature
+from llmfacade.models import normalize_reference_images
 from llmfacade.providers.anthropic import AnthropicProvider
 from llmfacade.providers.google import GoogleProvider
 from llmfacade.providers.llamacpp import LlamaCppServerProvider
@@ -527,3 +529,105 @@ def test_llm_generate_image_local_passes_base_url():
         "flux cat", provider="localimage", model="flux", base_url="http://127.0.0.1:1234/v1"
     )
     assert built == [("localimage", {"base_url": "http://127.0.0.1:1234/v1"})]
+
+
+# ---- Labeled / interleaved reference images --------------------------------
+
+
+def test_normalize_reference_images_coerces_each_form():
+    a = ImageBlock(data=b"A", media_type="image/png")
+    b = ImageBlock(data=b"B", media_type="image/jpeg")
+    c = ImageBlock(data=b"C", media_type="image/png")
+
+    pairs = normalize_reference_images([a, LabeledImage("Bert", b), ("Cara", c)])
+
+    assert pairs == [(None, a), ("Bert", b), ("Cara", c)]
+
+
+def test_normalize_reference_images_none_and_empty():
+    assert normalize_reference_images(None) == []
+    assert normalize_reference_images([]) == []
+
+
+def test_normalize_reference_images_rejects_bad_item():
+    with pytest.raises(TypeError, match="ImageBlock, LabeledImage"):
+        normalize_reference_images(["not an image"])  # type: ignore[list-item]
+
+    with pytest.raises(TypeError):
+        # a (label, block) tuple with a non-str label is not accepted
+        normalize_reference_images([(1, ImageBlock(data=b"X", media_type="image/png"))])  # type: ignore[list-item]
+
+
+def test_google_labeled_references_interleaved():
+    provider = GoogleProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.models.generate_content.return_value = _gemini_image_response(b"OUT")
+
+    adam = ImageBlock(data=b"ADAM", media_type="image/png")
+    bert = ImageBlock(data=b"BERT", media_type="image/png")
+    provider.generate_image(
+        "draw Adam waving at Bert",
+        reference_images=[LabeledImage("This is Adam:", adam), ("This is Bert:", bert)],
+    )
+
+    parts = provider._client.models.generate_content.call_args.kwargs["contents"][0]["parts"]
+    # Each label text part precedes its image; the prompt is the final part.
+    assert parts[0] == {"text": "This is Adam:"}
+    assert base64.b64decode(parts[1]["inline_data"]["data"]) == b"ADAM"
+    assert parts[2] == {"text": "This is Bert:"}
+    assert base64.b64decode(parts[3]["inline_data"]["data"]) == b"BERT"
+    assert parts[4] == {"text": "draw Adam waving at Bert"}
+
+
+def test_google_unlabeled_references_unchanged():
+    """Back-compat: an unlabeled bag keeps the prompt-first shape."""
+    provider = GoogleProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.models.generate_content.return_value = _gemini_image_response(b"OUT")
+
+    provider.generate_image(
+        "same character, new pose",
+        reference_images=[ImageBlock(data=b"REF", media_type="image/png")],
+    )
+
+    parts = provider._client.models.generate_content.call_args.kwargs["contents"][0]["parts"]
+    assert parts[0] == {"text": "same character, new pose"}
+    assert base64.b64decode(parts[1]["inline_data"]["data"]) == b"REF"
+
+
+def test_openai_labeled_references_preamble():
+    provider = OpenAIProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.images.edit.return_value = _openai_image_response(b"EDITED")
+
+    adam = ImageBlock(data=b"ADAM", media_type="image/png")
+    bert = ImageBlock(data=b"BERT", media_type="image/png")
+    provider.generate_image(
+        "draw Adam waving at Bert",
+        model="gpt-image-1",
+        reference_images=[("Adam", adam), LabeledImage("Bert", bert)],
+    )
+
+    kwargs = provider._client.images.edit.call_args.kwargs
+    # Edit endpoint cannot interleave: labels degrade to an order-binding preamble.
+    assert kwargs["prompt"] == (
+        "Reference image 1 is Adam. Reference image 2 is Bert.\n\ndraw Adam waving at Bert"
+    )
+    # Images still upload in list order.
+    assert [content for _, content, _ in kwargs["image"]] == [b"ADAM", b"BERT"]
+
+
+def test_openai_tuple_shorthand_accepted():
+    provider = OpenAIProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.images.edit.return_value = _openai_image_response(b"E")
+
+    provider.generate_image(
+        "x",
+        model="gpt-image-1",
+        reference_images=[("Solo", ImageBlock(data=b"REF", media_type="image/png"))],
+    )
+
+    kwargs = provider._client.images.edit.call_args.kwargs
+    assert kwargs["prompt"].startswith("Reference image 1 is Solo.")
+    assert kwargs["image"][0][1] == b"REF"

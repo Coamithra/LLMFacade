@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json as _json
 import warnings
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,7 @@ from llmfacade.models import (
     ImageBlock,
     ImageResult,
     Message,
+    ReferenceImage,
     Response,
     StreamEvent,
     TextBlock,
@@ -485,7 +486,7 @@ class OpenAIProvider(Provider):
         quality: str | None,
         background: str | None,
         output_format: str | None,
-        reference_images: list[ImageBlock] | None,
+        reference_images: Sequence[ReferenceImage] | None,
         extra: dict[str, Any] | None,
     ) -> tuple[str, dict[str, Any]]:
         """Return ``("edit"|"generate", kwargs)``. Reference images route to the
@@ -524,7 +525,7 @@ class OpenAIProvider(Provider):
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -559,7 +560,7 @@ class OpenAIProvider(Provider):
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:

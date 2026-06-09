@@ -134,6 +134,31 @@ def test_image_log_reference_image_count(tmp_path):
 
     rec = _records(tmp_path)[0]
     assert rec["reference_images"] == 2  # a count, not the bytes
+    assert rec["reference_labels"] == []  # unlabeled bag -> no labels
+
+
+def test_image_log_records_reference_labels(tmp_path):
+    from llmfacade import LabeledImage
+
+    provider = _provider(tmp_path)
+
+    provider.generate_image(
+        "draw them together",
+        model="fake-image-1",
+        reference_images=[
+            LabeledImage("Adam", ImageBlock(data=b"REF1", media_type="image/png")),
+            ("Bert", ImageBlock(data=b"REF2", media_type="image/png")),
+        ],
+    )
+
+    rec = _records(tmp_path)[0]
+    assert rec["reference_images"] == 2
+    assert rec["reference_labels"] == ["Adam", "Bert"]
+
+    html_path = _ledger(tmp_path).with_suffix(".html")
+    html = html_path.read_text(encoding="utf-8")
+    assert "reference_labels" in html
+    assert "Adam, Bert" in html
 
 
 def test_image_log_async(tmp_path):
