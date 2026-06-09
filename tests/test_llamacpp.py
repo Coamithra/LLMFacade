@@ -2025,13 +2025,15 @@ def test_message_to_api_drops_image_block_on_assistant_role(
     """Assistant messages are flattened to text-only on the way out — the
     OpenAI-compat surface has no role for an assistant-emitted image, and
     propagating one would hand the model a malformed message on the next
-    turn. Locks the drop behaviour against accidental refactor."""
+    turn. The drop warns (aligned with the OpenAI provider via the shared
+    `_openai_chat.message_to_api`; historically llamacpp dropped silently)."""
     from llmfacade import Message
     from llmfacade.models import ImageBlock, TextBlock
 
     img = ImageBlock(data=b"\x89PNG\r\n\x1a\nignored", media_type="image/png")
     msg = Message(role="assistant", content=[TextBlock("here you go"), img])
-    api = provider._message_to_api(msg)
+    with pytest.warns(UserWarning, match="dropping image"):
+        api = provider._message_to_api(msg)
     assert len(api) == 1
     assert api[0]["content"] == "here you go"
     assert "image_url" not in str(api[0])
