@@ -620,10 +620,24 @@ class Conversation:
             resp = self._model.provider._complete_raw(req)
         else:
             try:
-                resp = self._guarded_complete(req, guard)
+                guarded_resp = self._guarded_complete(req, guard)
             except RepetitionLoopError:
                 self.rollback(pre_send_snap)
                 raise
+            if guarded_resp is None:
+                # Empty stream (no blocks at all): mirror stream()'s handling
+                # of a None from _finalize_stream — append nothing to history,
+                # cache nothing, and hand back an empty Response.
+                return Response(
+                    text="",
+                    blocks=[],
+                    tool_calls=[],
+                    thinking=None,
+                    usage=None,
+                    finish_reason=None,
+                    model=req.model,
+                )
+            resp = guarded_resp
         self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
@@ -696,10 +710,22 @@ class Conversation:
             resp = await self._model.provider._acomplete_raw(req)
         else:
             try:
-                resp = await self._aguarded_complete(req, guard)
+                guarded_resp = await self._aguarded_complete(req, guard)
             except RepetitionLoopError:
                 self.rollback(pre_send_snap)
                 raise
+            if guarded_resp is None:
+                # Empty stream: see the matching comment in ``send``.
+                return Response(
+                    text="",
+                    blocks=[],
+                    tool_calls=[],
+                    thinking=None,
+                    usage=None,
+                    finish_reason=None,
+                    model=req.model,
+                )
+            resp = guarded_resp
         self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
@@ -1220,12 +1246,15 @@ class Conversation:
             return self._repetition_guard
         return coerce_repetition_guard(per_call)
 
-    def _guarded_complete(self, req: CompletionRequest, guard: RepetitionGuard) -> Response:
+    def _guarded_complete(
+        self, req: CompletionRequest, guard: RepetitionGuard
+    ) -> Response | None:
         """Run ``req`` under the repetition guard and return the first attempt
         that does not loop. Drives the provider's stream hook so a loop is
         caught mid-generation; on a hit, discards the attempt and restarts with
         escalated anti-repetition samplers, up to ``guard.retries`` times. Does
-        not touch history — the caller appends the returned ``Response``."""
+        not touch history — the caller appends the returned ``Response``.
+        Returns ``None`` for an empty stream (no blocks produced)."""
         attempts = guard.retries + 1
         last_detail: str | None = None
         last_buffers: _StreamBuffers | None = None
@@ -1236,7 +1265,9 @@ class Conversation:
                 return self._build_response_from_stream(req, buffers)
             last_detail, last_buffers = detail, buffers
         if guard.on_exhausted == "return_last" and last_buffers is not None:
-            return self._build_response_from_stream(req, last_buffers)
+            resp = self._build_response_from_stream(req, last_buffers)
+            if resp is not None:
+                return resp
         raise RepetitionLoopError(
             last_detail or "repetition loop",
             attempts=attempts,
@@ -1252,7 +1283,9 @@ class Conversation:
             ),
         )
 
-    async def _aguarded_complete(self, req: CompletionRequest, guard: RepetitionGuard) -> Response:
+    async def _aguarded_complete(
+        self, req: CompletionRequest, guard: RepetitionGuard
+    ) -> Response | None:
         """Async equivalent of ``_guarded_complete``."""
         attempts = guard.retries + 1
         last_detail: str | None = None
@@ -1264,7 +1297,9 @@ class Conversation:
                 return self._build_response_from_stream(req, buffers)
             last_detail, last_buffers = detail, buffers
         if guard.on_exhausted == "return_last" and last_buffers is not None:
-            return self._build_response_from_stream(req, last_buffers)
+            resp = self._build_response_from_stream(req, last_buffers)
+            if resp is not None:
+                return resp
         raise RepetitionLoopError(
             last_detail or "repetition loop",
             attempts=attempts,
@@ -1356,10 +1391,14 @@ class Conversation:
             await _aclose_stream(stream_iter)
         return detail, buf
 
-    def _build_response_from_stream(self, req: CompletionRequest, buf: _StreamBuffers) -> Response:
+    def _build_response_from_stream(
+        self, req: CompletionRequest, buf: _StreamBuffers
+    ) -> Response | None:
         """Assemble a ``Response`` from stream buffers without touching history
         (the guarded send appends it itself, after caching). Mirrors the block
-        ordering of ``_finalize_stream``."""
+        ordering of ``_finalize_stream`` — including its empty-stream guard:
+        returns ``None`` when the stream produced no blocks at all, so an
+        empty assistant message never lands in history or the cache."""
         blocks: list[ContentBlock] = list(buf.thinking_blocks)
         text = "".join(buf.text)
         if buf.text:
@@ -1373,6 +1412,8 @@ class Conversation:
                     raw_arguments=call.raw_arguments,
                 )
             )
+        if not blocks:
+            return None
         thinking_text = "".join(b.text for b in buf.thinking_blocks if not b.encrypted) or None
         return Response(
             text=text,

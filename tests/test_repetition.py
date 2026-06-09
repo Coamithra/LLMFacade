@@ -430,6 +430,74 @@ def test_asend_catches_thinking_loop():
 
 
 # ---------------------------------------------------------------------------
+# Empty stream under the guard: no empty assistant message, no cache entry
+# ---------------------------------------------------------------------------
+
+
+class EmptyStreamProvider(Provider):
+    """Streams only a terminal done event — no blocks at all."""
+
+    NAME = "emptystream"
+    SUPPORTS = frozenset({"max_tokens", "temperature", "repeat_penalty", "dry", "tools"})
+
+    def _init_client(self) -> None:
+        self._client = object()
+
+    def _resolve_key(self, env_var: str) -> str:
+        del env_var
+        return "key"
+
+    _USAGE = Usage(prompt_tokens=5, completion_tokens=0, total_tokens=5)
+
+    def _complete_raw(self, req: CompletionRequest) -> Response:
+        raise AssertionError("guarded send must drive the stream hook")
+
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
+        raise AssertionError("guarded send must drive the stream hook")
+
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
+        yield StreamEvent(done=True, usage=self._USAGE, finish_reason="stop")
+
+    async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(done=True, usage=self._USAGE, finish_reason="stop")
+
+
+def test_guarded_send_empty_stream_appends_nothing(tmp_path):
+    p = EmptyStreamProvider()
+    convo = p.new_model("empty-model").new_conversation(
+        log_dir=False, cache_dir=tmp_path, repetition_detection=RepetitionGuard(retries=0)
+    )
+    resp = convo.send("hi")
+    assert resp.blocks == [] and resp.text == ""
+    # No empty assistant message in history (the next Anthropic send would 400)
+    # and no empty Response cached.
+    assert [m.role for m in convo.history] == ["user"]
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_guarded_asend_empty_stream_appends_nothing(tmp_path):
+    p = EmptyStreamProvider()
+    convo = p.new_model("empty-model").new_conversation(
+        log_dir=False, cache_dir=tmp_path, repetition_detection=RepetitionGuard(retries=0)
+    )
+    resp = asyncio.run(convo.asend("hi"))
+    assert resp.blocks == []
+    assert [m.role for m in convo.history] == ["user"]
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_stream_empty_stream_appends_nothing(tmp_path):
+    """The public stream() path already guards via _finalize_stream; pin the
+    behaviour the guarded send now mirrors."""
+    p = EmptyStreamProvider()
+    convo = p.new_model("empty-model").new_conversation(log_dir=False, cache_dir=tmp_path)
+    events = list(convo.stream("hi"))
+    assert events[-1].done is True
+    assert [m.role for m in convo.history] == ["user"]
+    assert not list(tmp_path.rglob("*.json"))
+
+
+# ---------------------------------------------------------------------------
 # Streamed tool-call argument fragments
 # ---------------------------------------------------------------------------
 
