@@ -737,6 +737,7 @@ class Conversation:
         last_finish_reason: str | None = None
         repetition_detail: str | None = None
         chars_since_check = 0
+        completed = False
         stream_iter = self._model.provider._stream_raw(req)
         # Use try/finally so a consumer that breaks out of the iterator early
         # (break, exception, generator close) still gets the partial assistant
@@ -777,6 +778,7 @@ class Conversation:
             else:
                 # Natural completion: flush a final check so a short-but-complete
                 # loop that never crossed the cadence is still caught.
+                completed = True
                 if guard is not None and chars_since_check > 0:
                     repetition_detail = _detect_in_buffers(
                         thinking_buf, text_buf, tool_calls, guard
@@ -791,7 +793,11 @@ class Conversation:
                 resp = self._finalize_stream(
                     req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
                 )
-                if resp is not None:
+                # Only a naturally exhausted stream may be cached: a consumer
+                # break or a mid-stream provider error lands here with partial
+                # buffers, and caching those would permanently serve a
+                # truncated Response for the full request fingerprint.
+                if resp is not None and completed:
                     self._cache_store(cache_key, cache_fp, resp)
                 _close_stream(stream_iter)
         if repetition_detail is not None:
@@ -871,6 +877,7 @@ class Conversation:
         last_finish_reason: str | None = None
         repetition_detail: str | None = None
         chars_since_check = 0
+        completed = False
         stream_iter = self._model.provider._astream_raw(req)
         try:
             async for ev in stream_iter:
@@ -904,6 +911,7 @@ class Conversation:
             else:
                 # Natural completion: flush a final check so a short-but-complete
                 # loop that never crossed the cadence is still caught.
+                completed = True
                 if guard is not None and chars_since_check > 0:
                     repetition_detail = _detect_in_buffers(
                         thinking_buf, text_buf, tool_calls, guard
@@ -918,7 +926,9 @@ class Conversation:
                 resp = self._finalize_stream(
                     req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
                 )
-                if resp is not None:
+                # Only a naturally exhausted stream may be cached — see the
+                # matching comment in ``stream``.
+                if resp is not None and completed:
                     self._cache_store(cache_key, cache_fp, resp)
                 await _aclose_stream(stream_iter)
         if repetition_detail is not None:
