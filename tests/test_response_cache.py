@@ -142,6 +142,35 @@ def test_hash_changes_with_provider_name(mock_model):
     )
 
 
+def test_hash_changes_with_base_url(mock_model):
+    convo = mock_model.new_conversation()
+    req = _build_req(convo)
+    h_a = hash_fingerprint(fingerprint_request(req, "mock", base_url="http://a:8080/v1"))
+    h_b = hash_fingerprint(fingerprint_request(req, "mock", base_url="http://b:8080/v1"))
+    h_default = hash_fingerprint(fingerprint_request(req, "mock"))
+    assert h_a != h_b  # different endpoints → different keys
+    assert h_a != h_default  # explicit endpoint vs default → different keys
+
+
+def test_hash_stable_for_default_base_url(mock_model):
+    convo = mock_model.new_conversation()
+    req = _build_req(convo)
+    assert hash_fingerprint(fingerprint_request(req, "mock")) == hash_fingerprint(
+        fingerprint_request(req, "mock", base_url=None)
+    )
+
+
+def test_hash_changes_with_provider_base_url():
+    """Two provider instances differing only in base_url fingerprint differently."""
+    p_a = MockProvider(base_url="http://a:8080/v1")
+    p_b = MockProvider(base_url="http://b:8080/v1")
+    req_a = _build_req(p_a.new_model("alias").new_conversation())
+    req_b = _build_req(p_b.new_model("alias").new_conversation())
+    h_a = hash_fingerprint(fingerprint_request(req_a, p_a.NAME, base_url=p_a._base_url))
+    h_b = hash_fingerprint(fingerprint_request(req_b, p_b.NAME, base_url=p_b._base_url))
+    assert h_a != h_b
+
+
 def test_hash_changes_with_image_bytes(mock_model):
     convo_a = mock_model.new_conversation()
     convo_b = mock_model.new_conversation()
@@ -204,6 +233,29 @@ def test_send_miss_when_prompt_changes(tmp_path):
     c2 = model.new_conversation(cache_dir=tmp_path)
     c2.send("second")
     assert len(p.calls) == 2
+
+
+def test_send_does_not_replay_across_base_urls(tmp_path):
+    """Two same-NAME providers at different endpoints sharing a cache_dir
+    must not replay each other's output (e.g. two external llama-servers
+    each serving a different GGUF under the same alias)."""
+    p_a = MockProvider(base_url="http://a:8080/v1", canned_text="from-a")
+    p_b = MockProvider(base_url="http://b:8080/v1", canned_text="from-b")
+    c_a = p_a.new_model("alias").new_conversation(cache_dir=tmp_path)
+    c_b = p_b.new_model("alias").new_conversation(cache_dir=tmp_path)
+
+    assert c_a.send("q").text == "from-a"
+    assert len(p_a.calls) == 1
+
+    # Same prompt, same provider NAME and model alias, different endpoint:
+    # must miss and call provider b, not replay a's cached response.
+    assert c_b.send("q").text == "from-b"
+    assert len(p_b.calls) == 1
+
+    # Same endpoint as a -> still a hit.
+    c_a2 = p_a.new_model("alias").new_conversation(cache_dir=tmp_path)
+    assert c_a2.send("q").text == "from-a"
+    assert len(p_a.calls) == 1
 
 
 def test_read_only_does_not_write(tmp_path):

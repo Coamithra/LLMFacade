@@ -513,6 +513,53 @@ def test_llm_generate_image_resolves_and_caches():
     assert len(built) == 1
 
 
+def test_llm_generate_image_distinct_api_keys_build_distinct_providers():
+    llm = LLM(log_dir=False)
+    built: list[dict] = []
+
+    def fake_new_provider(name, **kw):
+        built.append(kw)
+        fake = MagicMock()
+        fake.generate_image.return_value = f"R{len(built)}"
+        return fake
+
+    llm.new_provider = fake_new_provider  # type: ignore[method-assign]
+
+    out1 = llm.generate_image("a cat", provider="openai", model="gpt-image-1", api_key="key-one")
+    out2 = llm.generate_image("a cat", provider="openai", model="gpt-image-1", api_key="key-two")
+    assert (out1, out2) == ("R1", "R2")
+    assert [kw["api_key"] for kw in built] == ["key-one", "key-two"]
+
+    # Repeating either key reuses its cached provider — no third build.
+    out3 = llm.generate_image("a dog", provider="openai", model="gpt-image-1", api_key="key-one")
+    assert out3 == "R1"
+    assert len(built) == 2
+
+    # The raw secret is never a member of the cache-key tuples (digest only).
+    for key in llm._image_providers:
+        assert "key-one" not in key
+        assert "key-two" not in key
+
+
+def test_llm_generate_image_explicit_key_not_shadowed_by_default_key_provider():
+    llm = LLM(api_keys={"openai": "env-key"}, log_dir=False)
+    built: list[dict] = []
+
+    def fake_new_provider(name, **kw):
+        built.append(kw)
+        fake = MagicMock()
+        fake.generate_image.return_value = "R"
+        return fake
+
+    llm.new_provider = fake_new_provider  # type: ignore[method-assign]
+
+    llm.generate_image("x", provider="openai", model="gpt-image-1")  # manager/env key
+    llm.generate_image("x", provider="openai", model="gpt-image-1", api_key="explicit")
+    assert len(built) == 2
+    assert "api_key" not in built[0]
+    assert built[1]["api_key"] == "explicit"
+
+
 def test_llm_generate_image_local_passes_base_url():
     llm = LLM(log_dir=False)
     fake = MagicMock()
