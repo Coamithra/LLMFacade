@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from llmfacade.models import Message, TextBlock, ToolResultBlock, ToolUseBlock
+import pytest
+
+from llmfacade.exceptions import AuthenticationError, ProviderError, RateLimitError
+from llmfacade.models import ImageBlock, Message, TextBlock, ToolResultBlock, ToolUseBlock
 from llmfacade.providers.google import GoogleProvider
 
 
@@ -106,6 +109,83 @@ def test_usage_extracts_thoughts_token_count():
     assert u.total_tokens == 45
 
 
+def test_tool_result_list_content_is_flattened():
+    """List-form ToolResultBlock content reaches function_response as flattened
+    text instead of being silently discarded (matches OpenAI/llamacpp)."""
+    p = _bare_provider()
+    m = Message(
+        role="tool",
+        content=[
+            ToolResultBlock(
+                tool_use_id="call-abc",
+                content=[TextBlock("part one. "), TextBlock("part two.")],
+                name="get_weather",
+            )
+        ],
+    )
+    out = p._message_to_api(m, {})
+    assert out[0]["parts"][0]["function_response"]["response"]["content"] == (
+        "part one. part two."
+    )
+
+
+def test_tool_result_list_content_ignores_non_text_blocks():
+    """Non-text blocks in a list-form tool result are skipped, matching the
+    other providers' flatten_text_blocks behaviour. (An ImageBlock here is
+    normally rejected upstream by the "tool_result_images" request-time gate.)"""
+    p = _bare_provider()
+    m = Message(
+        role="tool",
+        content=[
+            ToolResultBlock(
+                tool_use_id="call-abc",
+                content=[
+                    TextBlock("see image"),
+                    ImageBlock(data=b"\x89PNG", media_type="image/png"),
+                ],
+                name="screenshot",
+            )
+        ],
+    )
+    out = p._message_to_api(m, {})
+    assert out[0]["parts"][0]["function_response"]["response"]["content"] == "see image"
+
+
+def test_build_kwargs_marshals_list_form_tool_result():
+    """Convo-level marshaling: a list-form tool result in history produces the
+    flattened text in function_response via _build_kwargs."""
+    from llmfacade.provider import CompletionRequest
+
+    p = _bare_provider()
+    messages = [
+        Message(role="user", content="what's the weather?"),
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call-abc", name="get_weather", input={"city": "Oslo"})],
+        ),
+        Message(
+            role="tool",
+            content=[
+                ToolResultBlock(
+                    tool_use_id="call-abc",
+                    content=[TextBlock("cold"), TextBlock(" and windy")],
+                )
+            ],
+        ),
+    ]
+    req = CompletionRequest(
+        model="gemini-2.5-pro",
+        messages=messages,
+        system_blocks=[],
+        tools=[],
+        stop=None,
+        settings={"max_tokens": 128},
+    )
+    api_kwargs = p._build_kwargs(req)
+    tool_part = api_kwargs["contents"][-1]["parts"][0]
+    assert tool_part["function_response"]["response"]["content"] == "cold and windy"
+
+
 def test_usage_total_falls_back_to_sum_including_thoughts():
     """With no ``total_token_count`` reported, the total includes thoughts."""
     from types import SimpleNamespace
@@ -122,3 +202,60 @@ def test_usage_total_falls_back_to_sum_including_thoughts():
     assert u is not None
     assert u.reasoning_tokens == 15
     assert u.total_tokens == 45
+
+
+class FakeAPIError(Exception):
+    """Shaped like google.genai.errors.APIError: structured .code / .status."""
+
+    def __init__(self, code: int | None, status: str | None, message: str = "boom"):
+        self.code = code
+        self.status = status
+        super().__init__(f"{code} {status}. {message}")
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "expected"),
+    [
+        (401, "UNAUTHENTICATED", AuthenticationError),
+        (403, "PERMISSION_DENIED", AuthenticationError),
+        (429, "RESOURCE_EXHAUSTED", RateLimitError),
+        (500, "INTERNAL", ProviderError),
+    ],
+)
+def test_reraise_classifies_on_structured_fields(code, status, expected):
+    p = _bare_provider()
+    with pytest.raises(expected):
+        p._reraise(FakeAPIError(code, status))
+
+
+def test_reraise_classifies_on_status_alone():
+    """A missing HTTP code still classifies via the gRPC-style status string."""
+    p = _bare_provider()
+    with pytest.raises(RateLimitError):
+        p._reraise(FakeAPIError(None, "RESOURCE_EXHAUSTED"))
+    with pytest.raises(AuthenticationError):
+        p._reraise(FakeAPIError(None, "PERMISSION_DENIED"))
+
+
+def test_reraise_plain_exception_maps_to_provider_error_with_original():
+    p = _bare_provider()
+    original = Exception("something broke")
+    with pytest.raises(ProviderError) as exc_info:
+        p._reraise(original)
+    assert exc_info.value.original is original
+
+
+def test_reraise_plain_exception_falls_back_to_message_keywords():
+    p = _bare_provider()
+    with pytest.raises(AuthenticationError):
+        p._reraise(Exception("API key not valid. Please pass a valid API key."))
+    with pytest.raises(RateLimitError):
+        p._reraise(Exception("Quota exceeded, please retry later."))
+
+
+def test_reraise_does_not_keyword_match_structured_errors():
+    """An APIError with a real code/status never falls into the message-keyword
+    fallback (a 500 whose message mentions 'quota' stays a ProviderError)."""
+    p = _bare_provider()
+    with pytest.raises(ProviderError):
+        p._reraise(FakeAPIError(500, "INTERNAL", "backend quota service crashed"))
