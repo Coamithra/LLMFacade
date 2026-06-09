@@ -239,10 +239,13 @@ def test_pid_file_written_with_expected_shape(
     supervisor.ensure_model("flux")
 
     raw = supervisor.pid_file.read_text(encoding="utf-8").strip()
-    pid, port, model, _uuid = raw.split("|")
+    pid, port, model, _uuid, owner = raw.split("|")
     assert pid == "9988"
     assert port == "7001"
     assert model == "flux"
+    import os as _os
+
+    assert owner == f"owner={_os.getpid()}"
 
 
 def test_shutdown_is_idempotent_and_unlinks_pidfile(

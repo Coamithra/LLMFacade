@@ -293,7 +293,13 @@ class _SdServerSupervisor:
     def _write_pid_file(self) -> None:
         if self._proc is None or self._port is None:
             return
-        line = f"{self._proc.pid}|{self._port}|{self._current_model_id}|{self._session_uuid}\n"
+        # owner= records *our* (Python) PID so a sibling process sharing this
+        # llmfacade_dir can tell a live session's sd-server from a true orphan
+        # (see _swap_lifecycle._pid_file_sweep).
+        line = (
+            f"{self._proc.pid}|{self._port}|{self._current_model_id}|"
+            f"{self._session_uuid}|owner={os.getpid()}\n"
+        )
         self.pid_file.write_text(line, encoding="utf-8")
 
     def _close_log(self) -> None:

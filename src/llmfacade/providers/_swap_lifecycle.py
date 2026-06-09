@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ __all__ = [
     "_spawn_with_pdeathsig",
     "_pid_file_sweep",
     "_render_swap_yaml",
+    "_pid_alive",
     "_pid_alive_and_named",
     "_signal_reload",
 ]
@@ -314,22 +316,98 @@ def _pid_alive_and_named(pid: int, expected_name: str) -> bool:
     return expected_name in output.decode("utf-8", errors="replace").strip()
 
 
+def _pid_alive(pid: int) -> bool:
+    """True iff a process with PID ``pid`` is alive. No image-name check — this
+    probes the *owner* (Python) process recorded in a PID file, whose image name
+    we can't predict (python.exe, pythonw.exe, an embedding app). PID reuse can
+    therefore false-positive "alive", but that only makes the sweep *skip* a
+    kill — it can never kill the wrong process — so it's the safe direction.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        # Never os.kill(pid, 0) on Windows: Python implements non-CTRL signals
+        # there via TerminateProcess, which would kill the probed process.
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000  # noqa: N806
+        STILL_ACTIVE = 259  # noqa: N806
+        ERROR_ACCESS_DENIED = 5  # noqa: N806
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # Access denied means the process exists but isn't ours to open.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            exit_code = wintypes.DWORD()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            return bool(ok) and exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)  # POSIX: signal 0 probes existence without delivering
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True  # exists but owned by someone else
+    return True
+
+
+def _parse_owner_pid(fields: list[str]) -> int | None:
+    """Extract the ``owner=<pid>`` field written by ``_write_pid_file``.
+    Returns None for legacy/corrupt files (no such field, or unparseable),
+    which the sweep treats as an orphan — preserving pre-owner-field cleanup
+    behaviour for stale files."""
+    for field in fields:
+        if field.startswith("owner="):
+            try:
+                return int(field[len("owner=") :])
+            except ValueError:
+                return None
+    return None
+
+
 def _pid_file_sweep(pid_file: Path, *, expected_name: str = "llama-swap") -> None:
     """If ``pid_file`` exists and its PID is alive (and matches the expected
     image name), SIGTERM it and remove the file. If the PID is dead/unknown,
-    just remove the file."""
+    just remove the file.
+
+    Exception: when the file records an ``owner=<pid>`` whose Python process is
+    still alive (another live session sharing this llmfacade_dir), the recorded
+    server is *not* an orphan — skip the kill, warn, and leave the sibling's
+    file untouched. A legacy file without the owner field is treated as an
+    orphan, matching the old behaviour."""
     if not pid_file.exists():
         return
     try:
         raw = pid_file.read_text(encoding="utf-8")
     except OSError:
         return
-    pid_str = raw.split("|", 1)[0].strip()
+    fields = [f.strip() for f in raw.split("|")]
     try:
-        pid = int(pid_str)
+        pid = int(fields[0])
     except (TypeError, ValueError):
         with contextlib.suppress(OSError):
             pid_file.unlink()
+        return
+    owner_pid = _parse_owner_pid(fields[1:])
+    if owner_pid is not None and owner_pid != os.getpid() and _pid_alive(owner_pid):
+        # A live sibling session owns this directory. Killing its server would
+        # abort its in-flight generations, so leave both the process and its
+        # PID file alone. (Our own caller will then overwrite the file with our
+        # record — last-writer-wins is the least-harm option for a config that
+        # is already degraded: the sibling's primary cleanup is its own
+        # atexit/Job-Object/pdeathsig layers, not this file.) An owner equal to
+        # our own PID means a prior spawn in this process leaked its file —
+        # that IS our orphan, so fall through and sweep it.
+        warnings.warn(
+            f"PID file {pid_file} is owned by another live process "
+            f"(PID {owner_pid}); skipping the orphan sweep. Two sessions appear "
+            "to share the same llmfacade_dir — give each its own directory.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return
     if _pid_alive_and_named(pid, expected_name):
         killed = _try_kill(pid, expected_name)
@@ -483,6 +561,7 @@ class _LlamaSwapSupervisor:
         self._log_file: Any = None
         self._prior_signal_handlers: dict[int, Any] = {}
         self._atexit_registered = False
+        self._signal_handlers_installed = False
         self._shutdown_done = False
 
     # --- accessors ---------------------------------------------------------
@@ -606,6 +685,11 @@ class _LlamaSwapSupervisor:
         self._proc = proc
         self._anchor = anchor
         self._port = port
+        # A respawn after an explicit shutdown() must be cleaned up again, so
+        # re-arm the idempotency latch (atexit/shutdown become effective once
+        # more). interrupt() never sets the latch, so the interrupt-then-respawn
+        # path is unaffected.
+        self._shutdown_done = False
         self._write_pid_file()
         self._install_exit_hooks()
 
@@ -728,7 +812,10 @@ class _LlamaSwapSupervisor:
     def _write_pid_file(self) -> None:
         if self._proc is None or self._port is None:
             return
-        line = f"{self._proc.pid}|{self._port}|{self._session_uuid}\n"
+        # owner= records *our* (Python) PID so a sibling process sharing this
+        # llmfacade_dir can tell a live session's swap from a true orphan
+        # (see _pid_file_sweep).
+        line = f"{self._proc.pid}|{self._port}|{self._session_uuid}|owner={os.getpid()}\n"
         self.pid_file.write_text(line, encoding="utf-8")
 
     def _close_log(self) -> None:
@@ -752,15 +839,22 @@ class _LlamaSwapSupervisor:
     # --- shutdown ----------------------------------------------------------
 
     def _install_exit_hooks(self) -> None:
+        # Install once per supervisor, not on every (re)spawn: re-running the
+        # signal.signal loop after an interrupt()-triggered respawn would read
+        # our own handler back as the "prior" one and chain to itself on the
+        # next signal (infinite recursion, KeyboardInterrupt never raised).
         if not self._atexit_registered:
             atexit.register(self.shutdown)
             self._atexit_registered = True
+        if self._signal_handlers_installed:
+            return
         # signal.signal() only works on the main thread. If we're being driven
         # from a worker (asyncio.to_thread, a background thread), skip — atexit
         # still covers normal exit. The user's Ctrl+C still goes wherever the
         # main thread put it.
         if threading.current_thread() is not threading.main_thread():
             return
+        self._signal_handlers_installed = True
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(ValueError, OSError, AttributeError):
                 prior = signal.getsignal(sig)

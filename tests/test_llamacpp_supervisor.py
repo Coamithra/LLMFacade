@@ -331,9 +331,12 @@ def test_ensure_started_full_happy_path(
     assert fake_supervisor.yaml_path.exists()
     assert fake_supervisor.pid_file.exists()
     pid_line = fake_supervisor.pid_file.read_text().strip()
-    pid_str, port_str, _uuid = pid_line.split("|")
+    pid_str, port_str, _uuid, owner = pid_line.split("|")
     assert int(pid_str) == 4242
     assert int(port_str) == 5556
+    import os as _os
+
+    assert owner == f"owner={_os.getpid()}"
 
     # Base URL points at the bound port
     assert fake_supervisor.base_url == "http://127.0.0.1:5556"
@@ -537,6 +540,121 @@ def test_interrupt_allows_respawn(
     assert fake_supervisor.base_url == "http://127.0.0.1:5571"
 
 
+def test_interrupt_then_respawn_shutdown_still_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    """interrupt() must not consume the shutdown latch: after an
+    interrupt-triggered respawn, an explicit shutdown() still tears the new
+    process down."""
+    proc1 = _FakeProc(pid=1111)
+    _patch_for_successful_start(monkeypatch, proc=proc1, port=5572)
+    _stub_taskkill(monkeypatch)
+    fake_supervisor.register(_LaunchEntry(model_id="m", gguf="x.gguf"))
+    fake_supervisor.ensure_started()
+    assert fake_supervisor.interrupt() is True
+
+    proc2 = _FakeProc(pid=2222)
+    _patch_for_successful_start(monkeypatch, proc=proc2, port=5573)
+    fake_supervisor.ensure_started()
+    assert fake_supervisor._shutdown_done is False
+
+    fake_supervisor.shutdown()
+    assert proc2.terminate_called
+    assert not fake_supervisor.is_started
+    assert not fake_supervisor.pid_file.exists()
+
+
+# ---- shutdown-then-respawn re-arms the cleanup latch -----------------------
+
+
+def test_respawn_after_shutdown_rearms_cleanup_latch(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    """Regression: shutdown() sets the idempotency latch; a later respawn via
+    ensure_started() must re-arm it, otherwise shutdown()/atexit/__del__ all
+    early-return and the respawned llama-swap is orphaned on platforms without
+    Job Object / pdeathsig (macOS)."""
+    proc1 = _FakeProc(pid=1111)
+    _patch_for_successful_start(monkeypatch, proc=proc1, port=5574)
+    fake_supervisor.register(_LaunchEntry(model_id="m", gguf="x.gguf"))
+    fake_supervisor.ensure_started()
+    fake_supervisor.shutdown()
+    assert fake_supervisor._shutdown_done is True
+
+    proc2 = _FakeProc(pid=2222)
+    _patch_for_successful_start(monkeypatch, proc=proc2, port=5575)
+    fake_supervisor.ensure_started()  # respawn after shutdown
+    assert fake_supervisor._shutdown_done is False  # cleanup latch re-armed
+    assert fake_supervisor.is_started
+
+    fake_supervisor.shutdown()  # a fresh shutdown actually tears the respawn down
+    assert proc2.terminate_called
+    assert not fake_supervisor.pid_file.exists()
+
+
+# ---- signal handlers install once (no self-chaining after respawn) ---------
+
+
+def test_signal_handlers_installed_once_across_respawns(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    """Regression: re-running the signal.signal loop on an interrupt()-triggered
+    respawn would read our own handler back as the 'prior' one and chain to
+    itself on the next Ctrl+C (infinite recursion, KeyboardInterrupt never
+    raised). Handlers must install exactly once per supervisor."""
+    registered: list[int] = []
+    monkeypatch.setattr(ls.signal, "signal", lambda sig, handler: registered.append(sig))
+    proc1 = _FakeProc(pid=1111)
+    _patch_for_successful_start(monkeypatch, proc=proc1, port=5576)
+    _stub_taskkill(monkeypatch)
+    fake_supervisor.register(_LaunchEntry(model_id="m", gguf="x.gguf"))
+    fake_supervisor.ensure_started()
+    first = list(registered)
+    assert first  # handlers actually installed on the first start
+    assert fake_supervisor._signal_handlers_installed is True
+
+    assert fake_supervisor.interrupt() is True
+    proc2 = _FakeProc(pid=2222)
+    _patch_for_successful_start(monkeypatch, proc=proc2, port=5577)
+    fake_supervisor.ensure_started()  # respawn must not re-register
+
+    assert registered == first  # no further signal.signal calls on the respawn
+
+
+def test_signal_handler_chains_to_genuine_prior_after_respawn(
+    monkeypatch: pytest.MonkeyPatch, fake_supervisor: ls._LlamaSwapSupervisor
+) -> None:
+    """The recorded 'prior' handler must stay the pre-supervisor one across an
+    interrupt() respawn — never the supervisor's own handler."""
+    handlers: dict[int, Any] = {}
+
+    def fake_getsignal(sig):
+        return handlers.get(sig, signal.SIG_DFL)
+
+    def fake_signal(sig, handler):
+        handlers[sig] = handler
+
+    user_handler = lambda signum, frame: None  # noqa: E731
+    handlers[signal.SIGINT] = user_handler
+    monkeypatch.setattr(ls.signal, "getsignal", fake_getsignal)
+    monkeypatch.setattr(ls.signal, "signal", fake_signal)
+
+    proc1 = _FakeProc(pid=1111)
+    _patch_for_successful_start(monkeypatch, proc=proc1, port=5578)
+    _stub_taskkill(monkeypatch)
+    fake_supervisor.register(_LaunchEntry(model_id="m", gguf="x.gguf"))
+    fake_supervisor.ensure_started()
+    assert fake_supervisor._prior_signal_handlers[signal.SIGINT] is user_handler
+
+    assert fake_supervisor.interrupt() is True
+    proc2 = _FakeProc(pid=2222)
+    _patch_for_successful_start(monkeypatch, proc=proc2, port=5579)
+    fake_supervisor.ensure_started()
+    # Without the installed-once guard this would now be the supervisor's own
+    # _signal_handler — the self-chaining recursion bug.
+    assert fake_supervisor._prior_signal_handlers[signal.SIGINT] is user_handler
+
+
 # ---- PID-file sweep -------------------------------------------------------
 
 
@@ -614,6 +732,145 @@ def test_pid_file_sweep_handles_unparseable_file(tmp_path: Path) -> None:
 
 def test_pid_file_sweep_no_file_is_noop(tmp_path: Path) -> None:
     ls._pid_file_sweep(tmp_path / "missing.pid")  # must not raise
+
+
+# ---- PID-file sweep: owner-PID awareness ----------------------------------
+
+
+def test_pid_file_sweep_skips_kill_when_owner_alive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A sibling Python process sharing the llmfacade_dir is alive — its swap
+    is NOT an orphan. The sweep must not kill it and must leave its PID file
+    in place."""
+    pid_file = tmp_path / "swap.pid"
+    pid_file.write_text("4242|1234|abc|owner=7777\n")
+
+    monkeypatch.setattr(ls, "_pid_alive", lambda pid: pid == 7777)
+    monkeypatch.setattr(ls, "_pid_alive_and_named", lambda pid, name: True)
+    monkeypatch.setattr(
+        ls, "_try_kill", lambda pid, name: pytest.fail("must not kill a live sibling's swap")
+    )
+
+    with pytest.warns(RuntimeWarning, match="owned by another live process"):
+        ls._pid_file_sweep(pid_file, expected_name="llama-swap")
+    assert pid_file.exists()  # sibling's record left for its own cleanup
+
+
+def test_pid_file_sweep_kills_orphan_when_owner_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pid_file = tmp_path / "swap.pid"
+    pid_file.write_text("4242|1234|abc|owner=7777\n")
+
+    kills: list[int] = []
+    monkeypatch.setattr(ls, "_pid_alive", lambda pid: False)  # owner is dead
+    monkeypatch.setattr(ls, "_pid_alive_and_named", lambda pid, name: pid not in kills)
+    monkeypatch.setattr(ls, "_try_kill", lambda pid, name: kills.append(pid) or True)
+
+    ls._pid_file_sweep(pid_file, expected_name="llama-swap")
+    assert kills == [4242]
+    assert not pid_file.exists()
+
+
+def test_pid_file_sweep_corrupt_owner_field_treated_as_orphan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pid_file = tmp_path / "swap.pid"
+    pid_file.write_text("4242|1234|abc|owner=not-a-pid\n")
+
+    kills: list[int] = []
+    monkeypatch.setattr(
+        ls, "_pid_alive", lambda pid: pytest.fail("corrupt owner must not be probed")
+    )
+    monkeypatch.setattr(ls, "_pid_alive_and_named", lambda pid, name: pid not in kills)
+    monkeypatch.setattr(ls, "_try_kill", lambda pid, name: kills.append(pid) or True)
+
+    ls._pid_file_sweep(pid_file, expected_name="llama-swap")
+    assert kills == [4242]
+    assert not pid_file.exists()
+
+
+def test_pid_file_sweep_own_pid_as_owner_treated_as_orphan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An owner equal to our own PID means a prior spawn in this very process
+    leaked its file — that IS our orphan, so the sweep must reap it."""
+    import os
+
+    pid_file = tmp_path / "swap.pid"
+    pid_file.write_text(f"4242|1234|abc|owner={os.getpid()}\n")
+
+    kills: list[int] = []
+    monkeypatch.setattr(ls, "_pid_alive", lambda pid: True)  # we are alive, obviously
+    monkeypatch.setattr(ls, "_pid_alive_and_named", lambda pid, name: pid not in kills)
+    monkeypatch.setattr(ls, "_try_kill", lambda pid, name: kills.append(pid) or True)
+
+    ls._pid_file_sweep(pid_file, expected_name="llama-swap")
+    assert kills == [4242]
+    assert not pid_file.exists()
+
+
+def test_pid_file_sweep_owner_parsed_position_independently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sd-server pid file has an extra model-id field before the UUID; the
+    owner= field must be found regardless of its position."""
+    pid_file = tmp_path / "sd-server.pid"
+    pid_file.write_text("9988|7001|flux|abc|owner=7777\n")
+
+    monkeypatch.setattr(ls, "_pid_alive", lambda pid: pid == 7777)
+    monkeypatch.setattr(ls, "_pid_alive_and_named", lambda pid, name: True)
+    monkeypatch.setattr(
+        ls, "_try_kill", lambda pid, name: pytest.fail("must not kill a live sibling's sd-server")
+    )
+
+    with pytest.warns(RuntimeWarning, match="owned by another live process"):
+        ls._pid_file_sweep(pid_file, expected_name="sd-server")
+    assert pid_file.exists()
+
+
+def test_pid_file_sweep_legacy_format_dead_pid_removed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pre-owner-field file (legacy 3-field format) keeps the old behaviour:
+    dead swap PID -> file removed, no owner probe."""
+    pid_file = tmp_path / "swap.pid"
+    pid_file.write_text("4242|1234|abc\n")
+
+    monkeypatch.setattr(
+        ls, "_pid_alive", lambda pid: pytest.fail("legacy file has no owner to probe")
+    )
+    monkeypatch.setattr(ls, "_pid_alive_and_named", lambda pid, name: False)
+
+    ls._pid_file_sweep(pid_file, expected_name="llama-swap")
+    assert not pid_file.exists()
+
+
+# ---- _pid_alive ------------------------------------------------------------
+
+
+def test_pid_alive_nonpositive_pid_false() -> None:
+    assert ls._pid_alive(0) is False
+    assert ls._pid_alive(-5) is False
+
+
+def test_pid_alive_true_for_current_process() -> None:
+    import os
+
+    assert ls._pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_false_for_exited_process() -> None:
+    import sys
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait(timeout=30)
+    assert ls._pid_alive(proc.pid) is False
 
 
 # ---- signal handler installation -----------------------------------------
