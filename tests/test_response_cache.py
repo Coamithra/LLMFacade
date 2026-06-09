@@ -236,6 +236,64 @@ def test_replay_only_raises_on_miss(tmp_path):
     assert len(p.calls) == 0
 
 
+def test_replay_only_miss_send_leaves_history_unchanged(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    with pytest.raises(CacheMissError):
+        c.send("never-cached")
+    assert c.history == [], "the dangling prompt must be rolled back on a replay_only miss"
+    # A later turn must not trip over a dangling user message.
+    with pytest.raises(CacheMissError):
+        c.send("still-never-cached")
+    assert c.history == []
+
+
+def test_replay_only_miss_asend_leaves_history_unchanged(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    with pytest.raises(CacheMissError):
+        asyncio.run(c.asend("never-cached"))
+    assert c.history == []
+
+
+def test_replay_only_miss_stream_leaves_history_unchanged(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    with pytest.raises(CacheMissError):
+        list(c.stream("never-cached"))
+    assert c.history == []
+
+
+def test_replay_only_miss_astream_leaves_history_unchanged(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+
+    async def run():
+        async for _ev in c.astream("never-cached"):
+            pass
+
+    with pytest.raises(CacheMissError):
+        asyncio.run(run())
+    assert c.history == []
+
+
+def test_replay_only_miss_preserves_prior_turns(tmp_path):
+    p = MockProvider(canned_text="seeded")
+    model = p.new_model("mock-model")
+    seed = model.new_conversation(cache_dir=tmp_path)
+    seed.send("hello")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    c.send("hello")  # hit
+    before = c.history
+    with pytest.raises(CacheMissError):
+        c.send("uncached-follow-up")
+    assert c.history == before
+
+
 def test_replay_only_returns_hit(tmp_path):
     p = MockProvider(canned_text="seeded")
     model = p.new_model("mock-model")

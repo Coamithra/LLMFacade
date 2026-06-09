@@ -566,14 +566,21 @@ class Conversation:
         )
         guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
-        guard_snap = self.snapshot() if guard is not None else None
+        pre_send_snap = self.snapshot()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
-        cache_key, cache_fp, cached = self._cache_lookup(req)
+        try:
+            cache_key, cache_fp, cached = self._cache_lookup(req)
+        except CacheMissError:
+            # replay_only miss: undo the prompt append so history isn't left
+            # with a dangling user message (which would corrupt the next send
+            # and shift its fingerprint).
+            self.rollback(pre_send_snap)
+            raise
         if cached is not None:
             self._record_turn_boundary(cached.usage, len(req.messages))
             self._log_response(req, cached)
@@ -586,8 +593,7 @@ class Conversation:
             try:
                 resp = self._guarded_complete(req, guard)
             except RepetitionLoopError:
-                if guard_snap is not None:
-                    self.rollback(guard_snap)
+                self.rollback(pre_send_snap)
                 raise
         self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
@@ -639,14 +645,18 @@ class Conversation:
         )
         guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
-        guard_snap = self.snapshot() if guard is not None else None
+        pre_send_snap = self.snapshot()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
-        cache_key, cache_fp, cached = self._cache_lookup(req)
+        try:
+            cache_key, cache_fp, cached = self._cache_lookup(req)
+        except CacheMissError:
+            self.rollback(pre_send_snap)
+            raise
         if cached is not None:
             self._record_turn_boundary(cached.usage, len(req.messages))
             self._log_response(req, cached)
@@ -659,8 +669,7 @@ class Conversation:
             try:
                 resp = await self._aguarded_complete(req, guard)
             except RepetitionLoopError:
-                if guard_snap is not None:
-                    self.rollback(guard_snap)
+                self.rollback(pre_send_snap)
                 raise
         self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
@@ -711,14 +720,20 @@ class Conversation:
         )
         guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
-        guard_snap = self.snapshot() if guard is not None else None
+        pre_send_snap = self.snapshot()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
-        cache_key, cache_fp, cached = self._cache_lookup(req)
+        try:
+            cache_key, cache_fp, cached = self._cache_lookup(req)
+        except CacheMissError:
+            # replay_only miss: undo the prompt append so history isn't left
+            # with a dangling user message.
+            self.rollback(pre_send_snap)
+            raise
         msg_count_at_send = len(req.messages)
         if cached is not None:
             try:
@@ -786,8 +801,7 @@ class Conversation:
         finally:
             if repetition_detail is not None:
                 _close_stream(stream_iter)
-                if guard_snap is not None:
-                    self.rollback(guard_snap)
+                self.rollback(pre_send_snap)
             else:
                 self._record_turn_boundary(last_usage, msg_count_at_send)
                 resp = self._finalize_stream(
@@ -850,14 +864,18 @@ class Conversation:
         )
         guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
-        guard_snap = self.snapshot() if guard is not None else None
+        pre_send_snap = self.snapshot()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
-        cache_key, cache_fp, cached = self._cache_lookup(req)
+        try:
+            cache_key, cache_fp, cached = self._cache_lookup(req)
+        except CacheMissError:
+            self.rollback(pre_send_snap)
+            raise
         msg_count_at_send = len(req.messages)
         if cached is not None:
             try:
@@ -919,8 +937,7 @@ class Conversation:
         finally:
             if repetition_detail is not None:
                 await _aclose_stream(stream_iter)
-                if guard_snap is not None:
-                    self.rollback(guard_snap)
+                self.rollback(pre_send_snap)
             else:
                 self._record_turn_boundary(last_usage, msg_count_at_send)
                 resp = self._finalize_stream(
