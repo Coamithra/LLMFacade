@@ -5,11 +5,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
 
 from llmfacade import RepetitionGuard, RepetitionLoopError
+from llmfacade.conversation import (
+    _detect_in_tail,
+    _detection_text,
+    _DetectionTail,
+    _StreamBuffers,
+)
 from llmfacade.models import Response, StreamEvent, ToolArgsDelta, ToolCall, Usage
 from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.repetition import (
@@ -534,9 +541,7 @@ class ToolArgsLoopingProvider(Provider):
                 tool_args_delta=ToolArgsDelta(index=0, fragment=self.fragment, id="t1", name="f")
             )
         self.reached_terminal = True
-        yield StreamEvent(
-            tool_call_delta=ToolCall(id="t1", name="f", input={}, raw_arguments=raw)
-        )
+        yield StreamEvent(tool_call_delta=ToolCall(id="t1", name="f", input={}, raw_arguments=raw))
         yield StreamEvent(done=True, usage=self._USAGE, finish_reason="tool_calls")
 
     def _complete_raw(self, req: CompletionRequest) -> Response:
@@ -708,3 +713,156 @@ def test_int_shorthand_enables_guard():
     convo = _convo(p, repetition_detection=3)
     assert convo._repetition_guard is not None
     assert convo._repetition_guard.min_reps_floor == 3
+
+
+# ---------------------------------------------------------------------------
+# _DetectionTail: incremental tail == full _detection_text re-join
+# ---------------------------------------------------------------------------
+
+
+def _full_join(buf: _StreamBuffers) -> str:
+    return _detection_text(buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args)
+
+
+def _assert_tail_matches(buf: _StreamBuffers, tail: _DetectionTail, cap: int) -> None:
+    full = _full_join(buf)
+    assert tail.text() == full[-cap:]
+
+
+_LOOP_PHRASES = [
+    "I cannot help with that. ",
+    "spam ",
+    "abcabc",
+    '{"q": "again"}',
+]
+
+
+def _random_events(rng: random.Random) -> list[StreamEvent]:
+    """A random-ish interleaving of text / thinking / tool-args / terminal
+    tool-call events, with occasional degenerate loops in each channel."""
+    events: list[StreamEvent] = []
+    n_calls = 0
+    fluent = ["The sky is blue. ", "Counting: one two three. ", "ok\n", "- item\n"]
+    for _ in range(rng.randrange(5, 40)):
+        kind = rng.randrange(8)
+        if kind in (0, 1):
+            chunk = rng.choice(fluent + [rng.choice(_LOOP_PHRASES) * rng.randrange(1, 15)])
+            events.append(StreamEvent(text_delta=chunk))
+        elif kind in (2, 3):
+            chunk = rng.choice(fluent + [rng.choice(_LOOP_PHRASES) * rng.randrange(1, 15)])
+            events.append(StreamEvent(thinking_delta=chunk))
+        elif kind in (4, 5):
+            # Fragments for the in-flight call (index == n_calls), sometimes
+            # looping, sometimes empty (key presence still counts).
+            frag = rng.choice(['{"city": "Par', 'is"}', "", rng.choice(_LOOP_PHRASES) * 6])
+            events.append(StreamEvent(tool_args_delta=ToolArgsDelta(index=n_calls, fragment=frag)))
+        elif kind == 6:
+            # Terminal call that streamed no fragments (Google-style): parsed
+            # input or a raw_arguments string.
+            if rng.random() < 0.5:
+                call = ToolCall(id=f"t{n_calls}", name="fn", input={"x": rng.randrange(100)})
+            else:
+                call = ToolCall(id=f"t{n_calls}", name="fn", input={}, raw_arguments='{"broken": ')
+            events.append(StreamEvent(tool_call_delta=call))
+            n_calls += 1
+        else:
+            # Terminal call closing an (possibly) in-flight fragment stream.
+            call = ToolCall(id=f"t{n_calls}", name="fn", input={"city": "Paris"})
+            events.append(StreamEvent(tool_call_delta=call))
+            n_calls += 1
+    return events
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_detection_tail_matches_full_join_property(seed):
+    rng = random.Random(seed)
+    cap = rng.choice([16, 64, 256, 4096])
+    guard = RepetitionGuard(tail_chars=cap)
+    buf = _StreamBuffers()
+    tail = _DetectionTail(cap)
+    for ev in _random_events(rng):
+        buf.absorb(ev)
+        tail.absorb(ev)
+        # Invariant at every step: the incremental tail equals the last
+        # tail_chars of the full re-join, so the detector sees identical input.
+        _assert_tail_matches(buf, tail, cap)
+        expected = detect_repetition_loop(
+            _full_join(buf),
+            tail_chars=guard.tail_chars,
+            max_period=guard.max_period,
+            min_reps_floor=guard.min_reps_floor,
+        )
+        assert _detect_in_tail(tail, guard) == expected
+
+
+def _absorb_all(events) -> tuple[_StreamBuffers, _DetectionTail, RepetitionGuard]:
+    guard = RepetitionGuard()
+    buf = _StreamBuffers()
+    tail = _DetectionTail(guard.tail_chars)
+    for ev in events:
+        buf.absorb(ev)
+        tail.absorb(ev)
+    return buf, tail, guard
+
+
+def test_detection_tail_catches_thinking_loop():
+    events = [StreamEvent(thinking_delta="I should reconsider. ")] * 30
+    buf, tail, guard = _absorb_all(events)
+    _assert_tail_matches(buf, tail, guard.tail_chars)
+    assert _detect_in_tail(tail, guard) is not None
+
+
+def test_detection_tail_catches_tool_args_loop():
+    events = [StreamEvent(tool_args_delta=ToolArgsDelta(index=0, fragment='{"q": "again", '))] * 30
+    buf, tail, guard = _absorb_all(events)
+    _assert_tail_matches(buf, tail, guard.tail_chars)
+    assert _detect_in_tail(tail, guard) is not None
+
+
+def test_detection_tail_loop_outside_window_not_seen():
+    # A loop entirely before the tail window must not fire in either impl.
+    cap = 40
+    guard = RepetitionGuard(tail_chars=cap)
+    events = [StreamEvent(text_delta="spam " * 6)] + [
+        StreamEvent(text_delta="X clean unique trailing content that does not repeat. ")
+    ] * 3
+    buf = _StreamBuffers()
+    tail = _DetectionTail(cap)
+    for ev in events:
+        buf.absorb(ev)
+        tail.absorb(ev)
+    _assert_tail_matches(buf, tail, cap)
+    assert _detect_in_tail(tail, guard) is None
+
+
+def test_detection_tail_terminal_call_without_fragments_uses_args():
+    # No fragments + unparsed args: the raw_arguments string is scanned. The
+    # loop sits at the very end, so the suffix-anchored detector fires.
+    call = ToolCall(id="t0", name="fn", input={}, raw_arguments='{"q": ' + "again " * 30)
+    buf, tail, guard = _absorb_all([StreamEvent(tool_call_delta=call)])
+    _assert_tail_matches(buf, tail, guard.tail_chars)
+    assert _detect_in_tail(tail, guard) is not None
+
+
+def test_detection_tail_terminal_call_parsed_input_is_scanned():
+    # Google-style: no fragments, parsed input only — the json.dumps of the
+    # input lands in the scanned buffer (tail mirrors the full join exactly;
+    # the trailing '"}' breaks suffix periodicity, so neither impl fires).
+    call = ToolCall(id="t0", name="fn", input={"phrase": "again and again " * 10})
+    buf, tail, guard = _absorb_all([StreamEvent(tool_call_delta=call)])
+    _assert_tail_matches(buf, tail, guard.tail_chars)
+    assert "again and again " in tail.text()
+
+
+def test_detection_tail_fragments_not_double_counted_with_terminal():
+    # A call whose fragments streamed uses the fragments INSTEAD OF the
+    # terminal call's arguments — same string, counted once.
+    frag = '{"city": "Paris"}'
+    events = [
+        StreamEvent(tool_args_delta=ToolArgsDelta(index=0, fragment=frag)),
+        StreamEvent(tool_call_delta=ToolCall(id="t0", name="fn", input={"city": "Paris"})),
+    ]
+    buf, tail, guard = _absorb_all(events)
+    full = _full_join(buf)
+    assert full.count(frag) == 1
+    _assert_tail_matches(buf, tail, guard.tail_chars)

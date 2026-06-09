@@ -114,6 +114,13 @@ class Provider:
     SUPPORTS: frozenset[str] = frozenset()
     NAME: str = "provider"
     API_KEY_ENV: str | None = None
+    # True when this provider's reported ``usage.prompt_tokens`` already
+    # contains the cached subset (``cache_read_tokens``), so a turn's total
+    # input is ``prompt_tokens`` itself. False (Anthropic semantics) means
+    # cache reads/creations are additive on top of ``prompt_tokens``. Drives
+    # the total-input computations behind the conversation log's
+    # ``cache_summary`` and turn-boundary tracking.
+    PROMPT_TOKENS_INCLUDE_CACHED: bool = False
 
     def __init__(
         self,

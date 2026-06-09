@@ -145,6 +145,11 @@ class LlamaCppServerProvider(Provider):
     # has no budget form — so an int token budget fails fast through the
     # value-level gate in `Conversation._build_request` (the same mechanism that
     # rejects a budget on Opus 4.8), instead of being silently dropped here.
+    # llama-server speaks the OpenAI-compat usage shape, where prompt_tokens
+    # is the full input. Our parser never populates cache_read_tokens (always
+    # 0 today — the server's prompt cache is internal), so this is currently
+    # moot; declared to match OpenAI semantics should that ever change.
+    PROMPT_TOKENS_INCLUDE_CACHED = True
     # Wall-clock cap on the synchronous `llama-fit-params` probe in
     # `_maybe_estimate_fit`. Sub-second in the normal case; capped low so
     # `new_model()` never hangs on a missing or stuck binary.

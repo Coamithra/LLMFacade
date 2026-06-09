@@ -566,6 +566,28 @@ def test_log_max_message_lines_unset_writes_full_html(mock_model, tmp_path):
     assert "line-25" in html
 
 
+def test_clone_html_logger_keeps_max_lines(mock_model, tmp_path):
+    log = tmp_path / "log.jsonl"
+    convo = mock_model.new_conversation(name="t", log_path=log, log_max_message_lines=10)
+    twin = convo.clone(log_path=tmp_path / "twin.jsonl")
+    assert twin._html_logger is not None
+    assert twin._html_logger.max_lines == 10
+
+    novel = "\n".join(f"line-{i}" for i in range(100))
+    twin.send(novel)
+    html = (tmp_path / "twin.html").read_text(encoding="utf-8")
+    assert "[90 lines skipped]" in html
+    assert "line-50" not in html
+
+
+def test_clone_html_logger_max_lines_override(mock_model, tmp_path):
+    log = tmp_path / "log.jsonl"
+    convo = mock_model.new_conversation(name="t", log_path=log, log_max_message_lines=10)
+    twin = convo.clone(log_path=tmp_path / "twin.jsonl", log_max_message_lines=4)
+    assert twin._html_logger is not None
+    assert twin._html_logger.max_lines == 4
+
+
 def test_cache_summary_present_when_usage_has_cache_read(tmp_path):
     from llmfacade.models import Usage
 

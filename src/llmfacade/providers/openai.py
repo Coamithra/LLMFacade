@@ -90,6 +90,10 @@ class OpenAIProvider(Provider):
             "image_generation",
         }
     )
+    # OpenAI's ``usage.prompt_tokens`` already includes
+    # ``prompt_tokens_details.cached_tokens`` (the cached subset we surface as
+    # ``cache_read_tokens``), so total input must not re-add it.
+    PROMPT_TOKENS_INCLUDE_CACHED = True
 
     def __init__(self, *, org_id: str | None = None, **kwargs: Any):
         self._org_id = org_id
