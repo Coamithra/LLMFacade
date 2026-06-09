@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Iterator
 import pytest
 
 from llmfacade import RepetitionGuard, RepetitionLoopError
-from llmfacade.models import Response, StreamEvent, Usage
+from llmfacade.models import Response, StreamEvent, ToolArgsDelta, ToolCall, Usage
 from llmfacade.provider import CompletionRequest, Provider
 from llmfacade.repetition import (
     coerce_repetition_guard,
@@ -427,6 +427,230 @@ def test_asend_catches_thinking_loop():
     resp = asyncio.run(convo.asend("hi"))
     assert resp.text == "All good."
     assert p.stream_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Empty stream under the guard: no empty assistant message, no cache entry
+# ---------------------------------------------------------------------------
+
+
+class EmptyStreamProvider(Provider):
+    """Streams only a terminal done event — no blocks at all."""
+
+    NAME = "emptystream"
+    SUPPORTS = frozenset({"max_tokens", "temperature", "repeat_penalty", "dry", "tools"})
+
+    def _init_client(self) -> None:
+        self._client = object()
+
+    def _resolve_key(self, env_var: str) -> str:
+        del env_var
+        return "key"
+
+    _USAGE = Usage(prompt_tokens=5, completion_tokens=0, total_tokens=5)
+
+    def _complete_raw(self, req: CompletionRequest) -> Response:
+        raise AssertionError("guarded send must drive the stream hook")
+
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
+        raise AssertionError("guarded send must drive the stream hook")
+
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
+        yield StreamEvent(done=True, usage=self._USAGE, finish_reason="stop")
+
+    async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(done=True, usage=self._USAGE, finish_reason="stop")
+
+
+def test_guarded_send_empty_stream_appends_nothing(tmp_path):
+    p = EmptyStreamProvider()
+    convo = p.new_model("empty-model").new_conversation(
+        log_dir=False, cache_dir=tmp_path, repetition_detection=RepetitionGuard(retries=0)
+    )
+    resp = convo.send("hi")
+    assert resp.blocks == [] and resp.text == ""
+    # No empty assistant message in history (the next Anthropic send would 400)
+    # and no empty Response cached.
+    assert [m.role for m in convo.history] == ["user"]
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_guarded_asend_empty_stream_appends_nothing(tmp_path):
+    p = EmptyStreamProvider()
+    convo = p.new_model("empty-model").new_conversation(
+        log_dir=False, cache_dir=tmp_path, repetition_detection=RepetitionGuard(retries=0)
+    )
+    resp = asyncio.run(convo.asend("hi"))
+    assert resp.blocks == []
+    assert [m.role for m in convo.history] == ["user"]
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_stream_empty_stream_appends_nothing(tmp_path):
+    """The public stream() path already guards via _finalize_stream; pin the
+    behaviour the guarded send now mirrors."""
+    p = EmptyStreamProvider()
+    convo = p.new_model("empty-model").new_conversation(log_dir=False, cache_dir=tmp_path)
+    events = list(convo.stream("hi"))
+    assert events[-1].done is True
+    assert [m.role for m in convo.history] == ["user"]
+    assert not list(tmp_path.rglob("*.json"))
+
+
+# ---------------------------------------------------------------------------
+# Streamed tool-call argument fragments
+# ---------------------------------------------------------------------------
+
+
+class ToolArgsLoopingProvider(Provider):
+    """Streams a tool call whose arguments loop, fragment by fragment, then a
+    terminal tool_call_delta. ``reached_terminal`` records whether the consumer
+    let the stream get that far — mid-stream detection must abandon the stream
+    before the terminal event (i.e. before the budget is burned)."""
+
+    NAME = "argslooping"
+    SUPPORTS = frozenset({"max_tokens", "temperature", "repeat_penalty", "dry", "tools"})
+
+    def __init__(self, *, fragment: str = '{"q": "spam spam ', reps: int = 100, **knobs):
+        self.fragment = fragment
+        self.reps = reps
+        self.reached_terminal = False
+        self.stream_count = 0
+        super().__init__(**knobs)
+
+    def _init_client(self) -> None:
+        self._client = object()
+
+    def _resolve_key(self, env_var: str) -> str:
+        del env_var
+        return "key"
+
+    _USAGE = Usage(prompt_tokens=5, completion_tokens=50, total_tokens=55)
+
+    def _events(self):
+        raw = self.fragment * self.reps
+        for _ in range(self.reps):
+            yield StreamEvent(
+                tool_args_delta=ToolArgsDelta(index=0, fragment=self.fragment, id="t1", name="f")
+            )
+        self.reached_terminal = True
+        yield StreamEvent(
+            tool_call_delta=ToolCall(id="t1", name="f", input={}, raw_arguments=raw)
+        )
+        yield StreamEvent(done=True, usage=self._USAGE, finish_reason="tool_calls")
+
+    def _complete_raw(self, req: CompletionRequest) -> Response:
+        raise AssertionError("guarded send must drive the stream hook")
+
+    async def _acomplete_raw(self, req: CompletionRequest) -> Response:
+        raise AssertionError("guarded send must drive the stream hook")
+
+    def _stream_raw(self, req: CompletionRequest) -> Iterator[StreamEvent]:
+        self.stream_count += 1
+        yield from self._events()
+
+    async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
+        self.stream_count += 1
+        for ev in self._events():
+            yield ev
+
+
+def test_detection_text_uses_fragments_for_in_flight_call():
+    from llmfacade.conversation import _detection_text
+
+    frags = {0: ['{"q": "sp', 'am spam"']}
+    out = _detection_text([], [], [], frags)
+    assert out == '{"q": "spam spam"'
+
+
+def test_detection_text_counts_streamed_args_once():
+    """When the terminal call arrives for an index that already streamed
+    fragments, its args must not be added on top of the fragments."""
+    from llmfacade.conversation import _detection_text
+
+    tc = ToolCall(id="t1", name="f", input={}, raw_arguments='{"x": 1}')
+    frags = {0: ['{"x"', ": 1}"]}
+    assert _detection_text([], [], [tc], frags) == '{"x": 1}'
+
+
+def test_detection_text_terminal_only_keeps_args():
+    """Google-style streams emit no fragments; the terminal call's args are
+    still scanned."""
+    from llmfacade.conversation import _detection_text
+
+    tc = ToolCall(id="t1", name="f", input={}, raw_arguments='{"x": 1}')
+    assert _detection_text([], [], [tc], {}) == '{"x": 1}'
+    parsed_only = ToolCall(id="t2", name="f", input={"x": 1})
+    assert '"x": 1' in _detection_text([], [], [parsed_only], {})
+
+
+def test_guarded_send_catches_tool_args_loop_mid_stream():
+    p = ToolArgsLoopingProvider()
+    convo = p.new_model("args-model").new_conversation(
+        log_dir=False, repetition_detection=RepetitionGuard(retries=0)
+    )
+    with pytest.raises(RepetitionLoopError) as ei:
+        convo.send("hi")
+    assert "spam" in ei.value.partial_text
+    assert p.reached_terminal is False, "loop must be caught before the terminal event"
+    assert convo.history == []
+
+
+def test_guarded_asend_catches_tool_args_loop_mid_stream():
+    p = ToolArgsLoopingProvider()
+    convo = p.new_model("args-model").new_conversation(
+        log_dir=False, repetition_detection=RepetitionGuard(retries=0)
+    )
+    with pytest.raises(RepetitionLoopError):
+        asyncio.run(convo.asend("hi"))
+    assert p.reached_terminal is False
+    assert convo.history == []
+
+
+def test_stream_aborts_on_tool_args_loop_mid_stream():
+    p = ToolArgsLoopingProvider()
+    convo = p.new_model("args-model").new_conversation(
+        log_dir=False, repetition_detection=RepetitionGuard(retries=2)
+    )
+    seen = 0
+    with pytest.raises(RepetitionLoopError) as ei:
+        for ev in convo.stream("hi"):
+            if ev.tool_args_delta is not None:
+                seen += 1
+    assert seen > 0  # some fragments were yielded before the abort
+    assert p.reached_terminal is False, "loop must be caught before the terminal event"
+    assert "spam" in ei.value.partial_text
+    assert convo.history == []
+
+
+def test_astream_aborts_on_tool_args_loop_mid_stream():
+    p = ToolArgsLoopingProvider()
+    convo = p.new_model("args-model").new_conversation(
+        log_dir=False, repetition_detection=RepetitionGuard(retries=2)
+    )
+
+    async def run():
+        async for _ev in convo.astream("hi"):
+            pass
+
+    with pytest.raises(RepetitionLoopError):
+        asyncio.run(run())
+    assert p.reached_terminal is False
+    assert convo.history == []
+
+
+def test_clean_tool_args_fragments_not_flagged():
+    p = ToolArgsLoopingProvider(
+        fragment='{"q": "one unique question about geese migration"}', reps=1
+    )
+    convo = p.new_model("args-model").new_conversation(
+        log_dir=False, repetition_detection=RepetitionGuard(retries=0)
+    )
+    resp = convo.send("hi")
+    assert p.reached_terminal is True
+    assert resp.tool_calls and resp.tool_calls[0].id == "t1"
+    # The fragments fed detection only — history holds the terminal tool call.
+    assert convo.history[-1].role == "assistant"
 
 
 # ---------------------------------------------------------------------------

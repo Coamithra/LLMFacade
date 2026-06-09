@@ -426,6 +426,61 @@ def test_image_result_save(tmp_path):
     assert paths[1].read_bytes() == b"BBB"
 
 
+def test_image_result_save_never_overwrites(tmp_path):
+    """Two saves into one directory yield 2n distinct files; the second call
+    shifts to the next free contiguous index block instead of clobbering the
+    first call's (paid-for) images."""
+    first = ImageResult(
+        images=[
+            ImageBlock(data=b"FIRST0", media_type="image/png"),
+            ImageBlock(data=b"FIRST1", media_type="image/png"),
+        ],
+        usage=None,
+        model="m",
+        provider="p",
+    )
+    second = ImageResult(
+        images=[
+            ImageBlock(data=b"SECOND0", media_type="image/png"),
+            ImageBlock(data=b"SECOND1", media_type="image/jpeg"),
+        ],
+        usage=None,
+        model="m",
+        provider="p",
+    )
+
+    paths1 = first.save(tmp_path)
+    paths2 = second.save(tmp_path)
+
+    assert [p.name for p in paths1] == ["image_0.png", "image_1.png"]
+    assert [p.name for p in paths2] == ["image_2.png", "image_3.jpg"]
+    assert len({*paths1, *paths2}) == 4
+    assert paths1[0].read_bytes() == b"FIRST0"
+    assert paths1[1].read_bytes() == b"FIRST1"
+    assert paths2[0].read_bytes() == b"SECOND0"
+    assert paths2[1].read_bytes() == b"SECOND1"
+
+
+def test_image_result_save_skips_gap_that_cannot_fit_block(tmp_path):
+    """A pre-existing name mid-range pushes the whole call past it — one
+    call's images stay contiguously numbered."""
+    (tmp_path / "image_1.png").write_bytes(b"OCCUPIED")
+    result = ImageResult(
+        images=[
+            ImageBlock(data=b"A", media_type="image/png"),
+            ImageBlock(data=b"B", media_type="image/png"),
+        ],
+        usage=None,
+        model="m",
+        provider="p",
+    )
+
+    paths = result.save(tmp_path)
+
+    assert [p.name for p in paths] == ["image_2.png", "image_3.png"]
+    assert (tmp_path / "image_1.png").read_bytes() == b"OCCUPIED"
+
+
 def test_save_dir_populates_paths(tmp_path):
     provider = OpenAIProvider(api_key="test-key")
     provider._client = MagicMock()
@@ -511,6 +566,53 @@ def test_llm_generate_image_resolves_and_caches():
     # Second call with the same (provider, base_url) reuses the cached provider.
     llm.generate_image("a dog", provider="openai", model="gpt-image-1")
     assert len(built) == 1
+
+
+def test_llm_generate_image_distinct_api_keys_build_distinct_providers():
+    llm = LLM(log_dir=False)
+    built: list[dict] = []
+
+    def fake_new_provider(name, **kw):
+        built.append(kw)
+        fake = MagicMock()
+        fake.generate_image.return_value = f"R{len(built)}"
+        return fake
+
+    llm.new_provider = fake_new_provider  # type: ignore[method-assign]
+
+    out1 = llm.generate_image("a cat", provider="openai", model="gpt-image-1", api_key="key-one")
+    out2 = llm.generate_image("a cat", provider="openai", model="gpt-image-1", api_key="key-two")
+    assert (out1, out2) == ("R1", "R2")
+    assert [kw["api_key"] for kw in built] == ["key-one", "key-two"]
+
+    # Repeating either key reuses its cached provider — no third build.
+    out3 = llm.generate_image("a dog", provider="openai", model="gpt-image-1", api_key="key-one")
+    assert out3 == "R1"
+    assert len(built) == 2
+
+    # The raw secret is never a member of the cache-key tuples (digest only).
+    for key in llm._image_providers:
+        assert "key-one" not in key
+        assert "key-two" not in key
+
+
+def test_llm_generate_image_explicit_key_not_shadowed_by_default_key_provider():
+    llm = LLM(api_keys={"openai": "env-key"}, log_dir=False)
+    built: list[dict] = []
+
+    def fake_new_provider(name, **kw):
+        built.append(kw)
+        fake = MagicMock()
+        fake.generate_image.return_value = "R"
+        return fake
+
+    llm.new_provider = fake_new_provider  # type: ignore[method-assign]
+
+    llm.generate_image("x", provider="openai", model="gpt-image-1")  # manager/env key
+    llm.generate_image("x", provider="openai", model="gpt-image-1", api_key="explicit")
+    assert len(built) == 2
+    assert "api_key" not in built[0]
+    assert built[1]["api_key"] == "explicit"
 
 
 def test_llm_generate_image_local_passes_base_url():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -133,6 +134,144 @@ def test_helpers_run_to_completion_caps_iterations():
     convo = p.new_model("mock-model").new_conversation(tools=[echo])
     with pytest.raises(ToolIterationLimitError):
         helpers.run_to_completion(convo, "go", max_iterations=3)
+
+
+def test_helpers_run_bound_tools_rejects_async_tool_before_dispatch():
+    @tool
+    async def aecho(x: int) -> int:
+        """Echo x."""
+        return x
+
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="aecho", input={"x": 7})],
+    )
+    convo = p.new_model("mock-model").new_conversation(tools=[aecho])
+    resp = convo.send("go")
+    history_before = len(convo.history)
+    with pytest.raises(TypeError, match="aecho.*arun_bound_tools"):
+        helpers.run_bound_tools(convo, resp)
+    assert len(convo.history) == history_before
+    assert convo.history[-1].role == "assistant"
+
+
+def test_helpers_run_bound_tools_async_rejection_appends_nothing_mid_batch():
+    """The async scan runs before dispatch: a sync tool listed ahead of an
+    async one must not have its result appended before the raise (which would
+    leave the async call's tool_use dangling)."""
+    ran: list[int] = []
+
+    @tool
+    def echo(x: int) -> int:
+        """Echo x."""
+        ran.append(x)
+        return x
+
+    @tool
+    async def aecho(x: int) -> int:
+        """Echo x."""
+        return x
+
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[
+            ToolCall(id="t1", name="echo", input={"x": 1}),
+            ToolCall(id="t2", name="aecho", input={"x": 2}),
+        ],
+    )
+    convo = p.new_model("mock-model").new_conversation(tools=[echo, aecho])
+    resp = convo.send("go")
+    history_before = len(convo.history)
+    with pytest.raises(TypeError):
+        helpers.run_bound_tools(convo, resp)
+    assert ran == []
+    assert len(convo.history) == history_before
+
+
+def test_helpers_run_to_completion_rejects_async_tool():
+    @tool
+    async def aecho(x: int) -> int:
+        """Echo x."""
+        return x
+
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="aecho", input={"x": 7})],
+    )
+    convo = p.new_model("mock-model").new_conversation(tools=[aecho])
+    with pytest.raises(TypeError, match="arun_to_completion"):
+        helpers.run_to_completion(convo, "go")
+
+
+def test_helpers_arun_bound_tools_runs_async_tool():
+    @tool
+    async def aecho(x: int) -> int:
+        """Echo x."""
+        return x
+
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="aecho", input={"x": 7})],
+    )
+    convo = p.new_model("mock-model").new_conversation(tools=[aecho])
+
+    async def run():
+        resp = await convo.asend("go")
+        return await helpers.arun_bound_tools(convo, resp)
+
+    results = asyncio.run(run())
+    assert len(results) == 1
+    assert results[0].content == "7"
+    assert convo.history[-1].role == "tool"
+
+
+def test_helpers_run_to_completion_drops_tool_choice_on_followups():
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="echo", input={"x": 1})],
+    )
+
+    @tool
+    def echo(x: int) -> int:
+        """Echo x."""
+        p.canned_tool_calls = []
+        p.canned_text = "done"
+        return x
+
+    convo = p.new_model("mock-model").new_conversation(tools=[echo])
+    forced = "echo"
+    resp = helpers.run_to_completion(convo, "go", tool_choice=forced, max_tokens=99)
+    assert resp.text == "done"
+    assert len(p.calls) == 2
+    assert p.calls[0].req.settings["tool_choice"] == forced
+    assert "tool_choice" not in p.calls[1].req.settings
+    assert p.calls[1].req.settings["max_tokens"] == 99
+
+
+def test_helpers_arun_to_completion_drops_tool_choice_on_followups():
+    p = MockProvider(
+        canned_text="",
+        canned_tool_calls=[ToolCall(id="t1", name="echo", input={"x": 1})],
+    )
+
+    @tool
+    def echo(x: int) -> int:
+        """Echo x."""
+        p.canned_tool_calls = []
+        p.canned_text = "done"
+        return x
+
+    convo = p.new_model("mock-model").new_conversation(tools=[echo])
+    forced = "echo"
+
+    async def run():
+        return await helpers.arun_to_completion(convo, "go", tool_choice=forced)
+
+    resp = asyncio.run(run())
+    assert resp.text == "done"
+    assert len(p.calls) == 2
+    assert p.calls[0].req.settings["tool_choice"] == forced
+    assert "tool_choice" not in p.calls[1].req.settings
 
 
 def _records_of(log_path: Path, kind: str) -> list[dict]:

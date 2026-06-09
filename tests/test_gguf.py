@@ -118,6 +118,95 @@ def test_read_v1_unsupported_returns_none(tmp_path: Path) -> None:
     assert read_gguf_chat_template(f) is None
 
 
+def test_read_absurd_key_length_returns_none(tmp_path: Path) -> None:
+    """A corrupt u64 key length far beyond the file size must not reach
+    ``f.read()`` (OverflowError/MemoryError) — it's caught as a bounds
+    violation and resolves to None."""
+    f = tmp_path / "m.gguf"
+    blob = (
+        b"GGUF"
+        + struct.pack("<I", 3)
+        + struct.pack("<Q", 0)  # tensor_count
+        + struct.pack("<Q", 1)  # kv_count
+        + struct.pack("<Q", 2**62)  # absurd key length
+    )
+    f.write_bytes(blob)
+    assert read_gguf_chat_template(f) is None
+
+
+def test_read_absurd_string_value_length_returns_none(tmp_path: Path) -> None:
+    f = tmp_path / "m.gguf"
+    key = b"tokenizer.chat_template"
+    blob = (
+        b"GGUF"
+        + struct.pack("<I", 3)
+        + struct.pack("<Q", 0)
+        + struct.pack("<Q", 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", _T_STRING)
+        + struct.pack("<Q", 2**63)  # absurd value length (> sys.maxsize)
+    )
+    f.write_bytes(blob)
+    assert read_gguf_chat_template(f) is None
+
+
+def test_read_absurd_skipped_string_length_returns_none(tmp_path: Path) -> None:
+    """A corrupt length on a *skipped* string KV (not the template) is also
+    bounds-checked instead of seeking off into nowhere."""
+    f = tmp_path / "m.gguf"
+    key = b"general.name"
+    blob = (
+        b"GGUF"
+        + struct.pack("<I", 3)
+        + struct.pack("<Q", 0)
+        + struct.pack("<Q", 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", _T_STRING)
+        + struct.pack("<Q", 2**62)
+    )
+    f.write_bytes(blob)
+    assert read_gguf_chat_template(f) is None
+
+
+def test_read_absurd_string_array_count_returns_none(tmp_path: Path) -> None:
+    """A corrupt string-array count can't spin a near-infinite skip loop."""
+    f = tmp_path / "m.gguf"
+    key = b"tokenizer.tokens"
+    blob = (
+        b"GGUF"
+        + struct.pack("<I", 3)
+        + struct.pack("<Q", 0)
+        + struct.pack("<Q", 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", _T_ARRAY)
+        + struct.pack("<I", _T_STRING)
+        + struct.pack("<Q", 2**61)  # absurd element count
+    )
+    f.write_bytes(blob)
+    assert read_gguf_chat_template(f) is None
+
+
+def test_read_absurd_scalar_array_count_returns_none(tmp_path: Path) -> None:
+    f = tmp_path / "m.gguf"
+    key = b"some.scores"
+    blob = (
+        b"GGUF"
+        + struct.pack("<I", 3)
+        + struct.pack("<Q", 0)
+        + struct.pack("<Q", 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", _T_ARRAY)
+        + struct.pack("<I", 6)  # FLOAT32
+        + struct.pack("<Q", 2**61)  # absurd element count
+    )
+    f.write_bytes(blob)
+    assert read_gguf_chat_template(f) is None
+
+
 # ---- classify_thinking_style ----------------------------------------------
 
 

@@ -1,6 +1,7 @@
 """Response cache for deterministic replay of model output.
 
-Hashes every input that affects a completion — provider name, model id,
+Hashes every input that affects a completion — provider name, the
+provider's base_url (``None`` for the default endpoint), model id,
 system blocks (including ``cache=True`` markers), the full message list
 (image bytes hashed), tool schemas (in registration order), the merged
 effective settings, and the stop list — and stores the resulting Response
@@ -131,15 +132,21 @@ def _tool_fingerprint(t: Tool) -> dict[str, Any]:
     }
 
 
-def fingerprint_request(req: CompletionRequest, provider_name: str) -> dict[str, Any]:
+def fingerprint_request(
+    req: CompletionRequest, provider_name: str, *, base_url: str | None = None
+) -> dict[str, Any]:
     """Build a canonical dict describing every input that affects output.
 
     Tool order is preserved (some providers / models bias on tool ordering).
     Settings keys are sorted by ``_normalize``. Image bytes are reduced to a
     sha256 hex digest so the fingerprint stays small but is still uniquely
-    determined by the original bytes."""
+    determined by the original bytes. ``base_url`` distinguishes two
+    same-name providers pointed at different endpoints (e.g. two external
+    llama-servers each serving a different GGUF under the same alias);
+    ``None`` means the provider's default endpoint."""
     return {
         "provider": provider_name,
+        "base_url": base_url,
         "model": req.model,
         "system_blocks": [{"text": sb.text, "cache": sb.cache} for sb in req.system_blocks],
         "messages": [_message_fingerprint(m) for m in req.messages],

@@ -285,6 +285,47 @@ def test_warm_and_save_runs_send_then_save_and_rolls_back(
     assert convo.history == []
 
 
+def test_warm_and_save_bypasses_response_cache(
+    monkeypatch, llama_provider: LlamaCppServerProvider, tmp_path
+) -> None:
+    """A pre-populated response cache must not satisfy the warmup completion:
+    a cache hit would mean no request ever reaches llama-server, so save_slot
+    would persist a cold slot-0 KV. The warmup must hit the provider hook
+    every time, and must not write a cache entry either."""
+    create_calls: list[str] = []
+
+    class _FakeChatCompletions:
+        def create(self, **_kw):
+            create_calls.append("create")
+            from tests.test_llamacpp import _FakeResponse
+
+            return _FakeResponse(content="x")
+
+    monkeypatch.setattr(llama_provider._client.chat, "completions", _FakeChatCompletions())
+
+    def fake_post(path, *, params=None, json=None):
+        return _FakeHttpResponse(json_body={"ok": True})
+
+    monkeypatch.setattr(llama_provider._http, "post", fake_post)
+
+    model = llama_provider.new_model("qwen2.5", max_tokens=64)
+    # Seed the cache with the exact warmup request (same prompt ".", same
+    # per-call max_tokens) via a normal cached send.
+    seed = model.new_conversation(log_dir=False, cache_dir=tmp_path)
+    seed.send(".", max_tokens=1)
+    assert create_calls == ["create"]
+    cached_before = list(tmp_path.rglob("*.json"))
+    assert cached_before, "seed send should have populated the cache"
+
+    convo = model.new_conversation(log_dir=False, cache_dir=tmp_path)
+    out = convo.warm_and_save("warm.bin", max_warmup_tokens=1)
+    assert out == {"ok": True}
+    assert create_calls == ["create", "create"], "warmup must reach the server despite the hit"
+    # The warmup must not write to the cache either.
+    assert list(tmp_path.rglob("*.json")) == cached_before
+    assert convo.history == []
+
+
 # ---- lock primitives ------------------------------------------------------
 
 

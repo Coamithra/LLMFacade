@@ -106,6 +106,25 @@ def _flush_deferred_images(convo: Conversation, deferred_images: list[ImageBlock
         convo.add_user_message(content=[TextBlock(_DEFERRED_IMAGE_NOTE), *deferred_images])
 
 
+def _reject_async_tools(convo: Conversation, resp: Response) -> None:
+    """Raise if any tool call in ``resp`` matches an async tool registered on ``convo``.
+
+    Runs *before* anything is dispatched: raising mid-batch would leave earlier
+    ``tool_use`` blocks answered and later ones dangling, violating the
+    wire-format invariant the next ``send`` enforces."""
+    for call in resp.tool_calls:
+        tool_def = convo.tool(call.name)
+        if tool_def is not None and (
+            tool_def.is_async or inspect.iscoroutinefunction(tool_def.fn)
+        ):
+            raise TypeError(
+                f"Tool {call.name!r} is async; run_bound_tools/run_to_completion are "
+                f"sync-only and would never execute it (the coroutine would be "
+                f"stringified into the tool result). Use arun_bound_tools / "
+                f"arun_to_completion instead."
+            )
+
+
 def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock]:
     """Run every tool call in ``resp`` whose name matches a tool registered on ``convo``.
 
@@ -119,8 +138,16 @@ def run_bound_tools(convo: Conversation, resp: Response) -> list[ToolResultBlock
     tool result; otherwise the tool result is reduced to text and the image(s)
     are appended as a single follow-up user message after the batch.
 
+    Sync-only by design: if any matched tool is async (``@tool`` on an
+    ``async def``), raises ``TypeError`` up front, before dispatching anything,
+    so no ``tool_use`` block is left without its ``tool_result``. Use
+    ``arun_bound_tools`` / ``arun_to_completion`` for async tools. (No implicit
+    ``asyncio.run`` fallback: it would break inside a running event loop and
+    silently change execution semantics, so the failure is explicit instead.)
+
     Returns the list of ToolResultBlocks that were appended (the text-only block
     in the fallback case)."""
+    _reject_async_tools(convo, resp)
     out: list[ToolResultBlock] = []
     deferred_images: list[ImageBlock] = []
     for call in resp.tool_calls:
@@ -177,13 +204,23 @@ def run_to_completion(
 ) -> Response:
     """Send ``prompt``, then dispatch any bound tool calls and continue sending
     until the model returns a response with no tool calls (or ``max_iterations``
-    is hit). Raises ``ToolIterationLimitError`` if the loop doesn't terminate."""
+    is hit). Raises ``ToolIterationLimitError`` if the loop doesn't terminate.
+
+    ``send_kwargs`` are forwarded to every send, except ``tool_choice``, which
+    applies to the *first* send only. Follow-up sends after tool dispatch drop
+    it (the convo/model-level default applies, normally ``"auto"``): re-forcing
+    a named tool on every iteration would compel the model to call it again
+    each turn, so the loop could never produce a final answer.
+
+    Sync tools only: an async tool raises ``TypeError`` via ``run_bound_tools``
+    before any result is appended. Use ``arun_to_completion`` instead."""
     resp = convo.send(prompt, **send_kwargs)
+    followup_kwargs = {k: v for k, v in send_kwargs.items() if k != "tool_choice"}
     for _ in range(max_iterations):
         if not resp.tool_calls:
             return resp
         run_bound_tools(convo, resp)
-        resp = convo.send(**send_kwargs)
+        resp = convo.send(**followup_kwargs)
     raise ToolIterationLimitError(
         f"run_to_completion exceeded max_iterations={max_iterations}. "
         f"The model kept calling tools without producing a final answer."
@@ -197,13 +234,17 @@ async def arun_to_completion(
     max_iterations: int = 16,
     **send_kwargs: Any,
 ) -> Response:
-    """Async equivalent of ``run_to_completion``."""
+    """Async equivalent of ``run_to_completion``.
+
+    Same ``tool_choice`` handling: it applies to the first send only and is
+    dropped from follow-up sends after tool dispatch."""
     resp = await convo.asend(prompt, **send_kwargs)
+    followup_kwargs = {k: v for k, v in send_kwargs.items() if k != "tool_choice"}
     for _ in range(max_iterations):
         if not resp.tool_calls:
             return resp
         await arun_bound_tools(convo, resp)
-        resp = await convo.asend(**send_kwargs)
+        resp = await convo.asend(**followup_kwargs)
     raise ToolIterationLimitError(
         f"arun_to_completion exceeded max_iterations={max_iterations}. "
         f"The model kept calling tools without producing a final answer."
