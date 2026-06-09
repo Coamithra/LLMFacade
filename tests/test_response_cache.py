@@ -19,7 +19,7 @@ from llmfacade.cache import (
     hash_fingerprint,
     replay_stream,
 )
-from llmfacade.models import ToolCall, ToolUseBlock
+from llmfacade.models import StreamEvent, ToolCall, ToolUseBlock
 
 from .conftest import MockProvider
 
@@ -288,6 +288,64 @@ def test_replay_only_raises_on_miss(tmp_path):
     assert len(p.calls) == 0
 
 
+def test_replay_only_miss_send_leaves_history_unchanged(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    with pytest.raises(CacheMissError):
+        c.send("never-cached")
+    assert c.history == [], "the dangling prompt must be rolled back on a replay_only miss"
+    # A later turn must not trip over a dangling user message.
+    with pytest.raises(CacheMissError):
+        c.send("still-never-cached")
+    assert c.history == []
+
+
+def test_replay_only_miss_asend_leaves_history_unchanged(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    with pytest.raises(CacheMissError):
+        asyncio.run(c.asend("never-cached"))
+    assert c.history == []
+
+
+def test_replay_only_miss_stream_leaves_history_unchanged(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    with pytest.raises(CacheMissError):
+        list(c.stream("never-cached"))
+    assert c.history == []
+
+
+def test_replay_only_miss_astream_leaves_history_unchanged(tmp_path):
+    p = MockProvider(canned_text="x")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+
+    async def run():
+        async for _ev in c.astream("never-cached"):
+            pass
+
+    with pytest.raises(CacheMissError):
+        asyncio.run(run())
+    assert c.history == []
+
+
+def test_replay_only_miss_preserves_prior_turns(tmp_path):
+    p = MockProvider(canned_text="seeded")
+    model = p.new_model("mock-model")
+    seed = model.new_conversation(cache_dir=tmp_path)
+    seed.send("hello")
+    c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
+    c.send("hello")  # hit
+    before = c.history
+    with pytest.raises(CacheMissError):
+        c.send("uncached-follow-up")
+    assert c.history == before
+
+
 def test_replay_only_returns_hit(tmp_path):
     p = MockProvider(canned_text="seeded")
     model = p.new_model("mock-model")
@@ -373,6 +431,93 @@ def test_replay_only_stream_raises_on_miss(tmp_path):
     c = model.new_conversation(cache_dir=tmp_path, cache_mode="replay_only")
     with pytest.raises(CacheMissError):
         list(c.stream("never"))
+
+
+# --- early stream exit must not poison the cache ---------------------------
+
+
+class _ExplodingStreamProvider(MockProvider):
+    """Streams one text delta, then raises mid-stream."""
+
+    def _stream_raw(self, req):
+        yield StreamEvent(text_delta="partial ")
+        raise RuntimeError("connection dropped")
+
+    async def _astream_raw(self, req):
+        yield StreamEvent(text_delta="partial ")
+        raise RuntimeError("connection dropped")
+
+
+def test_stream_consumer_break_does_not_cache(tmp_path):
+    p = MockProvider(canned_text="one two three four")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path)
+    for _ev in c.stream("hi"):
+        break  # consumer bails after the first event
+    assert not list(tmp_path.rglob("*.json")), "truncated response must not be cached"
+    # The partial assistant turn still lands in history (role alternation).
+    assert c.history[-1].role == "assistant"
+
+
+def test_stream_provider_error_does_not_cache(tmp_path):
+    p = _ExplodingStreamProvider()
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="connection dropped"):
+        for _ev in c.stream("hi"):
+            pass
+    assert not list(tmp_path.rglob("*.json")), "truncated response must not be cached"
+
+
+def test_stream_natural_completion_still_cached(tmp_path):
+    p = MockProvider(canned_text="full answer")
+    model = p.new_model("mock-model")
+    c = model.new_conversation(cache_dir=tmp_path)
+    for _ev in c.stream("hi"):
+        pass
+    assert list(tmp_path.rglob("*.json"))
+
+
+def test_astream_consumer_break_does_not_cache(tmp_path):
+    p = MockProvider(canned_text="one two three four")
+    model = p.new_model("mock-model")
+
+    async def run():
+        c = model.new_conversation(cache_dir=tmp_path)
+        async for _ev in c.astream("hi"):
+            break
+        return c
+
+    c = asyncio.run(run())
+    assert not list(tmp_path.rglob("*.json")), "truncated response must not be cached"
+    assert c.history[-1].role == "assistant"
+
+
+def test_astream_provider_error_does_not_cache(tmp_path):
+    p = _ExplodingStreamProvider()
+    model = p.new_model("mock-model")
+
+    async def run():
+        c = model.new_conversation(cache_dir=tmp_path)
+        async for _ev in c.astream("hi"):
+            pass
+
+    with pytest.raises(RuntimeError, match="connection dropped"):
+        asyncio.run(run())
+    assert not list(tmp_path.rglob("*.json")), "truncated response must not be cached"
+
+
+def test_astream_natural_completion_still_cached(tmp_path):
+    p = MockProvider(canned_text="full answer")
+    model = p.new_model("mock-model")
+
+    async def run():
+        c = model.new_conversation(cache_dir=tmp_path)
+        async for _ev in c.astream("hi"):
+            pass
+
+    asyncio.run(run())
+    assert list(tmp_path.rglob("*.json"))
 
 
 # --- async ---------------------------------------------------------------

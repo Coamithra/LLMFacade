@@ -177,6 +177,10 @@ class _StreamBuffers:
     thinking_text: list[str] = field(default_factory=list)
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # Streamed tool-call argument fragments per tool-call index, scanned by
+    # the repetition detector (never used for history-building — the terminal
+    # tool_call_delta stays the source of truth there).
+    tool_args: dict[int, list[str]] = field(default_factory=dict)
     usage: Any = None
     finish_reason: str | None = None
 
@@ -189,6 +193,10 @@ class _StreamBuffers:
             self.thinking_blocks.append(ev.thinking_block)
         if ev.tool_call_delta:
             self.tool_calls.append(ev.tool_call_delta)
+        if ev.tool_args_delta is not None:
+            self.tool_args.setdefault(ev.tool_args_delta.index, []).append(
+                ev.tool_args_delta.fragment
+            )
         if ev.usage is not None:
             self.usage = ev.usage
         if ev.finish_reason is not None:
@@ -196,7 +204,10 @@ class _StreamBuffers:
 
 
 def _detection_text(
-    thinking_buf: list[str], text_buf: list[str], tool_calls: list[ToolCall]
+    thinking_buf: list[str],
+    text_buf: list[str],
+    tool_calls: list[ToolCall],
+    tool_args: dict[int, list[str]] | None = None,
 ) -> str:
     """Build the buffer the repetition detector scans: the model's reasoning /
     thinking stream, then assistant text, then any streamed tool-call arguments
@@ -208,13 +219,30 @@ def _detection_text(
     reasoning sits as a harmless prefix. Reasoning is accumulated from the
     token-by-token ``thinking_delta`` events, never the consolidated
     ``thinking_block`` (which arrives all-at-once only after the loop has
-    already happened and would double-count the deltas)."""
+    already happened and would double-count the deltas).
+
+    ``tool_args`` carries the live ``tool_args_delta`` fragments per tool-call
+    index, so an in-flight argument loop is scanned before the terminal
+    ``tool_call_delta`` exists. A call whose fragments were streamed uses
+    those fragments *instead of* the terminal call's arguments (they are the
+    same string — adding both would double-count); a call with no fragments
+    (e.g. Google, which emits none) falls back to the terminal call's raw or
+    parsed args as before."""
     parts = list(thinking_buf) + list(text_buf)
-    for tc in tool_calls:
-        if tc.raw_arguments:
+    tool_args = tool_args or {}
+    for i, tc in enumerate(tool_calls):
+        frags = tool_args.get(i)
+        if frags:
+            parts.append("".join(frags))
+        elif tc.raw_arguments:
             parts.append(tc.raw_arguments)
         elif tc.input:
             parts.append(json.dumps(tc.input, default=str, sort_keys=True))
+    # In-flight calls: fragments streamed for an index whose terminal
+    # tool_call_delta has not arrived yet.
+    for i in sorted(tool_args):
+        if i >= len(tool_calls):
+            parts.append("".join(tool_args[i]))
     return "".join(parts)
 
 
@@ -227,10 +255,11 @@ def _detect_in_buffers(
     thinking_buf: list[str],
     text_buf: list[str],
     tool_calls: list[ToolCall],
+    tool_args: dict[int, list[str]],
     guard: RepetitionGuard,
 ) -> str | None:
     return detect_repetition_loop(
-        _detection_text(thinking_buf, text_buf, tool_calls),
+        _detection_text(thinking_buf, text_buf, tool_calls, tool_args),
         tail_chars=guard.tail_chars,
         max_period=guard.max_period,
         min_reps_floor=guard.min_reps_floor,
@@ -566,14 +595,21 @@ class Conversation:
         )
         guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
-        guard_snap = self.snapshot() if guard is not None else None
+        pre_send_snap = self.snapshot()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
-        cache_key, cache_fp, cached = self._cache_lookup(req)
+        try:
+            cache_key, cache_fp, cached = self._cache_lookup(req)
+        except CacheMissError:
+            # replay_only miss: undo the prompt append so history isn't left
+            # with a dangling user message (which would corrupt the next send
+            # and shift its fingerprint).
+            self.rollback(pre_send_snap)
+            raise
         if cached is not None:
             self._record_turn_boundary(cached.usage, len(req.messages))
             self._log_response(req, cached)
@@ -584,11 +620,24 @@ class Conversation:
             resp = self._model.provider._complete_raw(req)
         else:
             try:
-                resp = self._guarded_complete(req, guard)
+                guarded_resp = self._guarded_complete(req, guard)
             except RepetitionLoopError:
-                if guard_snap is not None:
-                    self.rollback(guard_snap)
+                self.rollback(pre_send_snap)
                 raise
+            if guarded_resp is None:
+                # Empty stream (no blocks at all): mirror stream()'s handling
+                # of a None from _finalize_stream — append nothing to history,
+                # cache nothing, and hand back an empty Response.
+                return Response(
+                    text="",
+                    blocks=[],
+                    tool_calls=[],
+                    thinking=None,
+                    usage=None,
+                    finish_reason=None,
+                    model=req.model,
+                )
+            resp = guarded_resp
         self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
@@ -639,14 +688,18 @@ class Conversation:
         )
         guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
-        guard_snap = self.snapshot() if guard is not None else None
+        pre_send_snap = self.snapshot()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
-        cache_key, cache_fp, cached = self._cache_lookup(req)
+        try:
+            cache_key, cache_fp, cached = self._cache_lookup(req)
+        except CacheMissError:
+            self.rollback(pre_send_snap)
+            raise
         if cached is not None:
             self._record_turn_boundary(cached.usage, len(req.messages))
             self._log_response(req, cached)
@@ -657,11 +710,22 @@ class Conversation:
             resp = await self._model.provider._acomplete_raw(req)
         else:
             try:
-                resp = await self._aguarded_complete(req, guard)
+                guarded_resp = await self._aguarded_complete(req, guard)
             except RepetitionLoopError:
-                if guard_snap is not None:
-                    self.rollback(guard_snap)
+                self.rollback(pre_send_snap)
                 raise
+            if guarded_resp is None:
+                # Empty stream: see the matching comment in ``send``.
+                return Response(
+                    text="",
+                    blocks=[],
+                    tool_calls=[],
+                    thinking=None,
+                    usage=None,
+                    finish_reason=None,
+                    model=req.model,
+                )
+            resp = guarded_resp
         self._cache_store(cache_key, cache_fp, resp)
         self._record_turn_boundary(resp.usage, len(req.messages))
         self._log_response(req, resp)
@@ -711,14 +775,20 @@ class Conversation:
         )
         guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
-        guard_snap = self.snapshot() if guard is not None else None
+        pre_send_snap = self.snapshot()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
-        cache_key, cache_fp, cached = self._cache_lookup(req)
+        try:
+            cache_key, cache_fp, cached = self._cache_lookup(req)
+        except CacheMissError:
+            # replay_only miss: undo the prompt append so history isn't left
+            # with a dangling user message.
+            self.rollback(pre_send_snap)
+            raise
         msg_count_at_send = len(req.messages)
         if cached is not None:
             try:
@@ -733,10 +803,12 @@ class Conversation:
         thinking_buf: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
+        tool_args_frags: dict[int, list[str]] = {}
         last_usage = None
         last_finish_reason: str | None = None
         repetition_detail: str | None = None
         chars_since_check = 0
+        completed = False
         stream_iter = self._model.provider._stream_raw(req)
         # Use try/finally so a consumer that breaks out of the iterator early
         # (break, exception, generator close) still gets the partial assistant
@@ -765,40 +837,49 @@ class Conversation:
                         chars_since_check += len(ev.text_delta)
                     if ev.thinking_delta:
                         chars_since_check += len(ev.thinking_delta)
+                    if ev.tool_args_delta is not None:
+                        tool_args_frags.setdefault(ev.tool_args_delta.index, []).append(
+                            ev.tool_args_delta.fragment
+                        )
+                        chars_since_check += len(ev.tool_args_delta.fragment)
                     if ev.tool_call_delta:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
                         repetition_detail = _detect_in_buffers(
-                            thinking_buf, text_buf, tool_calls, guard
+                            thinking_buf, text_buf, tool_calls, tool_args_frags, guard
                         )
                         if repetition_detail:
                             break
             else:
                 # Natural completion: flush a final check so a short-but-complete
                 # loop that never crossed the cadence is still caught.
+                completed = True
                 if guard is not None and chars_since_check > 0:
                     repetition_detail = _detect_in_buffers(
-                        thinking_buf, text_buf, tool_calls, guard
+                        thinking_buf, text_buf, tool_calls, tool_args_frags, guard
                     )
         finally:
             if repetition_detail is not None:
                 _close_stream(stream_iter)
-                if guard_snap is not None:
-                    self.rollback(guard_snap)
+                self.rollback(pre_send_snap)
             else:
                 self._record_turn_boundary(last_usage, msg_count_at_send)
                 resp = self._finalize_stream(
                     req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
                 )
-                if resp is not None:
+                # Only a naturally exhausted stream may be cached: a consumer
+                # break or a mid-stream provider error lands here with partial
+                # buffers, and caching those would permanently serve a
+                # truncated Response for the full request fingerprint.
+                if resp is not None and completed:
                     self._cache_store(cache_key, cache_fp, resp)
                 _close_stream(stream_iter)
         if repetition_detail is not None:
             raise RepetitionLoopError(
                 repetition_detail,
                 attempts=1,
-                partial_text=_detection_text(thinking_buf, text_buf, tool_calls),
+                partial_text=_detection_text(thinking_buf, text_buf, tool_calls, tool_args_frags),
             )
 
     async def astream(
@@ -844,14 +925,18 @@ class Conversation:
         )
         guard = self._effective_guard(repetition_detection)
         self._check_no_dangling_tool_use()
-        guard_snap = self.snapshot() if guard is not None else None
+        pre_send_snap = self.snapshot()
         if prompt is not None:
             self._history.append(Message(role="user", content=prompt))
 
         req = self._build_request(stop=stop, per_call=per_call)
         self._log_request(req, per_call)
 
-        cache_key, cache_fp, cached = self._cache_lookup(req)
+        try:
+            cache_key, cache_fp, cached = self._cache_lookup(req)
+        except CacheMissError:
+            self.rollback(pre_send_snap)
+            raise
         msg_count_at_send = len(req.messages)
         if cached is not None:
             try:
@@ -867,10 +952,12 @@ class Conversation:
         thinking_buf: list[str] = []
         thinking_blocks: list[ThinkingBlock] = []
         tool_calls: list[ToolCall] = []
+        tool_args_frags: dict[int, list[str]] = {}
         last_usage = None
         last_finish_reason: str | None = None
         repetition_detail: str | None = None
         chars_since_check = 0
+        completed = False
         stream_iter = self._model.provider._astream_raw(req)
         try:
             async for ev in stream_iter:
@@ -892,40 +979,47 @@ class Conversation:
                         chars_since_check += len(ev.text_delta)
                     if ev.thinking_delta:
                         chars_since_check += len(ev.thinking_delta)
+                    if ev.tool_args_delta is not None:
+                        tool_args_frags.setdefault(ev.tool_args_delta.index, []).append(
+                            ev.tool_args_delta.fragment
+                        )
+                        chars_since_check += len(ev.tool_args_delta.fragment)
                     if ev.tool_call_delta:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
                         repetition_detail = _detect_in_buffers(
-                            thinking_buf, text_buf, tool_calls, guard
+                            thinking_buf, text_buf, tool_calls, tool_args_frags, guard
                         )
                         if repetition_detail:
                             break
             else:
                 # Natural completion: flush a final check so a short-but-complete
                 # loop that never crossed the cadence is still caught.
+                completed = True
                 if guard is not None and chars_since_check > 0:
                     repetition_detail = _detect_in_buffers(
-                        thinking_buf, text_buf, tool_calls, guard
+                        thinking_buf, text_buf, tool_calls, tool_args_frags, guard
                     )
         finally:
             if repetition_detail is not None:
                 await _aclose_stream(stream_iter)
-                if guard_snap is not None:
-                    self.rollback(guard_snap)
+                self.rollback(pre_send_snap)
             else:
                 self._record_turn_boundary(last_usage, msg_count_at_send)
                 resp = self._finalize_stream(
                     req, text_buf, thinking_blocks, tool_calls, last_usage, last_finish_reason
                 )
-                if resp is not None:
+                # Only a naturally exhausted stream may be cached — see the
+                # matching comment in ``stream``.
+                if resp is not None and completed:
                     self._cache_store(cache_key, cache_fp, resp)
                 await _aclose_stream(stream_iter)
         if repetition_detail is not None:
             raise RepetitionLoopError(
                 repetition_detail,
                 attempts=1,
-                partial_text=_detection_text(thinking_buf, text_buf, tool_calls),
+                partial_text=_detection_text(thinking_buf, text_buf, tool_calls, tool_args_frags),
             )
 
     # ---- llama-server slot save/restore (external mode only) -------------
@@ -1035,9 +1129,13 @@ class Conversation:
         intended to run once, right after construction, to materialise the
         static-prefix KV. The warmup user/assistant turns are rolled back
         so subsequent ``send`` calls behave as a fresh first turn that
-        prefix-matches the saved KV. Like the other slot methods, this is
-        not internally atomic; wrap with ``with provider.slot_lock(): ...``
-        if other tasks may mutate the slot concurrently.
+        prefix-matches the saved KV. The warmup completion deliberately
+        bypasses the response cache (both lookup and store): a cache hit
+        would skip the server round-trip entirely, leaving slot 0's KV
+        cold — and a cold save defeats the whole point. Like the other
+        slot methods, this is not internally atomic; wrap with
+        ``with provider.slot_lock(): ...`` if other tasks may mutate the
+        slot concurrently.
 
         Returns the dict that ``save_slot`` returns. Raises
         ``ConversationStateError`` if history is non-empty; otherwise
@@ -1052,7 +1150,7 @@ class Conversation:
             )
         snap = self.snapshot()
         try:
-            self.send(".", max_tokens=max_warmup_tokens)
+            self._model.provider._complete_raw(self._warmup_request(max_warmup_tokens))
         finally:
             self.rollback(snap)
         try:
@@ -1072,13 +1170,24 @@ class Conversation:
             )
         snap = self.snapshot()
         try:
-            await self.asend(".", max_tokens=max_warmup_tokens)
+            await self._model.provider._acomplete_raw(self._warmup_request(max_warmup_tokens))
         finally:
             self.rollback(snap)
         try:
             return await provider.asave_slot(0, sanitized)
         except ProviderError as e:
             raise _wrap_slot_provider_error(e, op="awarm_and_save") from e
+
+    def _warmup_request(self, max_warmup_tokens: int) -> CompletionRequest:
+        """Append the one-token warmup prompt and build its request for a
+        direct provider call. ``warm_and_save`` invokes the provider hook
+        itself (rather than ``send``) so the warmup bypasses the response
+        cache — a cache hit would skip the server round-trip and leave the
+        slot's KV cold. The caller wraps this in snapshot/rollback."""
+        self._history.append(Message(role="user", content="."))
+        return self._build_request(
+            stop=None, per_call=self._collect_per_call(max_tokens=max_warmup_tokens)
+        )
 
     def _check_slot_capable(self) -> None:
         provider = self._model.provider
@@ -1152,12 +1261,13 @@ class Conversation:
             return self._repetition_guard
         return coerce_repetition_guard(per_call)
 
-    def _guarded_complete(self, req: CompletionRequest, guard: RepetitionGuard) -> Response:
+    def _guarded_complete(self, req: CompletionRequest, guard: RepetitionGuard) -> Response | None:
         """Run ``req`` under the repetition guard and return the first attempt
         that does not loop. Drives the provider's stream hook so a loop is
         caught mid-generation; on a hit, discards the attempt and restarts with
         escalated anti-repetition samplers, up to ``guard.retries`` times. Does
-        not touch history — the caller appends the returned ``Response``."""
+        not touch history — the caller appends the returned ``Response``.
+        Returns ``None`` for an empty stream (no blocks produced)."""
         attempts = guard.retries + 1
         last_detail: str | None = None
         last_buffers: _StreamBuffers | None = None
@@ -1168,20 +1278,27 @@ class Conversation:
                 return self._build_response_from_stream(req, buffers)
             last_detail, last_buffers = detail, buffers
         if guard.on_exhausted == "return_last" and last_buffers is not None:
-            return self._build_response_from_stream(req, last_buffers)
+            resp = self._build_response_from_stream(req, last_buffers)
+            if resp is not None:
+                return resp
         raise RepetitionLoopError(
             last_detail or "repetition loop",
             attempts=attempts,
             partial_text=(
                 _detection_text(
-                    last_buffers.thinking_text, last_buffers.text, last_buffers.tool_calls
+                    last_buffers.thinking_text,
+                    last_buffers.text,
+                    last_buffers.tool_calls,
+                    last_buffers.tool_args,
                 )
                 if last_buffers is not None
                 else ""
             ),
         )
 
-    async def _aguarded_complete(self, req: CompletionRequest, guard: RepetitionGuard) -> Response:
+    async def _aguarded_complete(
+        self, req: CompletionRequest, guard: RepetitionGuard
+    ) -> Response | None:
         """Async equivalent of ``_guarded_complete``."""
         attempts = guard.retries + 1
         last_detail: str | None = None
@@ -1193,13 +1310,18 @@ class Conversation:
                 return self._build_response_from_stream(req, buffers)
             last_detail, last_buffers = detail, buffers
         if guard.on_exhausted == "return_last" and last_buffers is not None:
-            return self._build_response_from_stream(req, last_buffers)
+            resp = self._build_response_from_stream(req, last_buffers)
+            if resp is not None:
+                return resp
         raise RepetitionLoopError(
             last_detail or "repetition loop",
             attempts=attempts,
             partial_text=(
                 _detection_text(
-                    last_buffers.thinking_text, last_buffers.text, last_buffers.tool_calls
+                    last_buffers.thinking_text,
+                    last_buffers.text,
+                    last_buffers.tool_calls,
+                    last_buffers.tool_args,
                 )
                 if last_buffers is not None
                 else ""
@@ -1223,11 +1345,15 @@ class Conversation:
                     chars_since_check += len(ev.text_delta)
                 if ev.thinking_delta:
                     chars_since_check += len(ev.thinking_delta)
+                if ev.tool_args_delta is not None:
+                    chars_since_check += len(ev.tool_args_delta.fragment)
                 if ev.tool_call_delta:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(
+                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
+                    )
                     if detail:
                         break
             else:
@@ -1236,7 +1362,9 @@ class Conversation:
                 # loop (e.g. a model that repeats a brief phrase then hits a
                 # low max_tokens) isn't missed.
                 if chars_since_check > 0:
-                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(
+                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
+                    )
         finally:
             _close_stream(stream_iter)
         return detail, buf
@@ -1256,24 +1384,34 @@ class Conversation:
                     chars_since_check += len(ev.text_delta)
                 if ev.thinking_delta:
                     chars_since_check += len(ev.thinking_delta)
+                if ev.tool_args_delta is not None:
+                    chars_since_check += len(ev.tool_args_delta.fragment)
                 if ev.tool_call_delta:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(
+                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
+                    )
                     if detail:
                         break
             else:
                 if chars_since_check > 0:
-                    detail = _detect_in_buffers(buf.thinking_text, buf.text, buf.tool_calls, guard)
+                    detail = _detect_in_buffers(
+                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
+                    )
         finally:
             await _aclose_stream(stream_iter)
         return detail, buf
 
-    def _build_response_from_stream(self, req: CompletionRequest, buf: _StreamBuffers) -> Response:
+    def _build_response_from_stream(
+        self, req: CompletionRequest, buf: _StreamBuffers
+    ) -> Response | None:
         """Assemble a ``Response`` from stream buffers without touching history
         (the guarded send appends it itself, after caching). Mirrors the block
-        ordering of ``_finalize_stream``."""
+        ordering of ``_finalize_stream`` — including its empty-stream guard:
+        returns ``None`` when the stream produced no blocks at all, so an
+        empty assistant message never lands in history or the cache."""
         blocks: list[ContentBlock] = list(buf.thinking_blocks)
         text = "".join(buf.text)
         if buf.text:
@@ -1287,6 +1425,8 @@ class Conversation:
                     raw_arguments=call.raw_arguments,
                 )
             )
+        if not blocks:
+            return None
         thinking_text = "".join(b.text for b in buf.thinking_blocks if not b.encrypted) or None
         return Response(
             text=text,
