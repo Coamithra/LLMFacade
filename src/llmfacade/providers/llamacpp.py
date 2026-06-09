@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import warnings
 from collections.abc import AsyncIterator, Iterator
@@ -781,7 +782,11 @@ class LlamaCppServerProvider(Provider):
         return self._parse_response(raw)
 
     async def _acomplete_raw(self, req: CompletionRequest) -> Response:
-        self._ensure_supervised()
+        # _ensure_supervised is fully synchronous (threading.Lock + subprocess
+        # spawn + sleep-polling readiness) — run it off the event loop so the
+        # first managed-mode async call doesn't block the loop for seconds.
+        # The internal lock makes the cross-thread call safe by design.
+        await asyncio.to_thread(self._ensure_supervised)
         api_kwargs = self._build_kwargs(req)
         try:
             raw = await self._aclient.chat.completions.create(**api_kwargs)
@@ -812,7 +817,8 @@ class LlamaCppServerProvider(Provider):
             raise ProviderError(str(e), original=e) from e
 
     async def _astream_raw(self, req: CompletionRequest) -> AsyncIterator[StreamEvent]:
-        self._ensure_supervised()
+        # See _acomplete_raw: keep the blocking supervisor spawn off the loop.
+        await asyncio.to_thread(self._ensure_supervised)
         api_kwargs = self._build_kwargs(req)
         api_kwargs["stream"] = True
         api_kwargs["stream_options"] = {"include_usage": True}
@@ -1128,7 +1134,7 @@ class LlamaCppServerProvider(Provider):
         return self._http_get(f"{prefix}/health")
 
     async def ahealth(self, *, model: str | None = None) -> dict[str, Any]:
-        self._ensure_supervised()
+        await asyncio.to_thread(self._ensure_supervised)
         if self._managed and model is None:
             return await self._swap_root_health_async()
         prefix = self._resolve_introspection_target(model)
@@ -1187,7 +1193,7 @@ class LlamaCppServerProvider(Provider):
         return data if isinstance(data, list) else []
 
     async def aslots(self, *, model: str | None = None) -> list[dict[str, Any]]:
-        self._ensure_supervised()
+        await asyncio.to_thread(self._ensure_supervised)
         prefix = self._resolve_introspection_target(model)
         data = await self._ahttp_get(f"{prefix}/slots")
         return data if isinstance(data, list) else []
@@ -1228,7 +1234,7 @@ class LlamaCppServerProvider(Provider):
     async def asave_slot(
         self, id_slot: int, filename: str, *, model: str | None = None
     ) -> dict[str, Any]:
-        self._ensure_supervised()
+        await asyncio.to_thread(self._ensure_supervised)
         prefix = self._resolve_introspection_target(model)
         return await self._ahttp_post(
             f"{prefix}/slots/{id_slot}", params={"action": "save"}, json={"filename": filename}
@@ -1248,7 +1254,7 @@ class LlamaCppServerProvider(Provider):
     async def arestore_slot(
         self, id_slot: int, filename: str, *, model: str | None = None
     ) -> dict[str, Any]:
-        self._ensure_supervised()
+        await asyncio.to_thread(self._ensure_supervised)
         prefix = self._resolve_introspection_target(model)
         return await self._ahttp_post(
             f"{prefix}/slots/{id_slot}",
@@ -1262,7 +1268,7 @@ class LlamaCppServerProvider(Provider):
         return self._http_post(f"{prefix}/slots/{id_slot}", params={"action": "erase"})
 
     async def aerase_slot(self, id_slot: int, *, model: str | None = None) -> dict[str, Any]:
-        self._ensure_supervised()
+        await asyncio.to_thread(self._ensure_supervised)
         prefix = self._resolve_introspection_target(model)
         return await self._ahttp_post(f"{prefix}/slots/{id_slot}", params={"action": "erase"})
 
@@ -1287,7 +1293,7 @@ class LlamaCppServerProvider(Provider):
         return data if isinstance(data, list) else []
 
     async def arunning(self) -> list[dict[str, Any]]:
-        self._ensure_supervised()
+        await asyncio.to_thread(self._ensure_supervised)
         try:
             data = await self._ahttp_get("/running")
         except ProviderError as e:
@@ -1319,7 +1325,7 @@ class LlamaCppServerProvider(Provider):
             raise
 
     async def aunload(self, model_id: str) -> None:
-        self._ensure_supervised()
+        await asyncio.to_thread(self._ensure_supervised)
         try:
             await self._ahttp_post(f"/api/models/unload/{_urlquote(model_id, safe='')}")
         except ProviderError as e:
@@ -1347,7 +1353,7 @@ class LlamaCppServerProvider(Provider):
             raise
 
     async def aunload_all(self) -> None:
-        self._ensure_supervised()
+        await asyncio.to_thread(self._ensure_supervised)
         try:
             await self._ahttp_post("/api/models/unload")
         except ProviderError as e:

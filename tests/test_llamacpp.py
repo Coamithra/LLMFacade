@@ -1808,6 +1808,102 @@ async def test_model_ahealth_against_non_llamacpp_provider_raises_unsupported() 
         await m.ahealth()
 
 
+# ---- async paths offload _ensure_supervised off the event loop ------------
+#
+# _ensure_supervised is fully synchronous (threading.Lock + subprocess spawn +
+# sleep-polling readiness in _swap_lifecycle); the async surfaces must run it
+# via asyncio.to_thread so the first managed-mode async call doesn't block the
+# event loop for seconds. The internal lock makes the cross-thread call safe.
+
+
+class _AsyncIterStream:
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = list(chunks)
+
+    def __aiter__(self) -> _AsyncIterStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_acomplete_runs_ensure_supervised_off_the_loop(
+    monkeypatch, provider: LlamaCppServerProvider
+) -> None:
+    import threading
+
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        provider,
+        "_ensure_supervised",
+        lambda: seen.setdefault("thread", threading.current_thread()),
+    )
+
+    async def fake_create(**_kw: Any) -> _FakeResponse:
+        return _FakeResponse(content="hi")
+
+    monkeypatch.setattr(provider._aclient.chat.completions, "create", fake_create)
+    resp = await provider._acomplete_raw(_req())
+    assert resp.text == "hi"
+    assert seen["thread"] is not threading.current_thread()
+
+
+@pytest.mark.asyncio
+async def test_astream_runs_ensure_supervised_off_the_loop(
+    monkeypatch, provider: LlamaCppServerProvider
+) -> None:
+    import threading
+
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        provider,
+        "_ensure_supervised",
+        lambda: seen.setdefault("thread", threading.current_thread()),
+    )
+    chunks = [
+        _FakeStreamChunk(choices=[_FakeStreamChoice(delta=_FakeDelta(content="hi"))]),
+        _FakeStreamChunk(
+            choices=[_FakeStreamChoice(delta=_FakeDelta(), finish_reason="stop")],
+            usage=_FakeUsage(prompt=5, completion=2),
+        ),
+    ]
+
+    async def fake_create(**_kw: Any) -> _AsyncIterStream:
+        return _AsyncIterStream(chunks)
+
+    monkeypatch.setattr(provider._aclient.chat.completions, "create", fake_create)
+    events = [e async for e in provider._astream_raw(_req())]
+    assert any(e.text_delta == "hi" for e in events)
+    assert seen["thread"] is not threading.current_thread()
+
+
+@pytest.mark.asyncio
+async def test_async_introspection_awaits_ensure_supervised_via_to_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spy on asyncio.to_thread: the async introspection wrappers must route
+    _ensure_supervised through it (delegating so behaviour is unchanged)."""
+    import asyncio as _asyncio
+
+    p = _managed_provider_with_entries(tmp_path, monkeypatch, "m")
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body={"status": "ok"}))
+
+    offloaded: list[Any] = []
+    orig_to_thread = _asyncio.to_thread
+
+    async def spy(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        offloaded.append(fn)
+        return await orig_to_thread(fn, *args, **kwargs)
+
+    monkeypatch.setattr(_asyncio, "to_thread", spy)
+    await p.ahealth(model="m")
+    await p.aunload("m")
+    assert offloaded.count(p._ensure_supervised) == 2
+
+
 # ---- mmproj_path (managed-mode vision launch knob) -----------------------
 
 
