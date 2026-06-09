@@ -426,6 +426,61 @@ def test_image_result_save(tmp_path):
     assert paths[1].read_bytes() == b"BBB"
 
 
+def test_image_result_save_never_overwrites(tmp_path):
+    """Two saves into one directory yield 2n distinct files; the second call
+    shifts to the next free contiguous index block instead of clobbering the
+    first call's (paid-for) images."""
+    first = ImageResult(
+        images=[
+            ImageBlock(data=b"FIRST0", media_type="image/png"),
+            ImageBlock(data=b"FIRST1", media_type="image/png"),
+        ],
+        usage=None,
+        model="m",
+        provider="p",
+    )
+    second = ImageResult(
+        images=[
+            ImageBlock(data=b"SECOND0", media_type="image/png"),
+            ImageBlock(data=b"SECOND1", media_type="image/jpeg"),
+        ],
+        usage=None,
+        model="m",
+        provider="p",
+    )
+
+    paths1 = first.save(tmp_path)
+    paths2 = second.save(tmp_path)
+
+    assert [p.name for p in paths1] == ["image_0.png", "image_1.png"]
+    assert [p.name for p in paths2] == ["image_2.png", "image_3.jpg"]
+    assert len({*paths1, *paths2}) == 4
+    assert paths1[0].read_bytes() == b"FIRST0"
+    assert paths1[1].read_bytes() == b"FIRST1"
+    assert paths2[0].read_bytes() == b"SECOND0"
+    assert paths2[1].read_bytes() == b"SECOND1"
+
+
+def test_image_result_save_skips_gap_that_cannot_fit_block(tmp_path):
+    """A pre-existing name mid-range pushes the whole call past it — one
+    call's images stay contiguously numbered."""
+    (tmp_path / "image_1.png").write_bytes(b"OCCUPIED")
+    result = ImageResult(
+        images=[
+            ImageBlock(data=b"A", media_type="image/png"),
+            ImageBlock(data=b"B", media_type="image/png"),
+        ],
+        usage=None,
+        model="m",
+        provider="p",
+    )
+
+    paths = result.save(tmp_path)
+
+    assert [p.name for p in paths] == ["image_2.png", "image_3.png"]
+    assert (tmp_path / "image_1.png").read_bytes() == b"OCCUPIED"
+
+
 def test_save_dir_populates_paths(tmp_path):
     provider = OpenAIProvider(api_key="test-key")
     provider._client = MagicMock()

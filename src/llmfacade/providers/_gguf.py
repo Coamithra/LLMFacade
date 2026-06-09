@@ -61,23 +61,38 @@ def _read_u64(f) -> int:
     return struct.unpack("<Q", _read(f, 8))[0]
 
 
-def _read_str(f) -> str:
+def _read_len(f, file_size: int) -> int:
+    """Read a u64 length and bounds-check it against the bytes actually left in
+    the file, so a corrupt length can't reach ``f.read()`` (huge values raise
+    OverflowError / MemoryError there, escaping the never-raises contract)."""
     length = _read_u64(f)
-    return _read(f, length).decode("utf-8", errors="replace")
+    if length > file_size - f.tell():
+        raise ValueError(f"gguf length field {length} exceeds remaining file size")
+    return length
 
 
-def _skip_value(f, vtype: int) -> None:
+def _read_str(f, file_size: int) -> str:
+    return _read(f, _read_len(f, file_size)).decode("utf-8", errors="replace")
+
+
+def _skip_value(f, vtype: int, file_size: int) -> None:
     if vtype in _SCALAR_SIZE:
         f.seek(_SCALAR_SIZE[vtype], 1)
     elif vtype == _T_STRING:
-        f.seek(_read_u64(f), 1)
+        f.seek(_read_len(f, file_size), 1)
     elif vtype == _T_ARRAY:
         elem_type = _read_u32(f)
         count = _read_u64(f)
         if elem_type == _T_STRING:
+            # Each element carries at least an 8-byte length prefix; a count
+            # beyond that bound is corrupt (and would loop ~forever).
+            if count > max(file_size - f.tell(), 0) // 8:
+                raise ValueError(f"gguf array count {count} exceeds remaining file size")
             for _ in range(count):
-                f.seek(_read_u64(f), 1)
+                f.seek(_read_len(f, file_size), 1)
         elif elem_type in _SCALAR_SIZE:
+            if _SCALAR_SIZE[elem_type] * count > file_size - f.tell():
+                raise ValueError(f"gguf array count {count} exceeds remaining file size")
             f.seek(_SCALAR_SIZE[elem_type] * count, 1)
         else:
             raise ValueError(f"unsupported gguf array element type {elem_type}")
@@ -91,6 +106,8 @@ def read_gguf_chat_template(path: str | Path) -> str | None:
     key/value metadata (skips tensor data and weights)."""
     try:
         with open(path, "rb") as f:
+            file_size = f.seek(0, 2)
+            f.seek(0)
             if _read(f, 4) != _GGUF_MAGIC:
                 return None
             version = _read_u32(f)
@@ -102,12 +119,12 @@ def read_gguf_chat_template(path: str | Path) -> str | None:
             if kv_count > _MAX_KV:
                 return None
             for _ in range(kv_count):
-                key = _read_str(f)
+                key = _read_str(f, file_size)
                 vtype = _read_u32(f)
                 if key == _CHAT_TEMPLATE_KEY and vtype == _T_STRING:
-                    return _read_str(f)
-                _skip_value(f, vtype)
-    except (OSError, EOFError, ValueError, struct.error):
+                    return _read_str(f, file_size)
+                _skip_value(f, vtype, file_size)
+    except (OSError, EOFError, ValueError, struct.error, MemoryError, OverflowError):
         return None
     return None
 
