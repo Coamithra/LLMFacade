@@ -1295,7 +1295,10 @@ class LlamaCppServerProvider(Provider):
         ``model_id``. Raises ``UnsupportedFeature`` against bare llama-server."""
         self._ensure_supervised()
         try:
-            self._http_post(f"/api/models/unload/{model_id}")
+            # safe="" for the same reason as _resolve_introspection_target: a
+            # slashed author/model-style id must not parse as path segments
+            # (it would 404 and masquerade as "llama-swap not detected").
+            self._http_post(f"/api/models/unload/{_urlquote(model_id, safe='')}")
         except ProviderError as e:
             if "404" in str(e):
                 raise UnsupportedFeature(
@@ -1308,7 +1311,7 @@ class LlamaCppServerProvider(Provider):
     async def aunload(self, model_id: str) -> None:
         self._ensure_supervised()
         try:
-            await self._ahttp_post(f"/api/models/unload/{model_id}")
+            await self._ahttp_post(f"/api/models/unload/{_urlquote(model_id, safe='')}")
         except ProviderError as e:
             if "404" in str(e):
                 raise UnsupportedFeature(

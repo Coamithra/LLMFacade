@@ -1722,6 +1722,44 @@ async def test_managed_asave_slot_routes_through_upstream(
     ]
 
 
+def test_unload_url_quotes_slashed_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slashed author/model-style id must be %2F-escaped in the unload URL,
+    matching _resolve_introspection_target — unquoted it parses as extra path
+    segments, 404s, and masquerades as 'llama-swap not detected'."""
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    p.unload("Qwen/Qwen2.5-3B")
+    assert p._http.calls == [
+        {
+            "method": "POST",
+            "path": "/api/models/unload/Qwen%2FQwen2.5-3B",
+            "params": None,
+            "json": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_aunload_url_quotes_slashed_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._ahttp = _AsyncCapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    await p.aunload("Qwen/Qwen2.5-3B")
+    assert p._ahttp.calls[0]["path"] == "/api/models/unload/Qwen%2FQwen2.5-3B"
+
+
+def test_unload_plain_model_id_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _managed_provider_with_entries(tmp_path, monkeypatch)
+    p._http = _CapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
+    p.unload("qwen-fast")
+    assert p._http.calls[0]["path"] == "/api/models/unload/qwen-fast"
+
+
 @pytest.mark.asyncio
 async def test_model_aslots_passes_model_id_to_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
