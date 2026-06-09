@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -12,7 +13,7 @@ from llmfacade.exceptions import (
     RateLimitError,
     UnsupportedFeature,
 )
-from llmfacade.models import ImageBlock, ImageResult, _apply_save_dir
+from llmfacade.models import ImageResult, ReferenceImage, _apply_save_dir
 from llmfacade.provider import Provider
 from llmfacade.providers._openai_images import (
     build_edit_kwargs,
@@ -388,7 +389,7 @@ class LocalImageProvider(Provider):
         quality: str | None,
         background: str | None,
         output_format: str | None,
-        reference_images: list[ImageBlock] | None,
+        reference_images: Sequence[ReferenceImage] | None,
         extra: dict[str, Any] | None,
     ) -> tuple[str, dict[str, Any]]:
         # request_b64=True: OpenAI-compatible local servers default to returning
@@ -426,7 +427,7 @@ class LocalImageProvider(Provider):
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -472,7 +473,7 @@ class LocalImageProvider(Provider):
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -519,7 +520,7 @@ class LocalImageProvider(Provider):
         quality: str | None,
         background: str | None,
         output_format: str | None,
-        reference_images: list[ImageBlock] | None,
+        reference_images: Sequence[ReferenceImage] | None,
         save_dir: str | Path | None,
         extra: dict[str, Any] | None,
     ) -> ImageResult:
@@ -554,7 +555,7 @@ class LocalImageProvider(Provider):
         quality: str | None,
         background: str | None,
         output_format: str | None,
-        reference_images: list[ImageBlock] | None,
+        reference_images: Sequence[ReferenceImage] | None,
         save_dir: str | Path | None,
         extra: dict[str, Any] | None,
     ) -> ImageResult:

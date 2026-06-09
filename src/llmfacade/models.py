@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Union
@@ -33,6 +33,57 @@ class ImageBlock:
 
     def to_base64(self) -> str:
         return base64.b64encode(self.data).decode("ascii")
+
+
+@dataclass(frozen=True, slots=True)
+class LabeledImage:
+    """A reference image bound to a caller-supplied identity (e.g. a character
+    name), for entity->image binding in ``generate_image``.
+
+    An unlabeled ``ImageBlock`` reference is an anonymous member of a bag; a
+    ``LabeledImage`` lets the provider build a properly bound multimodal request
+    ("this is Adam:" [img] "this is Bert:" [img] "draw Adam waving at Bert")
+    instead. The ``label`` is emitted verbatim, so the caller controls the exact
+    phrasing."""
+
+    label: str
+    image: ImageBlock
+
+
+# A reference-image argument item: a bare block (unlabeled), a LabeledImage, or a
+# ``(label, block)`` tuple shorthand. See ``normalize_reference_images``.
+ReferenceImage = Union[ImageBlock, LabeledImage, tuple[str, ImageBlock]]  # noqa: UP007
+
+
+def normalize_reference_images(
+    refs: Sequence[ReferenceImage] | None,
+) -> list[tuple[str | None, ImageBlock]]:
+    """Coerce each reference-image item into a ``(label_or_None, ImageBlock)``
+    pair so providers have one shape to consume. A bare ``ImageBlock`` ->
+    ``(None, block)``; a ``LabeledImage`` or ``(label, block)`` tuple ->
+    ``(label, block)``. ``any(label for label, _ in pairs)`` then decides whether
+    a labeled/interleaved request shape is needed; an empty-string label carries
+    no identity and is therefore treated as unlabeled downstream. Raises
+    ``TypeError`` on any other item type."""
+    out: list[tuple[str | None, ImageBlock]] = []
+    for ref in refs or ():
+        if isinstance(ref, ImageBlock):
+            out.append((None, ref))
+        elif isinstance(ref, LabeledImage):
+            out.append((ref.label, ref.image))
+        elif (
+            isinstance(ref, tuple)
+            and len(ref) == 2
+            and isinstance(ref[0], str)
+            and isinstance(ref[1], ImageBlock)
+        ):
+            out.append((ref[0], ref[1]))
+        else:
+            raise TypeError(
+                "reference_images items must be ImageBlock, LabeledImage, or "
+                f"(label, ImageBlock) tuples; got {type(ref).__name__}"
+            )
+    return out
 
 
 @dataclass(frozen=True, slots=True)

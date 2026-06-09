@@ -30,8 +30,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from llmfacade.models import normalize_reference_images
+
 if TYPE_CHECKING:
-    from llmfacade.models import ImageBlock, ImageResult
+    from collections.abc import Sequence
+
+    from llmfacade.models import ImageResult, ReferenceImage
     from llmfacade.provider import Provider
 
 _LEDGER_NAME = "images.jsonl"
@@ -119,13 +123,15 @@ def build_image_record(
     quality: str | None,
     background: str | None,
     output_format: str | None,
-    reference_images: list[ImageBlock] | None,
+    reference_images: Sequence[ReferenceImage] | None,
     result: ImageResult,
 ) -> dict[str, Any]:
     """Build the JSONL record for one generation. The full prompt is kept (audit);
-    reference images are recorded as a count, and output images as
-    ``{media_type, bytes}`` — never the bytes themselves."""
+    reference images are recorded as a count plus any labels (entity->image
+    binding), and output images as ``{media_type, bytes}`` — never the bytes
+    themselves."""
     usage = result.usage
+    pairs = normalize_reference_images(reference_images)
     return {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "provider": provider,
@@ -137,7 +143,8 @@ def build_image_record(
         "quality": quality,
         "background": background,
         "output_format": output_format,
-        "reference_images": len(reference_images) if reference_images else 0,
+        "reference_images": len(pairs),
+        "reference_labels": [label for label, _ in pairs if label],
         "usage": (
             {
                 "input_tokens": usage.input_tokens,
@@ -193,6 +200,9 @@ def _append_html(html_path: Path, record: dict[str, Any]) -> None:
             out.append(f"  <dt>{key}</dt><dd>{_escape(str(v))}</dd>\n")
     if record.get("reference_images"):
         out.append(f"  <dt>reference_images</dt><dd>{record['reference_images']}</dd>\n")
+    if record.get("reference_labels"):
+        labels = ", ".join(_escape(str(label)) for label in record["reference_labels"])
+        out.append(f"  <dt>reference_labels</dt><dd>{labels}</dd>\n")
     out.append(f"  <dt>image_count</dt><dd>{record['image_count']}</dd>\n")
     for i, img in enumerate(record.get("images", [])):
         out.append(

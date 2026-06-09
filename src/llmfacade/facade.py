@@ -11,7 +11,9 @@ from llmfacade.exceptions import LLMError, ProviderNotInstalledError
 from llmfacade.providers import PROVIDER_REGISTRY
 
 if TYPE_CHECKING:
-    from llmfacade.models import ImageBlock, ImageResult
+    from collections.abc import Sequence
+
+    from llmfacade.models import ImageResult, ReferenceImage
     from llmfacade.provider import Provider
 
 
@@ -163,7 +165,7 @@ class LLM:
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: Path | str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -202,7 +204,7 @@ class LLM:
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: Path | str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:

@@ -10,10 +10,17 @@ methods only own the actual (sync/async) SDK call and error mapping.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from llmfacade.exceptions import ProviderError
-from llmfacade.models import ImageBlock, ImageResult, ImageUsage
+from llmfacade.models import (
+    ImageBlock,
+    ImageResult,
+    ImageUsage,
+    ReferenceImage,
+    normalize_reference_images,
+)
 
 
 def media_type_for(output_format: str | None) -> str:
@@ -66,7 +73,7 @@ def build_edit_kwargs(
     *,
     model: str | None,
     prompt: str,
-    reference_images: list[ImageBlock] | None,
+    reference_images: Sequence[ReferenceImage] | None,
     n: int,
     size: str | None,
     extra: dict[str, Any] | None,
@@ -75,11 +82,21 @@ def build_edit_kwargs(
     """Kwargs for ``client.images.edit``. Reference images become the
     ``(filename, bytes, mimetype)`` tuples the SDK uploads as multipart; a
     ``mask`` (if present in ``extra``) is forwarded as the edit mask. A ``model``
-    of ``None`` is omitted so the server uses its loaded default."""
+    of ``None`` is omitted so the server uses its loaded default.
+
+    The edits endpoint cannot interleave per-image labels (one prompt + a flat
+    image list), so labeled references degrade to *order binding*: images are
+    uploaded in list order and a textual preamble ("Reference image 1 is Adam.")
+    is prepended to the prompt. True interleaving needs the Responses API image
+    path (out of scope)."""
+    pairs = normalize_reference_images(reference_images)
     images = [
-        (f"ref_{i}{_ext(b.media_type)}", b.data, b.media_type)
-        for i, b in enumerate(reference_images or [])
+        (f"ref_{i}{_ext(b.media_type)}", b.data, b.media_type) for i, (_, b) in enumerate(pairs)
     ]
+    labeled = [(i, label) for i, (label, _) in enumerate(pairs) if label]
+    if labeled:
+        preamble = " ".join(f"Reference image {i + 1} is {label}." for i, label in labeled)
+        prompt = f"{preamble}\n\n{prompt}"
     kwargs: dict[str, Any] = {"prompt": prompt, "image": images, "n": n}
     if model is not None:
         kwargs["model"] = model

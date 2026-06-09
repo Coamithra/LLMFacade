@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from llmfacade.facade import LLM
     from llmfacade.image import ImageModel
     from llmfacade.model import Model
-    from llmfacade.models import ImageBlock, ImageResult, Message, Response, StreamEvent
+    from llmfacade.models import ImageResult, Message, ReferenceImage, Response, StreamEvent
     from llmfacade.tools import Tool
 
 
@@ -333,7 +333,7 @@ class Provider:
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -380,7 +380,7 @@ class Provider:
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -421,7 +421,7 @@ class Provider:
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -438,7 +438,7 @@ class Provider:
         quality: str | None = None,
         background: str | None = None,
         output_format: str | None = None,
-        reference_images: list[ImageBlock] | None = None,
+        reference_images: Sequence[ReferenceImage] | None = None,
         save_dir: str | Path | None = None,
         extra: dict[str, Any] | None = None,
     ) -> ImageResult:
@@ -454,7 +454,7 @@ class Provider:
         quality: str | None,
         background: str | None,
         output_format: str | None,
-        reference_images: list[ImageBlock] | None,
+        reference_images: Sequence[ReferenceImage] | None,
         result: ImageResult,
     ) -> None:
         from llmfacade._image_log import (
