@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json as _json
 import warnings
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -14,22 +13,14 @@ from llmfacade.exceptions import (
     RateLimitError,
     UnsupportedFeature,
 )
-from llmfacade.helpers import flatten_text_blocks
 from llmfacade.models import (
-    ContentBlock,
-    ImageBlock,
     Message,
     Response,
     StreamEvent,
-    TextBlock,
     ThinkingBlock,
-    ToolArgsDelta,
-    ToolCall,
-    ToolResultBlock,
-    ToolUseBlock,
-    Usage,
 )
 from llmfacade.provider import CompletionRequest, Provider
+from llmfacade.providers import _openai_chat as _chat
 from llmfacade.providers._gguf import classify_thinking_style, read_gguf_chat_template
 from llmfacade.providers._launch import (
     _LaunchEntry,
@@ -56,15 +47,11 @@ def _llama_reasoning(obj: Any) -> str:
     return getattr(obj, "reasoning_content", None) or getattr(obj, "reasoning", None) or ""
 
 
-def _llama_reasoning_tokens(usage: Any) -> int:
-    """Pull a reasoning-token count from llama-server usage if the build
-    reports one in ``completion_tokens_details.reasoning_tokens``. Most builds
-    fold reasoning into ``completion_tokens`` with no breakdown (→ 0); the
-    conversation log then counts the reasoning text locally via ``/tokenize``."""
-    details = getattr(usage, "completion_tokens_details", None)
-    if details is None:
-        return 0
-    return getattr(details, "reasoning_tokens", 0) or 0
+# Back-compat alias: the extraction logic is shared with OpenAI (same usage
+# shape). Most llama-server builds fold reasoning into ``completion_tokens``
+# with no breakdown (→ 0); the conversation log then counts the reasoning
+# text locally via ``/tokenize``.
+_llama_reasoning_tokens = _chat.reasoning_tokens_from_details
 
 
 def _coerce_thinking_style(value: ThinkingStyle | str) -> ThinkingStyle:
@@ -625,20 +612,12 @@ class LlamaCppServerProvider(Provider):
     # ---- chat completions ------------------------------------------------
 
     def _build_kwargs(self, req: CompletionRequest) -> dict[str, Any]:
-        api_msgs: list[dict[str, Any]] = []
-        if req.system_blocks:
-            api_msgs.append(
-                {
-                    "role": "system",
-                    "content": "\n\n".join(sb.text for sb in req.system_blocks),
-                }
-            )
-        for m in req.messages:
-            api_msgs.extend(self._message_to_api(m))
-
         api_kwargs: dict[str, Any] = {
             "model": req.model,
-            "messages": api_msgs,
+            "messages": _chat.chat_messages(req, self._message_to_api),
+            # Unlike the hosted OpenAI provider (which must emit
+            # `max_completion_tokens` for the GPT-5 / o-series models),
+            # llama-server speaks the legacy `max_tokens` param.
             "max_tokens": req.settings.get("max_tokens", 1024),
         }
         temperature = req.settings.get("temperature")
@@ -681,11 +660,7 @@ class LlamaCppServerProvider(Provider):
         if extra:
             api_kwargs["extra_body"] = extra
 
-        if req.tools:
-            api_kwargs["tools"] = [self._tool_to_api(t) for t in req.tools]
-            api_kwargs["tool_choice"] = self._tool_choice_to_api(
-                req.settings.get("tool_choice", "auto")
-            )
+        _chat.apply_tools(api_kwargs, req)
 
         out_format = req.settings.get("output_format")
         if out_format is not None:
@@ -873,25 +848,7 @@ class LlamaCppServerProvider(Provider):
                 if flushed is not None:
                     yield flushed
                 yield StreamEvent(text_delta=text)
-            for tc in getattr(delta, "tool_calls", None) or []:
-                idx = getattr(tc, "index", 0)
-                slot = tool_buf.setdefault(idx, {"id": None, "name": None, "args": ""})
-                if getattr(tc, "id", None):
-                    slot["id"] = tc.id
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        slot["name"] = fn.name
-                    if getattr(fn, "arguments", None):
-                        slot["args"] += fn.arguments
-                        yield StreamEvent(
-                            tool_args_delta=ToolArgsDelta(
-                                index=idx,
-                                fragment=fn.arguments,
-                                id=slot["id"],
-                                name=slot["name"],
-                            )
-                        )
+            yield from _chat.tool_fragment_events(delta, tool_buf)
             choice_finish = getattr(choice, "finish_reason", None)
             if choice_finish is not None:
                 state["finish_reason"] = choice_finish
@@ -900,24 +857,7 @@ class LlamaCppServerProvider(Provider):
                 flushed = self._flush_reasoning(state)
                 if flushed is not None:
                     yield flushed
-                for slot in tool_buf.values():
-                    if slot["id"] is None:
-                        continue
-                    try:
-                        parsed = _json.loads(slot["args"] or "{}")
-                        unparsed = None
-                    except _json.JSONDecodeError:
-                        parsed = {}
-                        unparsed = slot["args"]
-                    yield StreamEvent(
-                        tool_call_delta=ToolCall(
-                            id=slot["id"],
-                            name=slot["name"] or "",
-                            input=parsed,
-                            raw_arguments=unparsed,
-                        )
-                    )
-                tool_buf.clear()
+                yield from _chat.flush_tool_call_events(tool_buf)
         usage = getattr(chunk, "usage", None)
         if usage is not None:
             # Safety net: a usage chunk with no prior finish_reason still gets
@@ -927,154 +867,24 @@ class LlamaCppServerProvider(Provider):
                 yield flushed
             yield StreamEvent(
                 done=True,
-                usage=Usage(
-                    prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                    completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-                    total_tokens=getattr(usage, "total_tokens", 0) or 0,
-                    reasoning_tokens=_llama_reasoning_tokens(usage),
-                ),
+                usage=_chat.usage_from_chat(usage, include_cached=False),
                 finish_reason=state.get("finish_reason"),
             )
 
     # ---- message / tool / response shaping --------------------------------
 
     def _message_to_api(self, m: Message) -> list[dict[str, Any]]:
-        if m.role == "tool":
-            results: list[dict[str, Any]] = []
-            blocks = m.content if isinstance(m.content, list) else []
-            for b in blocks:
-                if isinstance(b, ToolResultBlock):
-                    text = (
-                        b.content if isinstance(b.content, str) else flatten_text_blocks(b.content)
-                    )
-                    results.append(
-                        {
-                            "role": "tool",
-                            "content": text,
-                            "tool_call_id": b.tool_use_id,
-                        }
-                    )
-            return results
-
-        if isinstance(m.content, str):
-            return [{"role": m.role, "content": m.content}]
-
-        parts: list[dict[str, Any]] = []
-        tool_calls: list[dict[str, Any]] = []
-        for b in m.content:
-            if isinstance(b, TextBlock):
-                parts.append({"type": "text", "text": b.text})
-            elif isinstance(b, ImageBlock):
-                parts.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{b.media_type};base64,{b.to_base64()}",
-                        },
-                    }
-                )
-            elif isinstance(b, ToolUseBlock):
-                tool_calls.append(
-                    {
-                        "id": b.id,
-                        "type": "function",
-                        "function": {"name": b.name, "arguments": _json.dumps(b.input)},
-                    }
-                )
-            elif isinstance(b, ThinkingBlock):
-                # llama-server has no canonical thinking-block format; local
-                # thinking models emit reasoning inline. Drop on the way out.
-                continue
-        out: dict[str, Any] = {"role": m.role}
-        if parts:
-            if m.role == "user":
-                out["content"] = parts
-            else:
-                out["content"] = "".join(
-                    p.get("text", "") for p in parts if p.get("type") == "text"
-                )
-        else:
-            out["content"] = None if tool_calls else ""
-        if tool_calls:
-            out["tool_calls"] = tool_calls
-        return [out]
-
-    def _tool_to_api(self, t: Any) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.schema,
-            },
-        }
-
-    def _tool_choice_to_api(self, tc: str) -> str | dict[str, Any]:
-        if tc == "auto":
-            return "auto"
-        if tc == "required":
-            return "required"
-        if tc == "none":
-            return "none"
-        return {"type": "function", "function": {"name": tc}}
+        return _chat.message_to_api(m, provider_label="llamacpp")
 
     def _parse_response(self, raw: Any) -> Response:
-        choices = getattr(raw, "choices", None) or []
-        if not choices:
-            detail = ""
-            model = getattr(raw, "model", None)
-            if model:
-                detail = f" (model={model!r})"
-            raise ProviderError(
-                f"llama-server returned a response with no choices{detail}; nothing to parse."
-            )
-        choice = choices[0]
-        msg = choice.message
-        reasoning = _llama_reasoning(msg)
-        text = getattr(msg, "content", "") or ""
-        # Reasoning leads the assistant turn (matches the canonical thinking-
-        # then-text ordering the rest of the facade assumes).
-        blocks: list[ContentBlock] = []
-        if reasoning:
-            blocks.append(ThinkingBlock(text=reasoning))
-        if text:
-            blocks.append(TextBlock(text))
-        tool_calls: list[ToolCall] = []
-        for tc in getattr(msg, "tool_calls", None) or []:
-            raw_args = tc.function.arguments
-            try:
-                args = _json.loads(raw_args)
-                unparsed = None
-            except _json.JSONDecodeError:
-                # Truncated/runaway tool call (e.g. hit the token limit mid-JSON).
-                # Keep the raw string so the failed call is still visible in logs.
-                args = {}
-                unparsed = raw_args
-            blocks.append(
-                ToolUseBlock(id=tc.id, name=tc.function.name, input=args, raw_arguments=unparsed)
-            )
-            tool_calls.append(
-                ToolCall(id=tc.id, name=tc.function.name, input=args, raw_arguments=unparsed)
-            )
-
-        usage = None
-        if raw.usage:
-            usage = Usage(
-                prompt_tokens=raw.usage.prompt_tokens,
-                completion_tokens=raw.usage.completion_tokens,
-                total_tokens=raw.usage.total_tokens,
-                reasoning_tokens=_llama_reasoning_tokens(raw.usage),
-            )
-
-        return Response(
-            text=text,
-            blocks=blocks,
-            tool_calls=tool_calls,
-            thinking=reasoning or None,
-            usage=usage,
-            finish_reason=choice.finish_reason,
-            model=raw.model,
-            raw=raw,
+        # `reasoning_text=_llama_reasoning` turns llama-server's extracted
+        # `reasoning_content` into a leading ThinkingBlock; cached tokens are
+        # never reported per-request (the server's prompt cache is internal).
+        return _chat.parse_chat_response(
+            raw,
+            server_label="llama-server",
+            include_cached_tokens=False,
+            reasoning_text=_llama_reasoning,
         )
 
     # ---- introspection ----------------------------------------------------
