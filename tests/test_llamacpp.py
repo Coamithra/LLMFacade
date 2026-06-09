@@ -8,6 +8,7 @@ repeat_penalty), the output_format JSON branch, and the introspection +
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import pytest
@@ -806,6 +807,37 @@ def test_managed_mode_new_model_registers_entry(tmp_path: Path) -> None:
     assert model.model_id.startswith("qwen-")
     suffix = model.model_id.rsplit("-", 1)[1]
     assert len(suffix) == 8
+
+
+def test_managed_mode_new_model_warns_on_no_mmap_plus_mlock(tmp_path: Path) -> None:
+    """no_mmap + mlock together can CUDA-OOM at load on a heavy-spill MoE
+    (pinned host allocation). new_model() warns rather than blocks — it's a valid
+    combo on a model that mostly fits VRAM."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    with pytest.warns(UserWarning, match="no_mmap=True and mlock=True"):
+        p.new_model(gguf=str(gguf), no_mmap=True, mlock=True)
+
+
+def test_managed_mode_new_model_warns_when_flags_split_across_scopes(tmp_path: Path) -> None:
+    """The warning keys off the merged config, so no_mmap at provider scope +
+    mlock at model scope still trips it."""
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess", no_mmap=True)
+    with pytest.warns(UserWarning, match="no_mmap=True and mlock=True"):
+        p.new_model(gguf=str(gguf), mlock=True)
+
+
+def test_managed_mode_new_model_no_warn_with_only_one_flag(tmp_path: Path) -> None:
+    gguf = tmp_path / "qwen.gguf"
+    gguf.write_bytes(b"fake")
+    p = LlamaCppServerProvider(llmfacade_dir=tmp_path / "sess")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning becomes a failure
+        p.new_model(gguf=str(gguf), name="only-no-mmap", no_mmap=True)
+        p.new_model(gguf=str(gguf), name="only-mlock", mlock=True)
 
 
 def test_managed_mode_explicit_name_used_as_model_id(tmp_path: Path) -> None:
@@ -2057,6 +2089,7 @@ def test_managed_mode_no_mmap_mlock_default_false(tmp_path: Path) -> None:
     assert p._supervisor.entries[0].mlock is False  # type: ignore[union-attr]
 
 
+@pytest.mark.filterwarnings("ignore:model .* sets both no_mmap=True and mlock=True")
 def test_managed_mode_no_mmap_mlock_provider_default_cascades(tmp_path: Path) -> None:
     gguf = tmp_path / "q.gguf"
     gguf.write_bytes(b"fake")
@@ -2074,6 +2107,7 @@ def test_managed_mode_no_mmap_model_overrides_provider(tmp_path: Path) -> None:
     assert p._supervisor.entries[0].no_mmap is False  # type: ignore[union-attr]
 
 
+@pytest.mark.filterwarnings("ignore:model .* sets both no_mmap=True and mlock=True")
 def test_new_model_does_not_forward_no_mmap_mlock_to_fit_params(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

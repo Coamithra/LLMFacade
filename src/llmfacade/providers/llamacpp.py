@@ -565,6 +565,24 @@ class LlamaCppServerProvider(Provider):
             no_mmap=bool(merged.get("no_mmap", False)),
             mlock=bool(merged.get("mlock", False)),
         )
+        if entry.no_mmap and entry.mlock:
+            # mlock pins the (now contiguous, no_mmap-preloaded) host pages. On a
+            # model whose experts spill heavily to system RAM (the low-VRAM MoE
+            # case this provider targets), that pinned host allocation can exhaust
+            # CUDA's pinned-memory pool and fail the load with "CUDA error: out of
+            # memory" — even when there's ample plain RAM. The combo is safe when
+            # little spills (most of the model is GPU-resident); it's the heavy
+            # CPU-offload case that bites. Warn rather than block: it's a valid,
+            # useful pairing on a model that mostly fits VRAM.
+            warnings.warn(
+                f"model {entry.model_id!r} sets both no_mmap=True and mlock=True. "
+                "When experts spill heavily to system RAM (low-VRAM MoE), pinning "
+                "the preloaded host pages can CUDA-OOM at load even with free RAM. "
+                "If the server fails to start with a CUDA out-of-memory error, drop "
+                "mlock (keep no_mmap). The combo is fine when most of the model is "
+                "GPU-resident.",
+                stacklevel=2,
+            )
         assert self._supervisor is not None
         self._supervisor.register(entry)
         self._maybe_estimate_fit(entry)

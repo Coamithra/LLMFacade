@@ -19,6 +19,15 @@ room left for KV** — no expert spill, no `n_cpu_moe`, no homebrew IQ2 quant. T
 26B, achieved for free by switching to the smaller dense model. Google also reports it
 *beats Gemma 3 27B* on GPQA Diamond / MMLU Pro / DocVQA and stays close to the 26B MoE. [S1]
 
+> **UPDATE 2026-06-05 (benchmarked on real hardware) -- the speed prediction was wrong.**
+> The "dense + fits => big speedup" claim above did NOT hold. On the 4070 Ti the existing
+> 26B-A4B (vlad-dynamic, `--fit` + flash-attn) decodes *faster* than the dense 12B (61 vs
+> 40 tok/s at matched 16k ctx) because decode cost scales with *active* params (4B < 12B),
+> and the partial expert spill is cheap with flash-attn. The 12B's only speed edge is
+> prompt-eval throughput (~2x, from full residency). On quality the 26B was at least equal
+> and clearly better on the hardest rules question. **Net: the 12B does NOT replace the
+> 26B-A4B.** See "## Benchmark results (2026-06-05)" below.
+
 ## Finding 1 — The model is real, dense, and encoder-free multimodal
 
 - Released **2026-06-03**, Apache 2.0, on Hugging Face + Kaggle. First mid-size Gemma with
@@ -108,7 +117,7 @@ provider.new_model(
     jinja=True,                # required for Gemma 4 enable_thinking + correct tool calls
     flash_attn="on",           # here also forced by the quantized V cache; explicit anyway
                                #   because Gemma 4 'auto' disables flash on f16 KV (~2x cost)
-    mmproj_path="C:/Models/mmproj-F16.gguf",  # only if you want vision; ~122 MB
+    mmproj_path="C:/Models/gemma-4-12b-mmproj-F16.gguf",  # only if you want vision; ~168 MB
     fit=True, fit_ctx=16384,   # safety net, floored at the chosen context
 )
 ```
@@ -120,6 +129,75 @@ Notes tying back to existing CLAUDE.md quirks:
   `capability_override=provider.SUPPORTS - {"vision"}`) for a text-only deploy.
 - `jinja=True` + `flash_attn="on"` are the same Gemma 4 gotchas documented for the 26B
   (`docs/learnings/llamacpp-reasoning-tool-calling.md`, CLAUDE.md → llama.cpp quirks).
+
+## Benchmark results (2026-06-05)
+
+Measured on the RTX 4070 Ti (12282 MiB) via the facade llamacpp **managed mode** (llama-swap
++ llama-server), q8_0 KV, `--jinja`, `--flash-attn on`, `--fit on`. Each run: warm-up send,
+then a timed generation; tok/s are llama-server's own `timings` (`predicted_per_second` /
+`prompt_per_second`). VRAM via `nvidia-smi` sampled every 0.4 s during decode. 26B baseline =
+`vlad-gemma4-26b-dynamic.gguf` (the deployed MTGAI model; all-4-bit experts).
+
+| Config | VRAM after load | Decode tok/s | Prompt-eval tok/s (6877-tok prompt) |
+|---|---|---|---|
+| **12B Q5_K_M**, 16k ctx, `n_gpu_layers=-1` (fully resident) | **10336 MiB** | **40-43** | **3301** |
+| 26B-A4B vlad, 128k ctx, `--fit` (partial expert spill) | 11215 MiB | 49-54 | 1322 |
+| 26B-A4B vlad, 16k ctx, `--fit` (partial expert spill) | 11243 MiB | **61** | 1657 |
+
+**Residency (12B): confirmed.** VRAM was flat across decode -- a 7-55 MiB swing over 512
+decoded tokens, which is exactly the q8_0 KV growing. No host spill. The 12B Q5 occupies
+~10.3 GB at 16k ctx, leaving ~2 GB headroom (so KV+compute at 16k ~= 2.3 GB; SWA keeps it
+gentle). Warm-up (spawn + load + prompt eval) ~7 s.
+
+**The decode-speed prediction was wrong.** The dense 12B decodes *slower* than the 26B-A4B
+at every context (40 vs 61 tok/s at matched 16k). Reason: per-token decode cost scales with
+*active* params, and the MoE fires only ~4B/token vs the dense 12B's full 12B -- so the MoE
+wins even while ~2 GB of its inactive experts sit in host RAM. With flash-attn + `--fit`, the
+spill is cheap (active experts are a small slice of PCIe traffic per token). The 12B's *only*
+speed advantage is prompt-eval throughput (~2x: 3301 vs 1322-1657 tok/s), from being fully
+resident -- so it pulls ahead only on very large single-pass prompts (e.g. whole-PDF theme
+extraction), not on chat-style decode.
+
+This also undercuts `plans/homebrew-gemma4-vram-fit.md`: that plan assumed full residency of
+the 26B would buy "a large decode-speed win." It won't -- the stock `--fit` setup already
+decodes at 49-61 tok/s. Full residency would mainly help prompt-eval, and the 12B Q5 already
+delivers that prompt-eval headroom at full precision, without an IQ2-quality hit.
+
+### Quality (4 MTG-domain tasks, temp 0.7, single sample each)
+
+Directional, not definitive (small N, one sample), but consistent. Raw outputs were captured
+side by side.
+
+1. **Combat math (FS + deathtouch 2/2 blocks 6/6 trample).** Correct answer: **0 trample
+   damage, blocker survives** -- the 6/6 takes lethal deathtouch damage in the first-strike
+   step, is destroyed by state-based actions *before* the regular damage step, and so never
+   deals its damage. **26B got this right.** **12B got it wrong** (let the already-dead
+   attacker deal damage; claimed 4 trample through + blocker dies). This is the strongest
+   single signal -- a real rules interaction the 26B handled and the 12B did not.
+2. **Humility + Giant Growth (layers).** Both correct (4/4). 26B referenced the actual layer
+   system (4/6/7) more faithfully; 12B invented layer numbers ("Layer 11", "Layer 123").
+3. **BG graveyard common (card design).** Both playable; 26B's "Grave-Fed Scavenger" (death
+   trigger grows a 2/2) is cleaner and better power-leveled for common than the 12B's pushed
+   ETB-reanimator.
+4. **Time-travel keyword (mechanic design).** Rough wash -- both reused the existing "Echo"
+   keyword name; 26B's flavor fit was slightly better, its third example messier.
+
+**Quality verdict: 26B-A4B >= 12B**, decisively better on the hardest rules question.
+
+### Decision
+
+**The Gemma 4 12B does NOT replace the 26B-A4B for this workload.** The 26B is both faster on
+decode and at least as good on quality. The 12B's genuine niches: (a) large-context,
+prompt-eval-bound single-pass work (~2x prompt throughput), and (b) simpler/safer deployment
+-- fully GPU-resident, ~1 GB less VRAM, no homebrew quant, multimodal via the tiny mmproj.
+Keep both registered; route to the 12B only when prompt-eval throughput or guaranteed full
+residency matters more than decode speed and peak quality.
+
+### Reproduce
+
+Models live at `C:\Models\gemma-4-12b-it-Q5_K_M.gguf`, `...-Q6_K.gguf`, and
+`C:\Models\gemma-4-12b-mmproj-F16.gguf`. Throwaway harness was `_scratch_bench/`
+(`bench_speed.py <q5|q6|26b|26b16k> [long]`, `quality_eval.py <key>`).
 
 ## Gaps and Uncertainties
 

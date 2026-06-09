@@ -9,8 +9,8 @@ SSM/state-space**)._
 ## TL;DR
 
 Five launch flags take the same model+hardware from **3 → 17 tokens/s** at **4× the context**,
-with no quality loss. Three of the five LLMFacade already exposes; two (`--no-mmap`, `--mlock`) it
-does not, except via the `extra_args` escape hatch — see `plans/llamacpp-no-mmap-mlock-knobs.md`.
+with no quality loss. All five map to LLMFacade knobs: `n_cpu_moe` / `cache_type_k` / `cache_type_v`
+were already exposed, and `no_mmap` / `mlock` are now first-class managed-mode `LAUNCH_KNOBS` too.
 And one widely-recommended trick — **speculative decoding — actively makes this class of model
 slower** (17 → 11 t/s). Don't add a draft-model knob for MoE/SSM models.
 
@@ -50,6 +50,17 @@ This matters specifically for **managed mode**, which *is* a long-lived supervis
 > slow leak back to the bad behaviour): the container's `memlock` ulimit raised, the `IPC_LOCK`
 > capability granted, **and** the `--mlock` flag. Miss any one and it falls back to default.
 
+> **`--mlock` + `--no-mmap` can CUDA-OOM at load — spill-fraction-dependent.** An external report
+> (Reddit r/LocalLLaMA, heitortp0, 2026-06-06, Qwen3.6-35B-A3B Q4_K_M on an **8 GB** 4060 laptop /
+> 32 GB RAM) hit `CUDA error: out of memory` when combining the two: with ~20 GB of experts pinned in
+> host RAM, the pinned-host allocation exhausts CUDA's pinned-memory pool even though plain RAM is
+> ample. **This does not contradict the 4070 Ti row below** (`no_mmap + mlock` → ~63 t/s, clean) — that
+> rig is a 26B mostly *GPU-resident* on a 12 GB card, so only ~2 GB of inactive experts are host-resident
+> and get pinned. The rule: the combo is safe when little spills, dangerous when most of the model lives
+> in RAM. The facade now `warnings.warn`s at `new_model()` when both flags are set; fix is to drop
+> `mlock`, keep `no_mmap`. (Unverified locally — believed because the mechanism is sound and matches the
+> "pin 20 GB of host pages" math.)
+
 ## TurboQuant KV — 4× context, same speed
 
 KV cache stores keys+values per token per layer and grows **linearly** with context, so context is
@@ -66,6 +77,10 @@ paid in VRAM. The lever:
 
 **LLMFacade already supports this** — `cache_type_k`/`cache_type_v` are free-form pass-through
 strings (no value whitelist), so `turbo4`/`turbo3` forward verbatim to a build that supports them.
+**Build check (2026-06-05): our local llama-server `b9500` does NOT support them yet** -- its allowed
+`--cache-type` values are `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` only. So this lever is
+gated on a newer/custom build; passing `turbo4`/`turbo3` today fails at server launch (`q8_0` is our
+near-lossless baseline in the meantime).
 
 ## Speculative decoding **backfires** on MoE + SSM (the negative result worth keeping)
 
@@ -87,9 +102,48 @@ transformers**, so if such a knob is ever added it must be gated on architecture
 (A diffusion-based drafter — "DLash" / block-diffusion, generating 8 tokens in one shot — was floated
 as the thing that *might* work for the dense 27B sibling; unverified, future work.)
 
+## On-hardware validation: the same levers on a 4070 Ti 12 GB (2026-06-05)
+
+Re-tested these flags on a *much* better rig than the video's floor: RTX 4070 Ti (12 GB),
+64 GB DDR4, NVMe. Model: `vlad-gemma4-26b-dynamic` (26B-A4B MoE, all-4-bit experts) via the
+facade managed mode, 16k ctx, q8_0 KV, `--jinja`, `--flash-attn on`. Long prompt = 6877 tokens;
+tok/s are llama-server `timings`. Numbers averaged over 2-3 runs each.
+
+| Config | decode t/s | prompt-eval t/s | VRAM after load |
+|---|---|---|---|
+| `--fit on` (our deployed baseline) | ~62 | ~1697 | 11.27 GB |
+| `+ no_mmap` | ~63 | **~2295 (+35%)** | 11.25 GB |
+| `+ no_mmap + mlock` | ~63 | ~2258 | 11.28 GB |
+| `n_cpu_moe=24` (fit off) | 44.5 | 946 | **6.30 GB** |
+
+Three takeaways, two of them refinements of the video:
+
+1. **`--no-mmap` gives ~+35% prompt-eval here -- even with 64 GB RAM and the model fully page-
+   cached.** So on this rig the benefit is NOT (only) "avoid disk reads" as the video framed it
+   (we have none -- it's cached). It's a **memory-access-pattern** effect: prompt-eval routes all
+   6877 tokens through every layer, hitting a wide spread of experts in the mmap'd CPU-resident
+   spill region, so even resident pages cost page-table/minor-fault overhead. `--no-mmap`'s
+   contiguous malloc preload removes that. **Decode barely moves (+1-3%, within noise)** because
+   each decoded token touches only its ~8 active experts. Net: `--no-mmap` is a near-free win
+   for *prompt-eval-bound* MoE workloads (big single-pass inputs), not for chat decode.
+2. **`--mlock` adds nothing to throughput** (as the video says -- its payoff is the long-horizon
+   "day-3" anti-pageout stability, which a single bench can't show). Worth enabling on a
+   long-lived managed backend anyway; it's free on a 64 GB box.
+3. **`n_cpu_moe` is the context<->speed trade lever, and `--fit` already wins it on a 12 GB card.**
+   The video *needed* `n_cpu_moe` to fit a 35B in 6 GB at all, then *lowered* it to fill spare
+   VRAM for speed. On 12 GB, `--fit` already places experts to max the GPU (62 t/s, 11.3 GB used).
+   Forcing `n_cpu_moe=24` pinned too many experts to CPU -- dropped to 44 t/s but freed ~5 GB.
+   The knob's real use on this card is *deliberately* trading decode speed for a much larger
+   context, not chasing speed (fit beats a naive manual split).
+
+**Actionable for MTGAI:** the deployed 26B does prompt-eval-heavy theme extraction on large
+(whole-PDF) inputs -- adding `no_mmap=True` (+ `mlock=True` for stability) to its managed-mode
+registration should speed that stage ~1/3 for free, given the box has 64 GB RAM. Decode-bound
+chat stages won't change. (That's an MTGAI config change, not an LLMFacade one.)
+
 ## Cross-references
 
-- `plans/llamacpp-no-mmap-mlock-knobs.md` — the actionable facade work this entry motivates.
+- `no_mmap` / `mlock` are now implemented `LAUNCH_KNOBS` (settings.py) -- this entry's actionable facade work is DONE; the plan file was removed.
 - `docs/learnings/qwen3.6-27b-12gb.md` — dense vs MoE; why `n_cpu_moe` is a no-op on dense models.
 - `docs/learnings/llamacpp-reasoning-tool-calling.md` — `--jinja` / `enable_thinking` interplay.
 - `CLAUDE.md` → llama.cpp provider quirks: `n_cpu_moe`, `cache_type_k/v`, `flash_attn`, autofit.

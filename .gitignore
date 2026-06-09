@@ -54,3 +54,6 @@ logs/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Throwaway benchmark / scratch scripts
+_scratch_bench/

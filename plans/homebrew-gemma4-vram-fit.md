@@ -1,5 +1,18 @@
 # Plan: homebrew an aggressively-compressed Gemma-4-26B that fits 12 GB VRAM
 
+> **RETIRED / DE-SCOPED 2026-06-05 -- the core premise was disproven by benchmarking.**
+> This plan's goal was full GPU residency of the 26B for "a large decode-speed win." On-hardware
+> measurement (see `docs/learnings/gemma4-12b-12gb.md` -> "Benchmark results (2026-06-05)") shows
+> the **existing** `--fit` + flash-attn 26B already decodes at **49-61 tok/s** -- there is no large
+> decode headroom to reclaim by going fully resident (the spill mainly costs *prompt-eval*, not
+> decode, and only ~2 GB of inactive experts spill). Where full residency *would* help (prompt-eval
+> on very large single-pass inputs), the dense **Gemma 4 12B Q5_K_M** already delivers ~2x prompt-eval
+> throughput at full precision -- without the IQ2 quality hit this plan would incur. So homebrewing an
+> IQ2 26B is squeezed from both sides and not worth building. **Do not pursue.** Kept (not deleted)
+> for the still-reusable artifacts below: the fixed chat-template graft, the `llama-quantize` MoE-aware
+> `--tensor-type` recipe, and the local quant-comparison notes. The benchmark scripts that produced the
+> verdict were throwaway (`_scratch_bench/`). If the MTGAI Trello board tracks this, archive that card.
+
 _Spec'd 2026-05-31 (MTGAI). Goal: a Gemma-4-26B-A4B GGUF that lives **entirely** on a 12 GB
 RTX 4070 Ti — no expert spill to CPU — at a usable context, for a large decode-speed win._
 
