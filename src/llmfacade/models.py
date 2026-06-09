@@ -62,8 +62,9 @@ def normalize_reference_images(
     pair so providers have one shape to consume. A bare ``ImageBlock`` ->
     ``(None, block)``; a ``LabeledImage`` or ``(label, block)`` tuple ->
     ``(label, block)``. ``any(label for label, _ in pairs)`` then decides whether
-    a labeled/interleaved request shape is needed. Raises ``TypeError`` on any
-    other item type."""
+    a labeled/interleaved request shape is needed; an empty-string label carries
+    no identity and is therefore treated as unlabeled downstream. Raises
+    ``TypeError`` on any other item type."""
     out: list[tuple[str | None, ImageBlock]] = []
     for ref in refs or ():
         if isinstance(ref, ImageBlock):

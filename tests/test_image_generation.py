@@ -579,6 +579,49 @@ def test_google_labeled_references_interleaved():
     assert parts[4] == {"text": "draw Adam waving at Bert"}
 
 
+def test_google_mixed_labeled_unlabeled():
+    """An unlabeled item in a labeled list emits its image with no preceding
+    text part, keeping its position."""
+    provider = GoogleProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.models.generate_content.return_value = _gemini_image_response(b"OUT")
+
+    adam = ImageBlock(data=b"ADAM", media_type="image/png")
+    anon = ImageBlock(data=b"ANON", media_type="image/png")
+    cara = ImageBlock(data=b"CARA", media_type="image/png")
+    provider.generate_image(
+        "scene",
+        reference_images=[LabeledImage("Adam", adam), anon, ("Cara", cara)],
+    )
+
+    parts = provider._client.models.generate_content.call_args.kwargs["contents"][0]["parts"]
+    assert parts[0] == {"text": "Adam"}
+    assert base64.b64decode(parts[1]["inline_data"]["data"]) == b"ADAM"
+    assert base64.b64decode(parts[2]["inline_data"]["data"]) == b"ANON"  # no label text
+    assert parts[3] == {"text": "Cara"}
+    assert base64.b64decode(parts[4]["inline_data"]["data"]) == b"CARA"
+    assert parts[5] == {"text": "scene"}
+
+
+def test_google_empty_label_treated_as_unlabeled():
+    """An empty-string label carries no identity, so it is dropped like an
+    unlabeled reference (no text part)."""
+    provider = GoogleProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.models.generate_content.return_value = _gemini_image_response(b"OUT")
+
+    provider.generate_image(
+        "pose",
+        reference_images=[LabeledImage("", ImageBlock(data=b"REF", media_type="image/png"))],
+    )
+
+    parts = provider._client.models.generate_content.call_args.kwargs["contents"][0]["parts"]
+    # No-label path == unlabeled bag: prompt first, then the image, no "" text part.
+    assert parts[0] == {"text": "pose"}
+    assert base64.b64decode(parts[1]["inline_data"]["data"]) == b"REF"
+    assert len(parts) == 2
+
+
 def test_google_unlabeled_references_unchanged():
     """Back-compat: an unlabeled bag keeps the prompt-first shape."""
     provider = GoogleProvider(api_key="test-key")
@@ -615,6 +658,26 @@ def test_openai_labeled_references_preamble():
     )
     # Images still upload in list order.
     assert [content for _, content, _ in kwargs["image"]] == [b"ADAM", b"BERT"]
+
+
+def test_openai_mixed_labeled_unlabeled_preamble():
+    """The preamble numbers over ALL images (1-based) but only names labeled
+    ones, preserving the order->identity map."""
+    provider = OpenAIProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.images.edit.return_value = _openai_image_response(b"E")
+
+    anon = ImageBlock(data=b"ANON", media_type="image/png")
+    bert = ImageBlock(data=b"BERT", media_type="image/png")
+    provider.generate_image(
+        "draw them",
+        model="gpt-image-1",
+        reference_images=[anon, LabeledImage("Bert", bert)],
+    )
+
+    kwargs = provider._client.images.edit.call_args.kwargs
+    assert kwargs["prompt"] == "Reference image 2 is Bert.\n\ndraw them"
+    assert [content for _, content, _ in kwargs["image"]] == [b"ANON", b"BERT"]
 
 
 def test_openai_tuple_shorthand_accepted():

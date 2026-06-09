@@ -157,8 +157,7 @@ def test_image_log_records_reference_labels(tmp_path):
 
     html_path = _ledger(tmp_path).with_suffix(".html")
     html = html_path.read_text(encoding="utf-8")
-    assert "reference_labels" in html
-    assert "Adam, Bert" in html
+    assert "<dt>reference_labels</dt><dd>Adam, Bert</dd>" in html
 
 
 def test_image_log_async(tmp_path):
