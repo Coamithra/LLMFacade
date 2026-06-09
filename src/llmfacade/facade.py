@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import importlib
 import shutil
 import threading
@@ -46,11 +47,12 @@ class LLM:
         max_log_folders: int = 10,
     ):
         self.api_keys: dict[str, str] = dict(api_keys or {})
-        # Providers built by generate_image, cached per (name, base_url) so the
-        # SDK client is reused across calls. Image generation is a one-shot, so
-        # there's no Conversation/Model to hang the provider off — the manager
-        # holds it instead.
-        self._image_providers: dict[tuple[str, str | None], Provider] = {}
+        # Providers built by generate_image, cached per (name, base_url,
+        # api-key digest) so the SDK client is reused across calls but a
+        # different api_key never silently reuses another key's client.
+        # Image generation is a one-shot, so there's no Conversation/Model
+        # to hang the provider off — the manager holds it instead.
+        self._image_providers: dict[tuple[str, str | None, str | None], Provider] = {}
         self._max_log_folders = max(0, int(max_log_folders))
         self._run_dir_materialized = False
         if log_dir is False:
@@ -138,7 +140,12 @@ class LLM:
     def _image_provider(
         self, provider: str, base_url: str | None, api_key: str | None
     ) -> Provider:
-        key = (provider.lower(), base_url)
+        # The api_key enters the cache key as a sha256 digest (not the raw
+        # secret), so the key material isn't enumerable from the mapping.
+        key_digest = (
+            None if api_key is None else hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        )
+        key = (provider.lower(), base_url, key_digest)
         cached = self._image_providers.get(key)
         if cached is not None:
             return cached
@@ -174,8 +181,8 @@ class LLM:
         The single entry point: ``provider`` is e.g. ``"openai"``, ``"google"`` /
         ``"gemini"``, or ``"localimage"``. Hosted providers use the manager's
         ``api_keys`` / env; for ``"localimage"`` pass ``base_url`` (and optionally
-        ``api_key``). The provider is cached per ``(provider, base_url)`` (the
-        provider name is case-folded, matching ``new_provider``)."""
+        ``api_key``). The provider is cached per ``(provider, base_url, api-key
+        digest)`` (the provider name is case-folded, matching ``new_provider``)."""
         return self._image_provider(provider, base_url, api_key).generate_image(
             prompt,
             model=model,

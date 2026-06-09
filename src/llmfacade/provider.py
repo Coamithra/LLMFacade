@@ -101,11 +101,9 @@ def _filter_unsupported(
     return out, out_src
 
 
-# Argument list shared by Provider.__init__, Provider.new_model,
-# Model.__init__, Model.new_conversation, Conversation.__init__, and the four
-# send/stream variants. Centralised so a new knob only has to be added in two
-# places (RUNTIME_KNOBS and here).
-_KNOB_DEFAULTS: dict[str, Any] = {k: None for k in RUNTIME_KNOBS}
+# NOTE: the generation-knob kwarg lists are hand-maintained across the
+# signatures in provider.py, model.py and conversation.py — adding a knob to
+# RUNTIME_KNOBS means adding the kwarg to each of those signatures too.
 
 
 class Provider:
