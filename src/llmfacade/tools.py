@@ -41,7 +41,11 @@ def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
         values = list(args)
         if all(isinstance(v, str) for v in values):
             return {"type": "string", "enum": values}
-        if all(isinstance(v, (int, float)) for v in values):
+        # bool before int/float: bool subclasses int, and strict validators
+        # reject {"type": "number", "enum": [true]}.
+        if all(isinstance(v, bool) for v in values):
+            return {"type": "boolean", "enum": values}
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
             return {"type": "number", "enum": values}
         return {"enum": values}
 
