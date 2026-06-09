@@ -1129,9 +1129,13 @@ class Conversation:
         intended to run once, right after construction, to materialise the
         static-prefix KV. The warmup user/assistant turns are rolled back
         so subsequent ``send`` calls behave as a fresh first turn that
-        prefix-matches the saved KV. Like the other slot methods, this is
-        not internally atomic; wrap with ``with provider.slot_lock(): ...``
-        if other tasks may mutate the slot concurrently.
+        prefix-matches the saved KV. The warmup completion deliberately
+        bypasses the response cache (both lookup and store): a cache hit
+        would skip the server round-trip entirely, leaving slot 0's KV
+        cold — and a cold save defeats the whole point. Like the other
+        slot methods, this is not internally atomic; wrap with
+        ``with provider.slot_lock(): ...`` if other tasks may mutate the
+        slot concurrently.
 
         Returns the dict that ``save_slot`` returns. Raises
         ``ConversationStateError`` if history is non-empty; otherwise
@@ -1146,7 +1150,7 @@ class Conversation:
             )
         snap = self.snapshot()
         try:
-            self.send(".", max_tokens=max_warmup_tokens)
+            self._model.provider._complete_raw(self._warmup_request(max_warmup_tokens))
         finally:
             self.rollback(snap)
         try:
@@ -1166,13 +1170,24 @@ class Conversation:
             )
         snap = self.snapshot()
         try:
-            await self.asend(".", max_tokens=max_warmup_tokens)
+            await self._model.provider._acomplete_raw(self._warmup_request(max_warmup_tokens))
         finally:
             self.rollback(snap)
         try:
             return await provider.asave_slot(0, sanitized)
         except ProviderError as e:
             raise _wrap_slot_provider_error(e, op="awarm_and_save") from e
+
+    def _warmup_request(self, max_warmup_tokens: int) -> CompletionRequest:
+        """Append the one-token warmup prompt and build its request for a
+        direct provider call. ``warm_and_save`` invokes the provider hook
+        itself (rather than ``send``) so the warmup bypasses the response
+        cache — a cache hit would skip the server round-trip and leave the
+        slot's KV cold. The caller wraps this in snapshot/rollback."""
+        self._history.append(Message(role="user", content="."))
+        return self._build_request(
+            stop=None, per_call=self._collect_per_call(max_tokens=max_warmup_tokens)
+        )
 
     def _check_slot_capable(self) -> None:
         provider = self._model.provider
@@ -1246,9 +1261,7 @@ class Conversation:
             return self._repetition_guard
         return coerce_repetition_guard(per_call)
 
-    def _guarded_complete(
-        self, req: CompletionRequest, guard: RepetitionGuard
-    ) -> Response | None:
+    def _guarded_complete(self, req: CompletionRequest, guard: RepetitionGuard) -> Response | None:
         """Run ``req`` under the repetition guard and return the first attempt
         that does not loop. Drives the provider's stream hook so a loop is
         caught mid-generation; on a hit, discards the attempt and restarts with
