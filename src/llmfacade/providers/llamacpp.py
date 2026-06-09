@@ -1008,7 +1008,17 @@ class LlamaCppServerProvider(Provider):
         return {"type": "function", "function": {"name": tc}}
 
     def _parse_response(self, raw: Any) -> Response:
-        choice = raw.choices[0]
+        choices = getattr(raw, "choices", None) or []
+        if not choices:
+            detail = ""
+            model = getattr(raw, "model", None)
+            if model:
+                detail = f" (model={model!r})"
+            raise ProviderError(
+                f"llama-server returned a response with no choices{detail}; "
+                "nothing to parse."
+            )
+        choice = choices[0]
         msg = choice.message
         reasoning = _llama_reasoning(msg)
         text = getattr(msg, "content", "") or ""

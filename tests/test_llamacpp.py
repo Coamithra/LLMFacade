@@ -332,6 +332,28 @@ def test_complete_truncated_tool_call_preserves_raw_arguments(
     assert tool_blocks[0].raw_arguments == truncated
 
 
+def test_complete_empty_choices_raises_provider_error(
+    monkeypatch, provider: LlamaCppServerProvider
+):
+    """A 200 with an empty choices list (a known OpenAI-compat quirk) must
+    surface as ProviderError, not bare IndexError — _parse_response runs
+    outside the SDK-error try/except in _complete_raw."""
+    fake = _FakeResponse(model="qwen2.5")
+    fake.choices = []
+    monkeypatch.setattr(provider._client.chat.completions, "create", lambda **_kw: fake)
+    with pytest.raises(ProviderError, match="no choices"):
+        provider._complete_raw(_req())
+
+
+def test_parse_response_none_choices_raises_provider_error(
+    provider: LlamaCppServerProvider,
+):
+    from types import SimpleNamespace
+
+    with pytest.raises(ProviderError, match="no choices"):
+        provider._parse_response(SimpleNamespace(choices=None))
+
+
 # ---- reasoning capture ----------------------------------------------------
 
 

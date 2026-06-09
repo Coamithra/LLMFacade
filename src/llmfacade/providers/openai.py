@@ -49,6 +49,21 @@ def _openai_cached_tokens(usage: Any) -> int:
     return getattr(details, "cached_tokens", 0) or 0
 
 
+def _empty_choices_detail(raw: Any) -> str:
+    """Describe a 200 response that carried no choices — a real occurrence on
+    OpenAI-compat proxies and content-filter paths. Finish/filter info lives on
+    the (absent) choices, so surface what the top-level object still carries:
+    the model id and any prompt-level filter results (Azure convention)."""
+    parts = []
+    model = getattr(raw, "model", None)
+    if model:
+        parts.append(f"model={model!r}")
+    filter_results = getattr(raw, "prompt_filter_results", None)
+    if filter_results:
+        parts.append(f"prompt_filter_results={filter_results!r}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _openai_reasoning_tokens(usage: Any) -> int:
     """Pull reasoning-token count from OpenAI usage. Lives in
     ``completion_tokens_details.reasoning_tokens`` on reasoning-model
@@ -430,7 +445,14 @@ class OpenAIProvider(Provider):
         return {"type": "function", "function": {"name": tc}}
 
     def _parse_response(self, raw: Any) -> Response:
-        choice = raw.choices[0]
+        choices = getattr(raw, "choices", None) or []
+        if not choices:
+            raise ProviderError(
+                "OpenAI returned a response with no choices"
+                f"{_empty_choices_detail(raw)}; nothing to parse. This can "
+                "happen on OpenAI-compat proxies and content-filter paths."
+            )
+        choice = choices[0]
         msg = choice.message
         text = getattr(msg, "content", "") or ""
         blocks: list[ContentBlock] = []

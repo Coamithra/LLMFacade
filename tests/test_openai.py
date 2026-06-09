@@ -116,6 +116,49 @@ def test_openai_reasoning_tokens_extracted():
     )
 
 
+# ---- empty-choices guard ---------------------------------------------------
+
+
+def test_openai_empty_choices_raises_provider_error(monkeypatch, openai_provider: OpenAIProvider):
+    """A 200 with an empty choices list (real on OpenAI-compat proxy /
+    content-filter paths) must surface as ProviderError, not bare IndexError.
+    Driven through _complete_raw because the _parse_response call sits outside
+    the SDK-error try/except."""
+    from types import SimpleNamespace
+
+    from llmfacade.exceptions import ProviderError
+
+    raw = SimpleNamespace(choices=[], model="gpt-5.5", usage=None)
+    monkeypatch.setattr(openai_provider._client.chat.completions, "create", lambda **_kw: raw)
+    with pytest.raises(ProviderError, match="no choices"):
+        openai_provider._complete_raw(_req())
+
+
+def test_openai_none_choices_raises_provider_error(openai_provider: OpenAIProvider):
+    from types import SimpleNamespace
+
+    from llmfacade.exceptions import ProviderError
+
+    with pytest.raises(ProviderError, match="no choices"):
+        openai_provider._parse_response(SimpleNamespace(choices=None))
+
+
+def test_openai_empty_choices_error_includes_filter_info(openai_provider: OpenAIProvider):
+    """Prompt-level filter results (Azure convention) are the only finish/filter
+    info available when choices is empty — include them in the message."""
+    from types import SimpleNamespace
+
+    from llmfacade.exceptions import ProviderError
+
+    raw = SimpleNamespace(
+        choices=[],
+        model="gpt-5.5",
+        prompt_filter_results=[{"content_filter_results": {"violence": {"filtered": True}}}],
+    )
+    with pytest.raises(ProviderError, match="prompt_filter_results"):
+        openai_provider._parse_response(raw)
+
+
 # ---- streaming tool-call argument fragments -------------------------------
 
 
