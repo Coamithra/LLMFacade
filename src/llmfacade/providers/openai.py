@@ -512,8 +512,10 @@ class OpenAIProvider(Provider):
         extra: dict[str, Any] | None,
     ) -> tuple[str, dict[str, Any]]:
         """Return ``("edit"|"generate", kwargs)``. Reference images route to the
-        edits endpoint. ``request_b64=False``: ``gpt-image-*`` always returns
-        base64 and rejects ``response_format``."""
+        edits endpoint, which for ``gpt-image-*`` accepts the same
+        ``quality`` / ``background`` / ``output_format`` params as generate.
+        ``request_b64=False``: ``gpt-image-*`` always returns base64 and
+        rejects ``response_format``."""
         if reference_images:
             return "edit", build_edit_kwargs(
                 model=model,
@@ -521,6 +523,9 @@ class OpenAIProvider(Provider):
                 reference_images=reference_images,
                 n=n,
                 size=size,
+                quality=quality,
+                background=background,
+                output_format=output_format,
                 extra=extra,
                 request_b64=False,
             )

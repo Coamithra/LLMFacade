@@ -76,6 +76,9 @@ def build_edit_kwargs(
     reference_images: Sequence[ReferenceImage] | None,
     n: int,
     size: str | None,
+    quality: str | None,
+    background: str | None,
+    output_format: str | None,
     extra: dict[str, Any] | None,
     request_b64: bool,
 ) -> dict[str, Any]:
@@ -83,6 +86,14 @@ def build_edit_kwargs(
     ``(filename, bytes, mimetype)`` tuples the SDK uploads as multipart; a
     ``mask`` (if present in ``extra``) is forwarded as the edit mask. A ``model``
     of ``None`` is omitted so the server uses its loaded default.
+
+    ``quality`` / ``background`` / ``output_format`` are accepted by the edits
+    endpoint for ``gpt-image-*`` (the openai SDK exposes all three on
+    ``images.edit``); the hosted provider forwards them, while localimage
+    passes ``None`` — sd-server's edits endpoint doesn't take them, mirroring
+    how ``request_b64`` separates the two callers. A caller that doesn't send
+    ``output_format`` must also not let it drive the parsed media type
+    (the server then defaults to PNG).
 
     The edits endpoint cannot interleave per-image labels (one prompt + a flat
     image list), so labeled references degrade to *order binding*: images are
@@ -102,6 +113,12 @@ def build_edit_kwargs(
         kwargs["model"] = model
     if size is not None:
         kwargs["size"] = size
+    if quality is not None:
+        kwargs["quality"] = quality
+    if background is not None:
+        kwargs["background"] = background
+    if output_format is not None:
+        kwargs["output_format"] = output_format
     if request_b64:
         kwargs["response_format"] = "b64_json"
     rest = dict(extra or {})

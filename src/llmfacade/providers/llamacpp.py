@@ -1021,8 +1021,7 @@ class LlamaCppServerProvider(Provider):
             if model:
                 detail = f" (model={model!r})"
             raise ProviderError(
-                f"llama-server returned a response with no choices{detail}; "
-                "nothing to parse."
+                f"llama-server returned a response with no choices{detail}; nothing to parse."
             )
         choice = choices[0]
         msg = choice.message

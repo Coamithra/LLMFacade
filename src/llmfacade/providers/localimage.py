@@ -395,12 +395,19 @@ class LocalImageProvider(Provider):
         # request_b64=True: OpenAI-compatible local servers default to returning
         # URLs; we want the bytes inline.
         if reference_images:
+            # quality/background/output_format are gpt-image-* edit params;
+            # sd-server's edits endpoint doesn't take them, so they are not
+            # sent here (and must then not drive the parsed media type — the
+            # server defaults to PNG; see _call_images_sync/_async).
             return "edit", build_edit_kwargs(
                 model=model,
                 prompt=prompt,
                 reference_images=reference_images,
                 n=n,
                 size=size,
+                quality=None,
+                background=None,
+                output_format=None,
                 extra=extra,
                 request_b64=True,
             )
@@ -542,7 +549,10 @@ class LocalImageProvider(Provider):
             raw,
             model=model or "localimage",
             provider=self.NAME,
-            fallback_media_type=media_type_for(output_format),
+            # output_format is not sent on the edit path (see _image_kwargs),
+            # so it must not label the returned bytes — the server defaults
+            # to PNG there.
+            fallback_media_type=media_type_for(output_format if endpoint == "generate" else None),
         )
         return _apply_save_dir(result, save_dir)
 
@@ -577,7 +587,8 @@ class LocalImageProvider(Provider):
             raw,
             model=model or "localimage",
             provider=self.NAME,
-            fallback_media_type=media_type_for(output_format),
+            # See _call_images_sync: edit path doesn't transmit output_format.
+            fallback_media_type=media_type_for(output_format if endpoint == "generate" else None),
         )
         return _apply_save_dir(result, save_dir)
 

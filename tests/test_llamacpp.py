@@ -1773,9 +1773,7 @@ async def test_aunload_url_quotes_slashed_model_id(
     assert p._ahttp.calls[0]["path"] == "/api/models/unload/Qwen%2FQwen2.5-3B"
 
 
-def test_unload_plain_model_id_unchanged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unload_plain_model_id_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     p = _managed_provider_with_entries(tmp_path, monkeypatch)
     p._http = _CapturingHttp(_FakeHttpResponse(json_body={"ok": True}))
     p.unload("qwen-fast")

@@ -140,6 +140,48 @@ def test_openai_edit_mask_forwarded():
     assert "extra_body" not in kwargs  # mask is popped out of extra
 
 
+def test_openai_edit_forwards_quality_background_output_format():
+    """The edits endpoint accepts quality/background/output_format for
+    gpt-image-* (openai SDK images.edit signature); they must not be silently
+    dropped when reference_images route the call to edit."""
+    provider = OpenAIProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.images.edit.return_value = _openai_image_response(b"WEBPDATA")
+
+    result = provider.generate_image(
+        "make it night",
+        model="gpt-image-1",
+        reference_images=[ImageBlock(data=b"REF", media_type="image/png")],
+        quality="high",
+        background="transparent",
+        output_format="webp",
+    )
+
+    kwargs = provider._client.images.edit.call_args.kwargs
+    assert kwargs["quality"] == "high"
+    assert kwargs["background"] == "transparent"
+    assert kwargs["output_format"] == "webp"
+    # output_format was transmitted, so it labels the returned bytes.
+    assert result.images[0].media_type == "image/webp"
+
+
+def test_openai_edit_without_output_format_defaults_png():
+    provider = OpenAIProvider(api_key="test-key")
+    provider._client = MagicMock()
+    provider._client.images.edit.return_value = _openai_image_response(b"E")
+
+    result = provider.generate_image(
+        "edit",
+        model="gpt-image-1",
+        reference_images=[ImageBlock(data=b"REF", media_type="image/png")],
+    )
+
+    kwargs = provider._client.images.edit.call_args.kwargs
+    for key in ("quality", "background", "output_format"):
+        assert key not in kwargs
+    assert result.images[0].media_type == "image/png"
+
+
 def test_openai_agenerate_image():
     provider = OpenAIProvider(api_key="test-key")
     provider._aclient = MagicMock()
@@ -263,6 +305,61 @@ def test_localimage_url_only_response_raises():
 
     with pytest.raises(ProviderError, match="URL"):
         provider.generate_image("x", model="flux")
+
+
+def test_localimage_edit_omits_gpt_image_params_and_labels_png():
+    """sd-server's edits endpoint doesn't take quality/background/output_format,
+    so they are not sent — and the untransmitted output_format must not
+    mislabel the returned bytes (the server defaults to PNG)."""
+    provider = LocalImageProvider(base_url="http://127.0.0.1:1234/v1")
+    provider._client = MagicMock()
+    provider._client.images.edit.return_value = _openai_image_response(b"PNGBYTES")
+
+    result = provider.generate_image(
+        "img2img",
+        model="flux",
+        reference_images=[ImageBlock(data=b"REF", media_type="image/png")],
+        quality="high",
+        background="opaque",
+        output_format="jpeg",
+    )
+
+    kwargs = provider._client.images.edit.call_args.kwargs
+    for key in ("quality", "background", "output_format"):
+        assert key not in kwargs
+    assert kwargs["response_format"] == "b64_json"
+    # Was mislabelled image/jpeg before (.save() then wrote a .jpg of PNG data).
+    assert result.images[0].media_type == "image/png"
+
+
+def test_localimage_async_edit_labels_png():
+    provider = LocalImageProvider(base_url="http://127.0.0.1:1234/v1")
+    provider._aclient = MagicMock()
+    provider._aclient.images.edit = AsyncMock(return_value=_openai_image_response(b"P"))
+
+    result = asyncio.run(
+        provider.agenerate_image(
+            "img2img",
+            model="flux",
+            reference_images=[ImageBlock(data=b"REF", media_type="image/png")],
+            output_format="jpeg",
+        )
+    )
+
+    assert "output_format" not in provider._aclient.images.edit.call_args.kwargs
+    assert result.images[0].media_type == "image/png"
+
+
+def test_localimage_generate_output_format_still_drives_media_type():
+    """The generate path transmits output_format, so it keeps labelling."""
+    provider = LocalImageProvider(base_url="http://127.0.0.1:1234/v1")
+    provider._client = MagicMock()
+    provider._client.images.generate.return_value = _openai_image_response(b"J")
+
+    result = provider.generate_image("x", model="flux", output_format="jpeg")
+
+    assert provider._client.images.generate.call_args.kwargs["output_format"] == "jpeg"
+    assert result.images[0].media_type == "image/jpeg"
 
 
 def test_localimage_model_omitted_when_none():
