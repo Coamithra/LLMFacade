@@ -386,3 +386,168 @@ def test_estimate_cached_boundary_picks_largest_matching(mock_model):
     )
     assert exact is True
     assert boundary == 3
+
+
+# --- PROMPT_TOKENS_INCLUDE_CACHED (per-provider usage semantics) ---------------
+
+
+def test_prompt_tokens_include_cached_flags():
+    from llmfacade.provider import Provider
+    from llmfacade.providers.anthropic import AnthropicProvider
+    from llmfacade.providers.google import GoogleProvider
+    from llmfacade.providers.llamacpp import LlamaCppServerProvider
+    from llmfacade.providers.openai import OpenAIProvider
+
+    assert Provider.PROMPT_TOKENS_INCLUDE_CACHED is False
+    # Anthropic's input_tokens EXCLUDES cache reads/creations (additive).
+    assert AnthropicProvider.PROMPT_TOKENS_INCLUDE_CACHED is False
+    # OpenAI's prompt_tokens INCLUDES prompt_tokens_details.cached_tokens.
+    assert OpenAIProvider.PROMPT_TOKENS_INCLUDE_CACHED is True
+    # google-genai: prompt_token_count "also includes the number of tokens in
+    # the cached content" when cached_content is set.
+    assert GoogleProvider.PROMPT_TOKENS_INCLUDE_CACHED is True
+    # OpenAI-compat shape; cache_read_tokens is never populated today.
+    assert LlamaCppServerProvider.PROMPT_TOKENS_INCLUDE_CACHED is True
+
+
+def test_turn_boundary_includes_cached_uses_prompt_as_total(mock_model):
+    p: MockProvider = mock_model.provider
+    p.PROMPT_TOKENS_INCLUDE_CACHED = True
+    convo = mock_model.new_conversation()
+    # OpenAI-style: prompt_tokens=120 already contains the 80 cached tokens,
+    # so the boundary total is 120, not 200.
+    _set_canned_usage(p, prompt_tokens=120, cache_read_tokens=80)
+    convo.send("hello")
+    assert convo._turn_boundaries == [(1, 120)]
+
+
+def test_cache_summary_exact_boundary_fires_for_openai_style_usage(tmp_path: Path, mock_model):
+    p: MockProvider = mock_model.provider
+    p.PROMPT_TOKENS_INCLUDE_CACHED = True
+    log_path = tmp_path / "convo.jsonl"
+    convo = mock_model.new_conversation(log_path=log_path)
+    # Turn 1: 500 input tokens, nothing cached yet.
+    _set_canned_usage(p, prompt_tokens=500)
+    convo.send("first")
+    # Turn 2: the whole turn-1 prefix is a cache hit. prompt_tokens (520)
+    # already includes the 500 cached tokens (OpenAI semantics), so the
+    # recorded turn-1 boundary (500) matches cache_read exactly.
+    _set_canned_usage(p, prompt_tokens=520, cache_read_tokens=500)
+    convo.send("second")
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    responses = [r for r in records if r["type"] == "response"]
+    summary = responses[1]["cache_summary"]
+    assert summary["tokenizer"] == "exact (turn-boundary)"
+    assert summary["approximate_messages_cached"] == 1
+    assert summary["uncached_input_tokens"] == 20
+    assert summary["hit_ratio"] == round(500 / 520, 3)
+
+
+def test_cache_summary_additive_for_excludes_provider(tmp_path: Path, mock_model):
+    # Default MockProvider keeps the base flag (Anthropic-style: excludes).
+    p: MockProvider = mock_model.provider
+    log_path = tmp_path / "convo.jsonl"
+    convo = mock_model.new_conversation(log_path=log_path)
+    _set_canned_usage(p, prompt_tokens=500)
+    convo.send("first")
+    # Anthropic-style: prompt_tokens=20 EXCLUDES the 500 cache-read tokens.
+    _set_canned_usage(p, prompt_tokens=20, cache_read_tokens=500)
+    convo.send("second")
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    responses = [r for r in records if r["type"] == "response"]
+    summary = responses[1]["cache_summary"]
+    assert summary["tokenizer"] == "exact (turn-boundary)"
+    assert summary["approximate_messages_cached"] == 1
+    assert summary["uncached_input_tokens"] == 20
+    assert summary["hit_ratio"] == round(500 / 520, 3)
+
+
+# --- token-count memoization (cache-boundary fallback walk) --------------------
+
+
+class _CountingProvider(MockProvider):
+    """Records every count_tokens text so tests can assert memoization."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.token_calls: list[str] = []
+
+    def count_tokens(self, text, *, system=None, model_id=None):
+        self.token_calls.append(text)
+        return super().count_tokens(text, system=system, model_id=model_id)
+
+
+def test_fallback_walk_memoizes_unchanged_prefix(tmp_path: Path):
+    p = _CountingProvider()
+    model = p.new_model("mock-model")
+    convo = model.new_conversation(log_path=tmp_path / "c.jsonl")
+    # A cache_read that never matches a recorded boundary forces the
+    # tokenizer fallback walk on every logged response.
+    _set_canned_usage(p, prompt_tokens=10, cache_read_tokens=10**9)
+    convo.send("first message")
+    first_walk = list(p.token_calls)
+    assert "first message" in first_walk
+
+    convo.send("second message")
+    new_calls = p.token_calls[len(first_walk) :]
+    # The unchanged turn-1 prefix is served from the memo; only the new
+    # assistant reply and user message are tokenized.
+    assert "first message" not in new_calls
+    assert "second message" in new_calls
+    assert "ok" in new_calls  # canned assistant reply
+
+
+def test_memoized_fallback_returns_identical_result(tmp_path: Path):
+    from llmfacade.models import Message
+
+    p = _CountingProvider()
+    model = p.new_model("mock-model")
+    convo = model.new_conversation()
+    msgs = [
+        Message(role="user", content="u1 " * 30),
+        Message(role="assistant", content="a1 " * 20),
+        Message(role="user", content="u2 " * 10),
+    ]
+    req = type("Req", (), {"messages": msgs, "system_blocks": []})()
+    first = convo._estimate_cached_boundary(req, 25)
+    calls_after_first = len(p.token_calls)
+    assert calls_after_first > 0
+    second = convo._estimate_cached_boundary(req, 25)
+    assert second == first
+    # Second walk is served entirely from the memo.
+    assert len(p.token_calls) == calls_after_first
+
+
+def test_rollback_clears_memo_and_divergent_history_recounts(tmp_path: Path):
+    from llmfacade.models import Message
+
+    p = _CountingProvider()
+    model = p.new_model("mock-model")
+    convo = model.new_conversation()
+    snap = convo.snapshot()
+    convo.add_user_message("original branch text")
+    req = type("Req", (), {"messages": list(convo.history), "system_blocks": []})()
+    convo._estimate_cached_boundary(req, 1000)
+    assert convo._token_count_memo
+
+    convo.rollback(snap)
+    assert convo._token_count_memo == {}
+
+    # Divergent history after rollback is freshly counted — never served a
+    # stale value (and content-hash keys couldn't collide anyway).
+    convo.add_user_message("divergent branch text!!")
+    req2 = type(
+        "Req",
+        (),
+        {
+            "messages": [Message(role="user", content="divergent branch text!!")],
+            "system_blocks": [],
+        },
+    )()
+    before = len(p.token_calls)
+    boundary, exact = convo._estimate_cached_boundary(req2, 1000)
+    assert exact is False
+    assert boundary == 1  # fully covered by the huge cache_read
+    assert p.token_calls[before:] == ["divergent branch text!!"]

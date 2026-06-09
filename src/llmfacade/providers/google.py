@@ -51,6 +51,11 @@ class GoogleProvider(Provider):
             "image_generation",
         }
     )
+    # google-genai's GenerateContentResponseUsageMetadata.prompt_token_count:
+    # "When `cached_content` is set, this also includes the number of tokens
+    # in the cached content." — i.e. it contains the cached subset we surface
+    # as ``cache_read_tokens`` (cached_content_token_count).
+    PROMPT_TOKENS_INCLUDE_CACHED = True
 
     def _init_client(self) -> None:
         try:

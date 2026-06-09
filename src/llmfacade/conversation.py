@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
+import hashlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -135,6 +136,22 @@ def _tokenizer_label(provider: Any, model_id: str) -> str:
     return provider.tokenizer_name(model_id=model_id)
 
 
+def _total_input_tokens(usage: Any, *, prompt_includes_cached: bool) -> int:
+    """A turn's total input tokens, respecting the provider's usage semantics.
+
+    With ``prompt_includes_cached`` (``Provider.PROMPT_TOKENS_INCLUDE_CACHED``;
+    OpenAI, Google, llamacpp) the reported ``prompt_tokens`` already contains
+    the cached subset, so it *is* the total — re-adding ``cache_read_tokens``
+    would double-count. Without it (Anthropic), cache reads/creations are
+    additive on top of ``prompt_tokens``."""
+    prompt = usage.prompt_tokens or 0
+    cache_read = usage.cache_read_tokens or 0
+    cache_creation = usage.cache_creation_tokens or 0
+    if prompt_includes_cached:
+        return max(prompt, cache_read + cache_creation)
+    return prompt + cache_read + cache_creation
+
+
 def _abbreviate_lines(text: str, *, head: int = 3, tail: int = 3) -> str:
     lines = text.splitlines()
     if len(lines) <= head + tail + 1:
@@ -227,7 +244,12 @@ def _detection_text(
     those fragments *instead of* the terminal call's arguments (they are the
     same string — adding both would double-count); a call with no fragments
     (e.g. Google, which emits none) falls back to the terminal call's raw or
-    parsed args as before."""
+    parsed args as before.
+
+    This full re-join is only used for ``RepetitionLoopError.partial_text``
+    (the rare error path). The periodic mid-stream checks use
+    ``_DetectionTail``, an incrementally maintained tail of this same string —
+    keep the two segment orders in sync."""
     parts = list(thinking_buf) + list(text_buf)
     tool_args = tool_args or {}
     for i, tc in enumerate(tool_calls):
@@ -251,15 +273,78 @@ def _detection_text(
 _DRY_ESCALATION_STEP = 0.5
 
 
-def _detect_in_buffers(
-    thinking_buf: list[str],
-    text_buf: list[str],
-    tool_calls: list[ToolCall],
-    tool_args: dict[int, list[str]],
-    guard: RepetitionGuard,
-) -> str | None:
+class _DetectionTail:
+    """Incrementally maintained suffix of the repetition-detection buffer.
+
+    Semantically equal to ``_detection_text(...)[-tail_chars:]`` over the full
+    stream buffers, but O(tail_chars) per check instead of re-joining the
+    entire accumulated output (which made a long generation O(n^2) in copying:
+    ~80MB of churn over a 100k-char stream at the default cadence).
+
+    Correctness: the detector only ever scans the last ``tail_chars`` of the
+    joined string, and each segment of that join (thinking, then text, then
+    per-tool-call args) keeps only its own last ``tail_chars`` here — a char
+    more than ``tail_chars`` from its segment's end can never be within
+    ``tail_chars`` of the end of the full concatenation, so per-segment
+    truncation preserves the global tail exactly, regardless of the order
+    deltas arrive in."""
+
+    __slots__ = ("_cap", "_thinking", "_text", "_frags", "_terminal", "_n_calls")
+
+    def __init__(self, tail_chars: int) -> None:
+        # >= 1, enforced by RepetitionGuard validation (a 0 cap would make
+        # the [-cap:] slices return the whole string).
+        self._cap = tail_chars
+        self._thinking = ""
+        self._text = ""
+        # Streamed argument fragments, keyed by provider tool-call index.
+        # Key presence (even for an empty fragment) mirrors _detection_text's
+        # "fragments were streamed for this call" branch.
+        self._frags: dict[int, str] = {}
+        # Fallback args for terminal calls that streamed no fragments (e.g.
+        # Google), keyed by the call's arrival position.
+        self._terminal: dict[int, str] = {}
+        self._n_calls = 0
+
+    def absorb(self, ev: StreamEvent) -> None:
+        cap = self._cap
+        if ev.text_delta:
+            self._text = (self._text + ev.text_delta)[-cap:]
+        if ev.thinking_delta:
+            self._thinking = (self._thinking + ev.thinking_delta)[-cap:]
+        if ev.tool_args_delta is not None:
+            i = ev.tool_args_delta.index
+            self._frags[i] = (self._frags.get(i, "") + ev.tool_args_delta.fragment)[-cap:]
+        if ev.tool_call_delta:
+            call = ev.tool_call_delta
+            i = self._n_calls
+            self._n_calls += 1
+            if i not in self._frags:
+                if call.raw_arguments:
+                    self._terminal[i] = call.raw_arguments[-cap:]
+                elif call.input:
+                    dumped = json.dumps(call.input, default=str, sort_keys=True)
+                    self._terminal[i] = dumped[-cap:]
+
+    def text(self) -> str:
+        """The last ``tail_chars`` of the detection buffer, mirroring
+        ``_detection_text``'s segment order: thinking, text, terminal
+        tool-call args in arrival order, then in-flight fragment streams."""
+        parts = [self._thinking, self._text]
+        for i in range(self._n_calls):
+            if i in self._frags:
+                parts.append(self._frags[i])
+            elif i in self._terminal:
+                parts.append(self._terminal[i])
+        for i in sorted(self._frags):
+            if i >= self._n_calls:
+                parts.append(self._frags[i])
+        return "".join(parts)[-self._cap :]
+
+
+def _detect_in_tail(tail: _DetectionTail, guard: RepetitionGuard) -> str | None:
     return detect_repetition_loop(
-        _detection_text(thinking_buf, text_buf, tool_calls, tool_args),
+        tail.text(),
         tail_chars=guard.tail_chars,
         max_period=guard.max_period,
         min_reps_floor=guard.min_reps_floor,
@@ -377,6 +462,11 @@ class Conversation:
         # Used by _estimate_cached_boundary to short-circuit the tokenizer
         # walk when a later turn's cache_read matches a recorded total.
         self._turn_boundaries: list[tuple[int, int]] = []
+        # Per-text token-count memo for _estimate_cached_boundary's fallback
+        # walk (content-hash keyed; cleared on rollback). Without it, every
+        # logged response re-tokenizes the whole history — one HTTP /tokenize
+        # round-trip per message per turn on llamacpp.
+        self._token_count_memo: dict[str, int] = {}
         self._html_logger: HtmlLogger | None = _make_html_logger(
             self._log_path, max_lines=self._log_max_message_lines
         )
@@ -475,6 +565,10 @@ class Conversation:
         # recorded after the snapshot referred to a longer prefix than the
         # rolled-back history and is now invalid.
         self._turn_boundaries = list(snap.turn_boundaries)
+        # Clearing (rather than pruning) is the chosen growth bound for the
+        # token-count memo: content-hash keys can't serve stale values, but
+        # entries for rolled-back messages would otherwise accumulate forever.
+        self._token_count_memo.clear()
 
     def clone(
         self,
@@ -506,6 +600,7 @@ class Conversation:
         # history. Cloning preserves that prefix verbatim, so boundaries stay
         # valid for the clone's first turn.
         clone._turn_boundaries = list(self._turn_boundaries)
+        clone._token_count_memo = dict(self._token_count_memo)
         clone._log_dir_override = log_dir
         clone._log_path_override = log_path
         clone._log_path = _resolve_log_path(
@@ -519,7 +614,9 @@ class Conversation:
             if log_max_message_lines is not None
             else self._log_max_message_lines
         )
-        clone._html_logger = _make_html_logger(clone._log_path)
+        clone._html_logger = _make_html_logger(
+            clone._log_path, max_lines=clone._log_max_message_lines
+        )
         # Inherited history was already part of the parent; treat it as already
         # logged so the clone's first send shows it under prior_history rather
         # than dumping all of it into new_messages.
@@ -809,6 +906,7 @@ class Conversation:
         repetition_detail: str | None = None
         chars_since_check = 0
         completed = False
+        detection_tail = _DetectionTail(guard.tail_chars) if guard is not None else None
         stream_iter = self._model.provider._stream_raw(req)
         # Use try/finally so a consumer that breaks out of the iterator early
         # (break, exception, generator close) still gets the partial assistant
@@ -832,7 +930,8 @@ class Conversation:
                 if ev.finish_reason is not None:
                     last_finish_reason = ev.finish_reason
                 yield ev
-                if guard is not None:
+                if guard is not None and detection_tail is not None:
+                    detection_tail.absorb(ev)
                     if ev.text_delta:
                         chars_since_check += len(ev.text_delta)
                     if ev.thinking_delta:
@@ -846,19 +945,15 @@ class Conversation:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
-                        repetition_detail = _detect_in_buffers(
-                            thinking_buf, text_buf, tool_calls, tool_args_frags, guard
-                        )
+                        repetition_detail = _detect_in_tail(detection_tail, guard)
                         if repetition_detail:
                             break
             else:
                 # Natural completion: flush a final check so a short-but-complete
                 # loop that never crossed the cadence is still caught.
                 completed = True
-                if guard is not None and chars_since_check > 0:
-                    repetition_detail = _detect_in_buffers(
-                        thinking_buf, text_buf, tool_calls, tool_args_frags, guard
-                    )
+                if guard is not None and detection_tail is not None and chars_since_check > 0:
+                    repetition_detail = _detect_in_tail(detection_tail, guard)
         finally:
             if repetition_detail is not None:
                 _close_stream(stream_iter)
@@ -958,6 +1053,7 @@ class Conversation:
         repetition_detail: str | None = None
         chars_since_check = 0
         completed = False
+        detection_tail = _DetectionTail(guard.tail_chars) if guard is not None else None
         stream_iter = self._model.provider._astream_raw(req)
         try:
             async for ev in stream_iter:
@@ -974,7 +1070,8 @@ class Conversation:
                 if ev.finish_reason is not None:
                     last_finish_reason = ev.finish_reason
                 yield ev
-                if guard is not None:
+                if guard is not None and detection_tail is not None:
+                    detection_tail.absorb(ev)
                     if ev.text_delta:
                         chars_since_check += len(ev.text_delta)
                     if ev.thinking_delta:
@@ -988,19 +1085,15 @@ class Conversation:
                         chars_since_check += guard.check_every
                     if chars_since_check >= guard.check_every:
                         chars_since_check = 0
-                        repetition_detail = _detect_in_buffers(
-                            thinking_buf, text_buf, tool_calls, tool_args_frags, guard
-                        )
+                        repetition_detail = _detect_in_tail(detection_tail, guard)
                         if repetition_detail:
                             break
             else:
                 # Natural completion: flush a final check so a short-but-complete
                 # loop that never crossed the cadence is still caught.
                 completed = True
-                if guard is not None and chars_since_check > 0:
-                    repetition_detail = _detect_in_buffers(
-                        thinking_buf, text_buf, tool_calls, tool_args_frags, guard
-                    )
+                if guard is not None and detection_tail is not None and chars_since_check > 0:
+                    repetition_detail = _detect_in_tail(detection_tail, guard)
         finally:
             if repetition_detail is not None:
                 await _aclose_stream(stream_iter)
@@ -1335,12 +1428,14 @@ class Conversation:
         ``guard.check_every`` chars. Returns ``(hit_detail_or_None, buffers)``;
         a non-None detail means a loop was detected and the stream was aborted."""
         buf = _StreamBuffers()
+        tail = _DetectionTail(guard.tail_chars)
         chars_since_check = 0
         detail: str | None = None
         stream_iter = self._model.provider._stream_raw(req)
         try:
             for ev in stream_iter:
                 buf.absorb(ev)
+                tail.absorb(ev)
                 if ev.text_delta:
                     chars_since_check += len(ev.text_delta)
                 if ev.thinking_delta:
@@ -1351,9 +1446,7 @@ class Conversation:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = _detect_in_buffers(
-                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
-                    )
+                    detail = _detect_in_tail(tail, guard)
                     if detail:
                         break
             else:
@@ -1362,9 +1455,7 @@ class Conversation:
                 # loop (e.g. a model that repeats a brief phrase then hits a
                 # low max_tokens) isn't missed.
                 if chars_since_check > 0:
-                    detail = _detect_in_buffers(
-                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
-                    )
+                    detail = _detect_in_tail(tail, guard)
         finally:
             _close_stream(stream_iter)
         return detail, buf
@@ -1374,12 +1465,14 @@ class Conversation:
     ) -> tuple[str | None, _StreamBuffers]:
         """Async equivalent of ``_drive_guarded_stream``."""
         buf = _StreamBuffers()
+        tail = _DetectionTail(guard.tail_chars)
         chars_since_check = 0
         detail: str | None = None
         stream_iter = self._model.provider._astream_raw(req)
         try:
             async for ev in stream_iter:
                 buf.absorb(ev)
+                tail.absorb(ev)
                 if ev.text_delta:
                     chars_since_check += len(ev.text_delta)
                 if ev.thinking_delta:
@@ -1390,16 +1483,12 @@ class Conversation:
                     chars_since_check += guard.check_every
                 if chars_since_check >= guard.check_every:
                     chars_since_check = 0
-                    detail = _detect_in_buffers(
-                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
-                    )
+                    detail = _detect_in_tail(tail, guard)
                     if detail:
                         break
             else:
                 if chars_since_check > 0:
-                    detail = _detect_in_buffers(
-                        buf.thinking_text, buf.text, buf.tool_calls, buf.tool_args, guard
-                    )
+                    detail = _detect_in_tail(tail, guard)
         finally:
             await _aclose_stream(stream_iter)
         return detail, buf
@@ -1801,15 +1890,17 @@ class Conversation:
     def _cache_summary(self, req: CompletionRequest, usage: Any) -> dict[str, Any] | None:
         if usage is None:
             return None
+        provider = self._model.provider
         cache_read = usage.cache_read_tokens or 0
         cache_creation = usage.cache_creation_tokens or 0
-        prompt_uncached = usage.prompt_tokens or 0
-        total_input = max(prompt_uncached + cache_creation + cache_read, prompt_uncached)
+        prompt = usage.prompt_tokens or 0
+        includes_cached = provider.PROMPT_TOKENS_INCLUDE_CACHED
+        prompt_uncached = max(prompt - cache_read, 0) if includes_cached else prompt
+        total_input = _total_input_tokens(usage, prompt_includes_cached=includes_cached)
         if total_input == 0:
             return None
 
         boundary, exact_boundary = self._estimate_cached_boundary(req, cache_read)
-        provider = self._model.provider
         explicit = self._model.is_available("auto_cache_last_user")
         auto = bool(explicit and req.settings.get("auto_cache_last_user", False))
 
@@ -1875,7 +1966,10 @@ class Conversation:
         Falls back to a per-message tokenizer estimate via
         ``provider.count_tokens`` when no recorded boundary matches (e.g.
         first-turn caching, system-block-only markers, mid-prefix divergence
-        after rollback)."""
+        after rollback). Per-text counts are memoized on the conversation
+        (``_token_count_memo``) so an unchanged history prefix isn't
+        re-tokenized on every logged turn — on llamacpp each count is a
+        synchronous HTTP ``/tokenize`` round-trip."""
         if cache_read_tokens <= 0:
             return 0, False
 
@@ -1891,23 +1985,36 @@ class Conversation:
             return best_match, True
 
         # Fallback: walk messages with the provider's local tokenizer.
-        provider = self._model.provider
-        model_id = self._model.model_id
         accumulated = 0
         for sb in req.system_blocks:
-            accumulated += provider.count_tokens(sb.text, model_id=model_id)
+            accumulated += self._count_tokens_memoized(sb.text)
             if accumulated > cache_read_tokens:
                 return 0, False
         msgs = list(req.messages)
         fully_covered = 0
         for i, msg in enumerate(msgs):
             text = _message_to_text(msg)
-            tokens = provider.count_tokens(text, model_id=model_id) if text else 0
+            tokens = self._count_tokens_memoized(text) if text else 0
             if accumulated + tokens > cache_read_tokens:
                 return i, False
             accumulated += tokens
             fully_covered = i + 1
         return fully_covered, False
+
+    def _count_tokens_memoized(self, text: str) -> int:
+        """``provider.count_tokens`` with a per-conversation memo.
+
+        Keyed by a content hash of ``text`` — the model (and so the
+        tokenizer) is fixed per conversation, so the text alone identifies
+        the count, and a rollback-then-diverge history can never be served a
+        stale value (different text, different key). The memo is cleared on
+        ``rollback`` to bound growth (see the comment there)."""
+        key = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+        cached = self._token_count_memo.get(key)
+        if cached is None:
+            cached = self._model.provider.count_tokens(text, model_id=self._model.model_id)
+            self._token_count_memo[key] = cached
+        return cached
 
     def _record_turn_boundary(self, usage: Any, msg_count_at_send: int) -> None:
         """Persist (msg_count_at_send, total_input_tokens) so a later turn's
@@ -1915,10 +2022,10 @@ class Conversation:
         tokenizer call. Called after every successful send/stream."""
         if usage is None:
             return
-        prompt = usage.prompt_tokens or 0
-        cache_read = usage.cache_read_tokens or 0
-        cache_creation = usage.cache_creation_tokens or 0
-        total = prompt + cache_read + cache_creation
+        total = _total_input_tokens(
+            usage,
+            prompt_includes_cached=self._model.provider.PROMPT_TOKENS_INCLUDE_CACHED,
+        )
         if total <= 0:
             return
         self._turn_boundaries.append((msg_count_at_send, total))
