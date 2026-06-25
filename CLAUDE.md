@@ -14,7 +14,16 @@ Trello board: **LLMFacade** — https://trello.com/b/WIanVfPx (board id `69f8642
 
 `docs/learnings/*.md` is the opposite of `plans/`: durable, persistent knowledge — external quirks, upstream bugs, non-obvious gotchas that cost real debugging time. Add an entry (and link it from `docs/learnings/README.md`) whenever a debugging or research session ends in an insight worth not rediscovering. These are never deleted.
 
-**Picking up a new card:** read `CONTRIBUTING.md` first — it covers the dev-loop expectations (style, tests, integration-test gating, commit/PR conventions) that every card depends on.
+**Picking up a new card:** follow the global contributing runbook (`~/.claude/CONTRIBUTING.md`) plus the **Contributing workflow** section below — it covers the dev-loop expectations (style, tests, integration-test gating, commit/PR conventions) that every card depends on.
+
+## Contributing workflow
+
+Card -> worktree -> PR runbook: follow `~/.claude/CONTRIBUTING.md` (the global generic runbook). LLMFacade specifics:
+
+- **Board:** LLMFacade (https://trello.com/b/WIanVfPx), id `69f86428`, remote `trello` backend. Lists: To Do / Doing / Done. Atomic pickup: `trello --board 69f86428 grab --from "To Do" --to "Doing"`.
+- **Default branch:** `main`. **GitHub:** solo public repo (unprotected `main` -> PR + self-merge, no approval needed).
+- **Worktrees:** `.trees/<branch>` (branch-named folders, gitignored). A fresh worktree lacks the gitignored files - recreate them for local testing: `.env` (provider API keys), `venv/`, and `.llmfacade/` (llamacpp `swap.yaml` state).
+- **Verification gate:** `ruff check src/` + `ruff format src/` clean; smoke `python -c "import llmfacade"`; `pytest` (default markers, no integration). NEVER auto-run anything under `tests/integration/` - real provider APIs, burns credits (see the integration-test rule below).
 
 ## Commands
 
